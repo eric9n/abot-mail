@@ -4,12 +4,15 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
-import {
+import worker, {
+  INGEST_MAX_RETRIES,
+  INGEST_RETRY_BASE_SEC,
   RpcError,
   archiveEvent,
   assembleStats,
   assertAllowedDownloadUrl,
   buildAttachmentKey,
+  buildFailureInsert,
   buildGetQuery,
   buildHealthQuery,
   buildInsertQuery,
@@ -20,9 +23,12 @@ import {
   decodeWebhookSecret,
   handleFetch,
   handleMcpRpc,
+  handleQueue,
+  isRetryableIngestError,
   likeContains,
   mapEmailForStorage,
   parseEmailDate,
+  retryDelaySeconds,
   timingSafeEqual,
   toMetadata,
   verifySvixSignature,
@@ -349,6 +355,7 @@ function sqliteEnv() {
   const db = new DatabaseSync(":memory:");
   db.exec(readFileSync(new URL("./schema.sql", import.meta.url), "utf8"));
   const bucket = new Map();
+  const sent = [];
   const env = {
     WEBHOOK_SECRET,
     RESEND_API_KEY: "test-resend-key",
@@ -359,8 +366,8 @@ function sqliteEnv() {
           all: async () => ({ results: db.prepare(sql).all(...params) }),
           first: async () => db.prepare(sql).get(...params) ?? null,
           run: async () => {
-            db.prepare(sql).run(...params);
-            return { success: true };
+            const info = db.prepare(sql).run(...params);
+            return { success: true, meta: { changes: info.changes } };
           },
         });
         return { ...make([]), bind: (...params) => make(params) };
@@ -377,8 +384,29 @@ function sqliteEnv() {
         return { async text() { return new TextDecoder().decode(hit.bytes); } };
       },
     },
+    INGEST_QUEUE: {
+      async send(body) {
+        sent.push(body);
+      },
+    },
   };
-  return { db, bucket, env };
+  return { db, bucket, env, sent };
+}
+
+function queueMessage(body, attempts = 1) {
+  const ops = [];
+  return {
+    id: `msg-${attempts}-${ops.length}`,
+    body,
+    attempts,
+    ack() {
+      ops.push({ op: "ack" });
+    },
+    retry(options) {
+      ops.push({ op: "retry", options });
+    },
+    ops,
+  };
 }
 
 function jsonResponse(body, status = 200, headers = {}) {
@@ -389,7 +417,7 @@ function jsonResponse(body, status = 200, headers = {}) {
 }
 
 test("webhook archives inbound mail once, then MCP can read it", async () => {
-  const { db, bucket, env } = sqliteEnv();
+  const { db, bucket, env, sent } = sqliteEnv();
   const calls = [];
   const fetchImpl = async (url, init = {}) => {
     const href = String(url);
@@ -478,11 +506,29 @@ test("webhook archives inbound mail once, then MCP can read it", async () => {
 
   const first = await post();
   assert.equal(first.status, 200);
-  assert.deepEqual(await first.json(), { ok: true });
+  assert.deepEqual(await first.json(), { ok: true, queued: true });
+  assert.equal(calls.length, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 0);
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0], {
+    resend_id: EMAIL_ID,
+    event_type: "email.received",
+    received_at: "2026-09-28T06:15:24.000Z",
+    svix_id: "msg_in",
+  });
+
+  const queued = queueMessage(sent[0], 1);
+  await handleQueue({ queue: "mail-ingest", messages: [queued] }, env, { fetch: fetchImpl, nowMs: NOW_MS });
+  assert.deepEqual(queued.ops, [{ op: "ack" }]);
   const callsAfterFirst = calls.length;
+  assert.ok(callsAfterFirst > 0);
+
   const second = await post();
   assert.equal(second.status, 200);
-  assert.deepEqual(await second.json(), { ok: true, duplicate: true });
+  assert.deepEqual(await second.json(), { ok: true, queued: true });
+  const replay = queueMessage(sent[1], 1);
+  await handleQueue({ queue: "mail-ingest", messages: [replay] }, env, { fetch: fetchImpl, nowMs: NOW_MS });
+  assert.deepEqual(replay.ops, [{ op: "ack" }]);
   assert.equal(calls.length, callsAfterFirst);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 1);
 
@@ -565,7 +611,7 @@ test("webhook archives inbound mail once, then MCP can read it", async () => {
 });
 
 test("webhook ignores unknown events and rejects a bad signature before fetch", async () => {
-  const { db, env } = sqliteEnv();
+  const { db, env, sent } = sqliteEnv();
   let fetched = false;
   const fetchImpl = async () => {
     fetched = true;
@@ -588,7 +634,9 @@ test("webhook ignores unknown events and rejects a bad signature before fetch", 
     { fetch: fetchImpl, nowMs: NOW_MS },
   );
   assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), { ok: true, ignored: true });
   assert.equal(fetched, false);
+  assert.equal(sent.length, 0);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 0);
 
   const bad = await handleFetch(
@@ -606,6 +654,7 @@ test("webhook ignores unknown events and rejects a bad signature before fetch", 
   );
   assert.equal(bad.status, 401);
   assert.equal(fetched, false);
+  assert.equal(sent.length, 0);
 
   const spaced = JSON.stringify({ type: "email.delivered", data: { email_id: EMAIL_ID } });
   const reparsed = await handleFetch(
@@ -625,8 +674,10 @@ test("webhook ignores unknown events and rejects a bad signature before fetch", 
 });
 
 test("webhook refuses a raw download that redirects off Resend", async () => {
-  const { db, env } = sqliteEnv();
+  const { db, env, sent } = sqliteEnv();
+  let fetched = false;
   const fetchImpl = async (url) => {
+    fetched = true;
     const href = String(url);
     if (href.startsWith("https://api.resend.com/emails/receiving/")) {
       return jsonResponse({
@@ -656,8 +707,16 @@ test("webhook refuses a raw download that redirects off Resend", async () => {
     env,
     { fetch: fetchImpl, nowMs: NOW_MS },
   );
-  assert.equal(res.status, 500);
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { ok: true, queued: true });
+  assert.equal(fetched, false);
+  const message = queueMessage(sent[0], 1);
+  await handleQueue({ queue: "mail-ingest", messages: [message] }, env, { fetch: fetchImpl, nowMs: NOW_MS });
+  assert.deepEqual(message.ops, [{ op: "ack" }]);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 0);
+  const failure = db.prepare("SELECT * FROM ingest_failures").get();
+  assert.equal(failure.resend_id, EMAIL_ID);
+  assert.match(failure.error, /unexpected download host/);
 });
 
 test("webhook stores outbound mail without auth or raw", async () => {
@@ -790,6 +849,362 @@ test("MCP HTTP auth runs before JSON parsing", async () => {
     env,
   );
   assert.equal(type.status, 415);
+});
+
+test("schema.sql can be applied twice and stores ingest failures", () => {
+  const db = new DatabaseSync(":memory:");
+  const sql = readFileSync(new URL("./schema.sql", import.meta.url), "utf8");
+  db.exec(sql);
+  db.exec(sql);
+  const poison = "'; DROP TABLE emails; --";
+  const insert = buildFailureInsert({
+    resend_id: poison,
+    event_type: "email.received",
+    error: "Bearer secret-token resend 404",
+    attempts: 2,
+    failed_at: "2026-09-28T12:00:00.000Z",
+  });
+  assert.equal(insert.sql.includes(poison), false);
+  assert.equal(insert.sql.includes("Bearer"), false);
+  db.prepare(insert.sql).run(...insert.params);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 0);
+  const row = db.prepare("SELECT * FROM ingest_failures").get();
+  assert.equal(row.resend_id, poison);
+  assert.equal(row.event_type, "email.received");
+  assert.equal(row.error, "Bearer [redacted] resend 404");
+  assert.equal(row.attempts, 2);
+  assert.equal(row.failed_at, "2026-09-28T12:00:00.000Z");
+});
+
+test("wrangler keeps production and staging queues apart", () => {
+  const toml = readFileSync(new URL("./wrangler.toml", import.meta.url), "utf8");
+  assert.equal(toml.includes("whsec_"), false);
+  assert.equal(/RESEND_API_KEY\s*=/.test(toml), false);
+  assert.equal(/MCP_TOKEN\s*=/.test(toml), false);
+  const parts = toml.split("\n[env.staging]\n");
+  assert.equal(parts.length, 2);
+  const [prod, staging] = parts;
+  assert.match(prod, /database_id = "779058bf-f5c1-44de-b2c8-99350ec7748e"/);
+  assert.match(prod, /binding = "ARCHIVE_BUCKET"/);
+  assert.match(prod, /queue = "mail-ingest"/);
+  assert.match(prod, /dead_letter_queue = "mail-ingest-dlq"/);
+  assert.match(prod, /queue = "mail-ingest"\nmax_batch_size = 1\nmax_batch_timeout = 1\nmax_retries = 5/);
+  assert.match(prod, /queue = "mail-ingest-dlq"\nmax_batch_size = 1\nmax_batch_timeout = 1\nmax_retries = 3/);
+  assert.match(prod, /retry_delay = 60/);
+  assert.match(prod, /max_batch_size = 1/);
+  assert.equal(prod.includes("mail-ingest-staging"), false);
+  assert.equal(staging.includes("779058bf-f5c1-44de-b2c8-99350ec7748e"), false);
+  assert.match(staging, /name = "resend-agent-mail-relay-staging"/);
+  assert.match(staging, /database_name = "abot-mail-archive-staging"/);
+  assert.match(staging, /bucket_name = "abot-mail-archive-staging"/);
+  assert.match(staging, /binding = "ARCHIVE_BUCKET"/);
+  assert.match(staging, /queue = "mail-ingest-staging"/);
+  assert.match(staging, /dead_letter_queue = "mail-ingest-staging-dlq"/);
+  assert.equal(INGEST_MAX_RETRIES, 3);
+  assert.equal(INGEST_RETRY_BASE_SEC, 60);
+  assert.equal(retryDelaySeconds(1), 60);
+  assert.equal(retryDelaySeconds(2), 120);
+  assert.equal(retryDelaySeconds(3), 240);
+});
+
+function receivedEmailResponse(status = 200) {
+  if (status !== 200) return new Response("no", { status });
+  return jsonResponse({
+    id: EMAIL_ID,
+    from: "a@b.c",
+    to: ["eric@abot.run"],
+    subject: "queued",
+    text: "hello queue",
+    created_at: "2026-09-28T00:00:00.000Z",
+    raw: { download_url: "https://cdn.resend.app/raw" },
+  });
+}
+
+function ingestFetch({ apiStatus = 200, apiStatuses = null } = {}) {
+  const statuses = apiStatuses ? [...apiStatuses] : null;
+  return async (url) => {
+    const href = String(url);
+    if (href === `https://api.resend.com/emails/receiving/${EMAIL_ID}`) {
+      const status = statuses ? statuses.shift() ?? 200 : apiStatus;
+      return receivedEmailResponse(status);
+    }
+    if (href === "https://cdn.resend.app/raw") return new Response("Subject: queued\r\n\r\nhello\r\n", { status: 200 });
+    if (href.startsWith(`https://api.resend.com/emails/receiving/${EMAIL_ID}/attachments`)) {
+      return jsonResponse({ object: "list", has_more: false, data: [] });
+    }
+    throw new Error(`unexpected fetch ${href}`);
+  };
+}
+
+test("webhook enqueues only signed mail events", async () => {
+  const { db, env, sent } = sqliteEnv();
+  let fetched = false;
+  const fetchImpl = async () => {
+    fetched = true;
+    throw new Error("webhook must not call Resend");
+  };
+  const event = { type: "email.received", created_at: "2026-09-28T06:15:24.000Z", data: { email_id: EMAIL_ID } };
+  const res = await handleFetch(
+    new Request("https://example.test/", {
+      method: "POST",
+      headers: {
+        "svix-id": "msg_q",
+        "svix-timestamp": freshTimestamp(),
+        "svix-signature": sign("msg_q", freshTimestamp(), JSON.stringify(event)),
+      },
+      body: JSON.stringify(event),
+    }),
+    env,
+    { fetch: fetchImpl, nowMs: NOW_MS },
+  );
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { ok: true, queued: true });
+  assert.equal(fetched, false);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 0);
+  assert.equal(sent.length, 1);
+
+  const sentEvent = { type: "email.sent", created_at: "2026-09-28T08:00:01.000Z", data: { email_id: "sent-1111-2222" } };
+  const sentRaw = JSON.stringify(sentEvent);
+  const sentTs = freshTimestamp();
+  const sentRes = await handleFetch(
+    new Request("https://example.test/", {
+      method: "POST",
+      headers: {
+        "svix-id": "msg_sent",
+        "svix-timestamp": sentTs,
+        "svix-signature": sign("msg_sent", sentTs, sentRaw),
+      },
+      body: sentRaw,
+    }),
+    env,
+    { fetch: fetchImpl, nowMs: NOW_MS },
+  );
+  assert.equal(sentRes.status, 200);
+  assert.equal((await sentRes.json()).queued, true);
+  assert.equal(sent[1].event_type, "email.sent");
+  assert.equal(sent[1].resend_id, "sent-1111-2222");
+
+  const badId = { type: "email.received", created_at: "2026-09-28T06:15:24.000Z", data: { email_id: "../secret" } };
+  const badRaw = JSON.stringify(badId);
+  const badTs = freshTimestamp();
+  const bad = await handleFetch(
+    new Request("https://example.test/", {
+      method: "POST",
+      headers: {
+        "svix-id": "msg_bad_id",
+        "svix-timestamp": badTs,
+        "svix-signature": sign("msg_bad_id", badTs, badRaw),
+      },
+      body: badRaw,
+    }),
+    env,
+    { fetch: fetchImpl, nowMs: NOW_MS },
+  );
+  assert.equal(bad.status, 400);
+  assert.deepEqual(await bad.json(), { ok: false, error: "invalid email_id" });
+  assert.equal(sent.length, 2);
+
+  const missing = await handleFetch(
+    new Request("https://example.test/", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: badRaw,
+    }),
+    env,
+    { fetch: fetchImpl, nowMs: NOW_MS },
+  );
+  assert.equal(missing.status, 401);
+  assert.equal(sent.length, 2);
+
+  const huge = await handleFetch(
+    new Request("https://example.test/", { method: "POST", body: "x".repeat(1_000_001) }),
+    env,
+    { fetch: fetchImpl, nowMs: NOW_MS },
+  );
+  assert.equal(huge.status, 413);
+  assert.equal(sent.length, 2);
+  assert.equal(fetched, false);
+
+  env.INGEST_QUEUE = {
+    async send() {
+      throw new Error("queue unavailable");
+    },
+  };
+  const failed = await handleFetch(
+    new Request("https://example.test/", {
+      method: "POST",
+      headers: {
+        "svix-id": "msg_q",
+        "svix-timestamp": freshTimestamp(),
+        "svix-signature": sign("msg_q", freshTimestamp(), JSON.stringify(event)),
+      },
+      body: JSON.stringify(event),
+    }),
+    env,
+    { fetch: fetchImpl, nowMs: NOW_MS },
+  );
+  assert.equal(failed.status, 500);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 0);
+});
+
+test("consumer retries transient failures, then archives once", async () => {
+  const { db, bucket, env } = sqliteEnv();
+  const fetchImpl = ingestFetch({ apiStatuses: [503, 200] });
+  const body = {
+    resend_id: EMAIL_ID,
+    event_type: "email.received",
+    received_at: "2026-09-28T00:00:01.000Z",
+    svix_id: "msg_retry",
+  };
+  const first = queueMessage(body, 1);
+  await handleQueue({ queue: "mail-ingest", messages: [first] }, env, { fetch: fetchImpl, nowMs: NOW_MS });
+  assert.deepEqual(first.ops, [{ op: "retry", options: { delaySeconds: 60 } }]);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM ingest_failures").get().n, 0);
+
+  const second = queueMessage(body, 2);
+  await handleQueue({ queue: "mail-ingest", messages: [second] }, env, { fetch: fetchImpl, nowMs: NOW_MS });
+  assert.deepEqual(second.ops, [{ op: "ack" }]);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 1);
+  assert.ok(bucket.has(`raw/${EMAIL_ID}.eml`));
+
+  const third = queueMessage(body, 1);
+  const callsBefore = db.prepare("SELECT COUNT(*) AS n FROM emails").get().n;
+  let fetches = 0;
+  const countingFetch = async (url, init) => {
+    fetches += 1;
+    return fetchImpl(url, init);
+  };
+  await handleQueue({ queue: "mail-ingest", messages: [third] }, env, { fetch: countingFetch, nowMs: NOW_MS });
+  assert.deepEqual(third.ops, [{ op: "ack" }]);
+  assert.equal(fetches, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, callsBefore);
+});
+
+test("consumer records permanent Resend 4xx and exhausted retries", async () => {
+  const { db, env } = sqliteEnv();
+  assert.equal(isRetryableIngestError(Object.assign(new Error("resend 404"), { status: 404, source: "resend" })), false);
+  assert.equal(isRetryableIngestError(Object.assign(new Error("resend 429"), { status: 429, source: "resend" })), true);
+  assert.equal(isRetryableIngestError(Object.assign(new Error("resend 503"), { status: 503, source: "resend" })), true);
+  assert.equal(isRetryableIngestError(new TypeError("network timeout")), true);
+  assert.equal(isRetryableIngestError(new Error("refusing unexpected download host")), false);
+
+  const missing = queueMessage(
+    { resend_id: EMAIL_ID, event_type: "email.received", received_at: "2026-09-28T00:00:01.000Z" },
+    1,
+  );
+  await handleQueue(
+    { queue: "mail-ingest", messages: [missing] },
+    env,
+    { fetch: ingestFetch({ apiStatus: 404 }), nowMs: NOW_MS },
+  );
+  assert.deepEqual(missing.ops, [{ op: "ack" }]);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 0);
+  const notFound = db.prepare("SELECT * FROM ingest_failures").get();
+  assert.equal(notFound.error, "resend 404");
+  assert.equal(notFound.attempts, 1);
+  assert.equal(notFound.event_type, "email.received");
+  assert.equal(notFound.failed_at, new Date(NOW_MS).toISOString());
+
+  const exhausted = queueMessage(
+    { resend_id: EMAIL_ID, event_type: "email.received", received_at: "2026-09-28T00:00:01.000Z" },
+    INGEST_MAX_RETRIES + 1,
+  );
+  await handleQueue(
+    { queue: "mail-ingest", messages: [exhausted] },
+    env,
+    { fetch: ingestFetch({ apiStatus: 503 }), nowMs: NOW_MS },
+  );
+  assert.deepEqual(exhausted.ops, [{ op: "ack" }]);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 0);
+  const dead = db.prepare("SELECT * FROM ingest_failures WHERE error = ?").get("resend 503");
+  assert.equal(dead.attempts, INGEST_MAX_RETRIES + 1);
+  assert.equal(dead.resend_id, EMAIL_ID);
+});
+
+test("poison queue messages are recorded and never fetched", async () => {
+  const { db, env } = sqliteEnv();
+  let fetched = false;
+  const fetchImpl = async () => {
+    fetched = true;
+    throw new Error("poison must not be fetched");
+  };
+  const samples = [
+    null,
+    ["email.received"],
+    { event_type: "email.bounced", resend_id: EMAIL_ID },
+    { event_type: "email.received", resend_id: "'; DROP TABLE emails; --" },
+    { event_type: "email.received" },
+  ];
+  for (const body of samples) {
+    const message = queueMessage(body, 1);
+    await handleQueue({ queue: "mail-ingest", messages: [message] }, env, { fetch: fetchImpl, nowMs: NOW_MS });
+    assert.deepEqual(message.ops, [{ op: "ack" }]);
+  }
+  assert.equal(fetched, false);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM ingest_failures").get().n, samples.length);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 0);
+});
+
+test("dead letter queue records the message without calling Resend", async () => {
+  const { db, env } = sqliteEnv();
+  let fetched = false;
+  const message = queueMessage(
+    { resend_id: EMAIL_ID, event_type: "email.received", received_at: "2026-09-28T00:00:01.000Z" },
+    4,
+  );
+  await handleQueue({ queue: "mail-ingest-dlq", messages: [message] }, env, {
+    fetch: async () => {
+      fetched = true;
+      throw new Error("dlq must not fetch");
+    },
+    nowMs: NOW_MS,
+  });
+  assert.equal(fetched, false);
+  assert.deepEqual(message.ops, [{ op: "ack" }]);
+  const row = db.prepare("SELECT * FROM ingest_failures").get();
+  assert.equal(row.error, "retries exhausted");
+  assert.equal(row.resend_id, EMAIL_ID);
+  assert.equal(row.attempts, 4);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 0);
+
+  const staging = queueMessage({ resend_id: EMAIL_ID, event_type: "email.sent" }, 3);
+  await handleQueue({ queue: "mail-ingest-staging-dlq", messages: [staging] }, env, { nowMs: NOW_MS });
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM ingest_failures").get().n, 2);
+});
+
+test("a D1 outage while recording a failure is retried", async () => {
+  const { env } = sqliteEnv();
+  env.DB = {
+    prepare() {
+      throw new Error("d1 unavailable");
+    },
+  };
+  const message = queueMessage({ resend_id: EMAIL_ID, event_type: "email.received" }, 2);
+  await handleQueue({ queue: "mail-ingest-dlq", messages: [message] }, env, { nowMs: NOW_MS });
+  assert.deepEqual(message.ops, [{ op: "retry", options: { delaySeconds: 120 } }]);
+});
+
+test("overlapping archive attempts still leave one email row", async () => {
+  const { db, env } = sqliteEnv();
+  const fetchImpl = ingestFetch();
+  const event = { type: "email.received", created_at: "2026-09-28T00:00:01.000Z", data: { email_id: EMAIL_ID } };
+  const [a, b] = await Promise.all([
+    archiveEvent({ event, env, fetchImpl, nowMs: NOW_MS }),
+    archiveEvent({ event, env, fetchImpl, nowMs: NOW_MS }),
+  ]);
+  assert.equal(a.status, 200);
+  assert.equal(b.status, 200);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 1);
+  assert.equal(db.prepare("SELECT text_body FROM emails").get().text_body, "hello queue");
+});
+
+test("worker queue handler is exported", async () => {
+  assert.equal(typeof worker.fetch, "function");
+  assert.equal(typeof worker.queue, "function");
+  const { env } = sqliteEnv();
+  await worker.queue({ queue: "mail-ingest", messages: [] }, env);
 });
 
 test("unknown routes and methods", async () => {

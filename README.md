@@ -2,7 +2,7 @@
 
 项目：`abot-mail`。
 
-Resend 的 `email.received` / `email.sent` webhook 进入 Cloudflare Worker `resend-agent-mail-relay`。验过 Svix 签名后，Worker 再向 Resend API 取全文，把结构化字段写入 D1，把原始 `.eml` 和附件写入 R2。历史邮件通过同一个 Worker 上的 MCP，或 `skill/mail_archive.py`，从这份存档里读。
+Resend 的 `email.received` / `email.sent` webhook 进入 Cloudflare Worker `resend-agent-mail-relay`。验过 Svix 签名后，Worker 把 `{resend_id, event_type, received_at}` 放进队列 `mail-ingest` 并立刻返回 `200 {"ok":true,"queued":true}`。队列消费者再向 Resend API 取全文，把结构化字段写入 D1，把原始 `.eml` 和附件写入 R2。失败可重试；不能重试或重试耗尽的消息写入 D1 表 `ingest_failures`。历史邮件通过同一个 Worker 上的 MCP，或 `skill/mail_archive.py`，从这份存档里读。
 
 存储只在已有的 Cloudflare 账号里：
 
@@ -11,6 +11,7 @@ Resend 的 `email.received` / `email.sent` webhook 进入 Cloudflare Worker `res
 | Worker | `resend-agent-mail-relay` | `https://resend-agent-mail-relay.eric9n-cf.workers.dev` |
 | D1 | `abot-mail-archive` | `779058bf-f5c1-44de-b2c8-99350ec7748e` |
 | R2 | `abot-mail-archive` | binding `ARCHIVE_BUCKET` |
+| Queue | `mail-ingest` | binding `INGEST_QUEUE`；死信 `mail-ingest-dlq` |
 
 D1 binding 名是 `DB`。密钥只放在 Worker secrets 里：`WEBHOOK_SECRET`、`RESEND_API_KEY`、`MCP_TOKEN`。
 
@@ -21,12 +22,16 @@ D1 binding 名是 `DB`。密钥只放在 Worker secrets 里：`WEBHOOK_SECRET`�
 ```bash
 npm test
 cd worker
+npx wrangler queues create mail-ingest
+npx wrangler queues create mail-ingest-dlq
 npx wrangler d1 execute abot-mail-archive --remote --file=schema.sql
 npx wrangler secret put WEBHOOK_SECRET
 npx wrangler secret put RESEND_API_KEY
 npx wrangler secret put MCP_TOKEN
 npx wrangler deploy
 ```
+
+Staging 使用另一套名字，不能和生产队列混用：`mail-ingest-staging`、`mail-ingest-staging-dlq`、D1 `abot-mail-archive-staging`、R2 `abot-mail-archive-staging`、Worker `resend-agent-mail-relay-staging`。绑定写在 `worker/wrangler.toml` 的 `[env.staging]`。staging 的 `database_id` 要换成 `wrangler d1 create` 打印的 id，占位符不是生产库。部署 staging 用 `npx wrangler deploy --env staging`，secrets 也加 `--env staging`。
 
 `schema.sql` 使用 `IF NOT EXISTS`，重复执行不会清掉已有邮件。Worker 名称与现有脚本相同，部署后地址保持 `https://resend-agent-mail-relay.eric9n-cf.workers.dev`。
 
@@ -38,7 +43,7 @@ npx wrangler deploy
 
 在 Resend 里把 webhook 指到 `https://resend-agent-mail-relay.eric9n-cf.workers.dev/`，订阅 `email.received` 和 `email.sent`。其它事件类型验签通过后直接回 200，不入库。
 
-同一封邮件以 Resend 的 id 为主键，`INSERT OR IGNORE`。Resend 重试时，已经入库的 id 直接回 200，不再拉正文。正文和附件都写完之后才插入 D1；中途失败回 500，让 Resend 重试。
+同一封邮件以 Resend 的 id 为主键，`INSERT OR IGNORE`。Webhook 不再返回 `duplicate:true`：去重在消费者里，已有行则跳过 Resend 和 R2。正文和附件都写完之后才插入 D1。Resend 5xx、429、网络超时、D1/R2 瞬时失败会按 60s、120s、240s 再试三次；第四次仍失败，或 Resend 返回 4xx（含 404），写入 `ingest_failures` 后确认消息。死信队列上的消息只落这张表，不再调 Resend。重放时把原来的 webhook 再投一次即可，消费者仍按 `resend_id` 去重。
 
 对象键：
 
@@ -51,7 +56,7 @@ npx wrangler deploy
 
 | 方法 | 路径 | 鉴权 | 作用 |
 | --- | --- | --- | --- |
-| `POST` | `/` | Svix 签名 | 收 webhook |
+| `POST` | `/` | Svix 签名 | 验签后入队 `mail-ingest` |
 | `POST` | `/mcp` | `Authorization: Bearer <MCP_TOKEN>` | MCP |
 | `GET` | `/health` | 无 | `{"ok":true,"last_received_at":"...","count_24h":N}` |
 
@@ -121,6 +126,6 @@ python3 skill/mail_archive.py get 435eb30a-d52d-4f7c-a400-ccac381b7cc4 --include
    - `/health` 的 `count_24h` 增加，响应里仍然没有邮件内容
    - MCP `search_emails` 能按主题找到元数据，`get_email` 能读到 `text_body`
    - `include_raw_eml=true` 能读到原文；R2 里有 `raw/{resend_id}.eml` 和 `attachments/{resend_id}/...`
-5. 再触发一次同一 webhook（或等 Resend 重试）。响应是 `{"ok":true,"duplicate":true}`，D1 里仍然只有一行。
+5. 再触发一次同一 webhook（或等 Resend 重试）。响应是 `{"ok":true,"queued":true}`，消费者跑完后 D1 里仍然只有一行。
 6. 从本域发出一封邮件且 webhook 含 `email.sent` 后，`direction` 为 `out`，`auth` 为空。
 7. `MAIL_ACCOUNT_ID` 和 `MAIL_D1_ID` 配好后，`python3 skill/mail_archive.py stats` 的 `total` 与 MCP `email_stats` 一致。

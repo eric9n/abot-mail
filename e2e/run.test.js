@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { signSvix } from "./run.mjs";
-import { verifySvixSignature } from "../worker/worker.js";
+import { handleFetch, verifySvixSignature } from "../worker/worker.js";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 
@@ -35,6 +35,48 @@ test("e2e signer matches the worker verifier", async () => {
   });
   assert.equal(expired.ok, false);
   assert.equal(expired.reason, "timestamp_out_of_range");
+});
+
+test("e2e signer is accepted by the worker webhook and only enqueues", async () => {
+  const secret = `whsec_${Buffer.from("unit-test-webhook-secret").toString("base64")}`;
+  const body = JSON.stringify({
+    type: "email.received",
+    created_at: "2026-09-28T12:00:00.000Z",
+    data: { email_id: "abc-1" },
+  });
+  const nowMs = Date.parse("2026-09-28T12:00:00.000Z");
+  const timestamp = String(Math.floor(nowMs / 1000) - 15);
+  const sent = [];
+  const res = await handleFetch(
+    new Request("https://example.test/", {
+      method: "POST",
+      headers: {
+        "svix-id": "msg_e2e",
+        "svix-timestamp": timestamp,
+        "svix-signature": signSvix({ secret, svixId: "msg_e2e", timestamp, body }),
+      },
+      body,
+    }),
+    {
+      WEBHOOK_SECRET: secret,
+      INGEST_QUEUE: {
+        async send(message) {
+          sent.push(message);
+        },
+      },
+    },
+    { nowMs },
+  );
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { ok: true, queued: true });
+  assert.deepEqual(sent, [
+    {
+      resend_id: "abc-1",
+      event_type: "email.received",
+      received_at: "2026-09-28T12:00:00.000Z",
+      svix_id: "msg_e2e",
+    },
+  ]);
 });
 
 test("e2e exits non-zero when credentials are missing", () => {

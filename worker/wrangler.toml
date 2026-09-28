@@ -12,3 +12,68 @@ database_id = "779058bf-f5c1-44de-b2c8-99350ec7748e"
 [[r2_buckets]]
 binding = "ARCHIVE_BUCKET"
 bucket_name = "abot-mail-archive"
+
+# Production ingest queue. Staging must not bind this name; see [env.staging].
+# Secrets stay in `wrangler secret put` (WEBHOOK_SECRET, RESEND_API_KEY, MCP_TOKEN).
+[[queues.producers]]
+binding = "INGEST_QUEUE"
+queue = "mail-ingest"
+
+# max_retries is above the worker's own limit (INGEST_MAX_RETRIES). The worker
+# records ingest_failures on the delivery after that limit and acks, so the
+# platform must still deliver that attempt. The DLQ catches crashes.
+[[queues.consumers]]
+queue = "mail-ingest"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 5
+max_concurrency = 2
+retry_delay = 60
+dead_letter_queue = "mail-ingest-dlq"
+
+# DLQ has no dead_letter_queue of its own. The consumer writes ingest_failures and acks.
+[[queues.consumers]]
+queue = "mail-ingest-dlq"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 3
+max_concurrency = 1
+
+[env.staging]
+name = "resend-agent-mail-relay-staging"
+# Separate worker, D1, R2, and queue. Do not point these at production.
+# Replace database_id after `npx wrangler d1 create abot-mail-archive-staging`.
+# The placeholder is not the production database. Deploy fails until it is replaced
+# with the id that command prints. Create the queues before deploy:
+#   npx wrangler queues create mail-ingest-staging
+#   npx wrangler queues create mail-ingest-staging-dlq
+# Do not set these secrets on the production worker, or the reverse.
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "abot-mail-archive-staging"
+database_id = "00000000-0000-4000-8000-000000000000"
+
+[[env.staging.r2_buckets]]
+binding = "ARCHIVE_BUCKET"
+bucket_name = "abot-mail-archive-staging"
+
+[[env.staging.queues.producers]]
+binding = "INGEST_QUEUE"
+queue = "mail-ingest-staging"
+
+[[env.staging.queues.consumers]]
+queue = "mail-ingest-staging"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 5
+max_concurrency = 2
+retry_delay = 60
+dead_letter_queue = "mail-ingest-staging-dlq"
+
+[[env.staging.queues.consumers]]
+queue = "mail-ingest-staging-dlq"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 3
+max_concurrency = 1
