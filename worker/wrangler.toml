@@ -2,11 +2,13 @@ name = "resend-agent-mail-relay"
 main = "worker.js"
 compatibility_date = "2026-09-01"
 
+# D1 database abot-mail-archive (already created).
 [[d1_databases]]
 binding = "DB"
 database_name = "abot-mail-archive"
 database_id = "779058bf-f5c1-44de-b2c8-99350ec7748e"
 
+# R2 bucket abot-mail-archive (already created).
 [[r2_buckets]]
 binding = "ARCHIVE_BUCKET"
 bucket_name = "abot-mail-archive"
