@@ -3,6 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --disable-warning=ExperimentalWarning --test"
+    "test": "node --disable-warning=ExperimentalWarning --test",
+    "gate": "node --check worker/worker.js && node --check e2e/run.mjs && python3 -m py_compile skill/mail_archive.py && node --disable-warning=ExperimentalWarning --test",
+    "e2e": "node e2e/run.mjs"
   }
 }
