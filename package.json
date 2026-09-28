@@ -1,0 +1,8 @@
+{
+  "name": "abot-mail-archive",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --disable-warning=ExperimentalWarning --test"
+  }
+}
