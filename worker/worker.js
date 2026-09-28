@@ -859,14 +859,16 @@ export function retryDelaySeconds(attempts) {
   return INGEST_RETRY_BASE_SEC * 2 ** exp;
 }
 
-/** 4xx from Resend (except 429) and local refusals do not get another try. */
+/** 4xx from Resend or a download (except 429) and local refusals do not get another try. */
 export function isRetryableIngestError(err) {
   if (!err || typeof err !== "object") return true;
   const status = Number(err.status);
   if (err.source === "resend" && Number.isFinite(status)) {
     return status === 429 || status >= 500;
   }
-  if (err.source === "download") return true;
+  if (err.source === "download" && Number.isFinite(status)) {
+    return status === 429 || status >= 500;
+  }
   const message = String(err.message || "");
   const resendStatus = /^resend (\d+)$/.exec(message);
   if (resendStatus) {

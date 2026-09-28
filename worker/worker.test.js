@@ -1086,6 +1086,9 @@ test("consumer records permanent Resend 4xx and exhausted retries", async () => 
   assert.equal(isRetryableIngestError(Object.assign(new Error("resend 404"), { status: 404, source: "resend" })), false);
   assert.equal(isRetryableIngestError(Object.assign(new Error("resend 429"), { status: 429, source: "resend" })), true);
   assert.equal(isRetryableIngestError(Object.assign(new Error("resend 503"), { status: 503, source: "resend" })), true);
+  assert.equal(isRetryableIngestError(Object.assign(new Error("download 404"), { status: 404, source: "download" })), false);
+  assert.equal(isRetryableIngestError(Object.assign(new Error("download 429"), { status: 429, source: "download" })), true);
+  assert.equal(isRetryableIngestError(Object.assign(new Error("download 503"), { status: 503, source: "download" })), true);
   assert.equal(isRetryableIngestError(new TypeError("network timeout")), true);
   assert.equal(isRetryableIngestError(new Error("refusing unexpected download host")), false);
 
