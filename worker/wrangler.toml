@@ -1,0 +1,12 @@
+name = "resend-agent-mail-relay"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "abot-mail-archive"
+database_id = "779058bf-f5c1-44de-b2c8-99350ec7748e"
+
+[[r2_buckets]]
+binding = "ARCHIVE_BUCKET"
+bucket_name = "abot-mail-archive"
