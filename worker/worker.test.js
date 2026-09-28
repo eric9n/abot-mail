@@ -5,9 +5,12 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import worker, {
+  CACHE_TTL,
   INGEST_MAX_RETRIES,
   INGEST_RETRY_BASE_SEC,
+  READ_REV_URL,
   RpcError,
+  STATS_CACHE_URL,
   archiveEvent,
   assembleStats,
   assertAllowedDownloadUrl,
@@ -20,15 +23,24 @@ import worker, {
   buildSearchQuery,
   buildStatsQueries,
   canonicalBound,
+  canonicalCacheRecord,
   decodeWebhookSecret,
+  emailCacheDecision,
+  getEmailCacheUrl,
   handleFetch,
   handleMcpRpc,
   handleQueue,
+  hashCacheFields,
   isRetryableIngestError,
   likeContains,
+  listCacheFields,
+  listCacheUrl,
   mapEmailForStorage,
   parseEmailDate,
+  r2CacheUrl,
   retryDelaySeconds,
+  searchCacheFields,
+  searchCacheUrl,
   timingSafeEqual,
   toMetadata,
   verifySvixSignature,
@@ -1216,4 +1228,708 @@ test("unknown routes and methods", async () => {
   assert.equal(missing.status, 404);
   const healthPost = await handleFetch(new Request("https://example.test/health", { method: "POST" }), env);
   assert.equal(healthPost.status, 405);
+});
+
+function memoryCache() {
+  const store = new Map();
+  const clock = { now: 0 };
+  const cache = {
+    puts: [],
+    deletes: [],
+    matches: [],
+    advance(ms) {
+      clock.now += ms;
+    },
+    async match(request) {
+      const url = request.url;
+      cache.matches.push({ url, method: request.method, authorization: request.headers.get("authorization") });
+      const hit = store.get(url);
+      if (!hit) return undefined;
+      if (clock.now >= hit.expires) {
+        store.delete(url);
+        return undefined;
+      }
+      return new Response(hit.body, { status: 200, headers: hit.headers });
+    },
+    async put(request, response) {
+      const url = request.url;
+      const cacheControl = response.headers.get("cache-control") || "";
+      const body = await response.text();
+      cache.puts.push({
+        url,
+        method: request.method,
+        authorization: request.headers.get("authorization"),
+        cacheControl,
+        status: response.status,
+        body,
+      });
+      const maxAge = Number(/max-age=(\d+)/.exec(cacheControl)?.[1]);
+      if (response.status === 200 && Number.isFinite(maxAge) && maxAge > 0) {
+        store.set(url, {
+          body,
+          expires: clock.now + maxAge * 1000,
+          headers: {
+            "content-type": response.headers.get("content-type") || "application/octet-stream",
+            "cache-control": cacheControl,
+          },
+        });
+      }
+    },
+    async delete(request) {
+      cache.deletes.push(request.url);
+      return store.delete(request.url);
+    },
+  };
+  return cache;
+}
+
+function instrumentDb(env) {
+  const sqls = [];
+  const orig = env.DB.prepare.bind(env.DB);
+  env.DB.prepare = (sql) => {
+    sqls.push(sql);
+    return orig(sql);
+  };
+  return {
+    sqls,
+    reset() {
+      sqls.length = 0;
+    },
+  };
+}
+
+function instrumentBucket(env) {
+  const keys = [];
+  const orig = env.ARCHIVE_BUCKET.get.bind(env.ARCHIVE_BUCKET);
+  env.ARCHIVE_BUCKET.get = async (key) => {
+    keys.push(key);
+    return orig(key);
+  };
+  return keys;
+}
+
+async function mcpCall(env, message, deps) {
+  const res = await handleFetch(
+    new Request("https://example.test/mcp", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer test-mcp-token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(message),
+    }),
+    env,
+    deps,
+  );
+  return {
+    status: res.status,
+    cacheControl: res.headers.get("cache-control"),
+    body: res.status === 202 ? null : await res.json(),
+  };
+}
+
+function toolMessage(id, name, args) {
+  return { jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } };
+}
+
+function toolValue(rpc) {
+  assert.equal(rpc.status, 200);
+  assert.equal(rpc.body.error, undefined);
+  return JSON.parse(rpc.body.result.content[0].text);
+}
+
+test("cache keys follow the phase-2 table and fresh is optional", async () => {
+  assert.equal(emailCacheDecision(false, undefined).ai, "none");
+  assert.equal(emailCacheDecision(false, null).cache, true);
+  for (const status of ["ok", "failed", "skipped", "deferred"]) {
+    assert.deepEqual(emailCacheDecision(true, status), { cache: true, ai: status });
+  }
+  assert.equal(emailCacheDecision(true, null).cache, false);
+  assert.equal(emailCacheDecision(true, "pending").cache, false);
+  assert.equal(emailCacheDecision(true, "").cache, false);
+
+  assert.equal(
+    getEmailCacheUrl(EMAIL_ID, true, false, "none"),
+    `https://cache.internal/mcp/get?id=${EMAIL_ID}&html=1&raw=0&ai=none`,
+  );
+  assert.equal(r2CacheUrl(`raw/${EMAIL_ID}.eml`), `https://cache.internal/r2/raw/${EMAIL_ID}.eml`);
+  assert.equal(
+    r2CacheUrl(`attachments/${EMAIL_ID}/a.png`),
+    `https://cache.internal/r2/attachments/${EMAIL_ID}/a.png`,
+  );
+  assert.equal(STATS_CACHE_URL, "https://cache.internal/mcp/stats");
+  assert.equal(CACHE_TTL.getEmail, 86400);
+  assert.equal(CACHE_TTL.r2, 604800);
+  assert.equal(CACHE_TTL.search, 10);
+  assert.equal(CACHE_TTL.list, 10);
+  assert.equal(CACHE_TTL.stats, 120);
+
+  const fields = searchCacheFields({
+    query: "invoice",
+    from: "a@b.c",
+    to: "eric@abot.run",
+    since: "2026-09-01",
+    until: "2026-09-28T00:00:00.000Z",
+    direction: "in",
+    limit: 500,
+  });
+  const record = canonicalCacheRecord(fields);
+  assert.deepEqual(
+    record.split("\n").map((line) => line.split("=")[0]),
+    ["direction", "from", "limit", "query", "since", "to", "until"],
+  );
+  assert.match(record, /^direction=in\nfrom=a@b\.c\nlimit=100\nquery=invoice\n/);
+  assert.match(record, /since=2026-09-01T00:00:00\.000Z/);
+  assert.equal(record.includes("fresh"), false);
+  assert.equal(record.includes("cursor"), false);
+  assert.equal(record.includes("token"), false);
+  assert.equal(record.includes("Bearer"), false);
+  const same = await hashCacheFields(searchCacheFields({ limit: 100, query: "invoice", from: "a@b.c", to: "eric@abot.run", since: "2026-09-01T00:00:00.000Z", until: "2026-09-28T00:00:00.000Z", direction: "in" }));
+  assert.equal(await hashCacheFields(fields), same);
+  assert.match(same, /^[0-9a-f]{64}$/);
+  const listRecord = canonicalCacheRecord(listCacheFields({ limit: 20, direction: "out", since: "2026-09-15" }));
+  assert.deepEqual(
+    listRecord.split("\n").map((line) => line.split("=")[0]),
+    ["direction", "limit", "since"],
+  );
+  assert.equal(listRecord.includes("cursor"), false);
+
+  const plain = buildSearchQuery({ query: "a", limit: 5 });
+  const withFresh = buildSearchQuery({ query: "a", limit: 5, fresh: true });
+  assert.equal(plain.sql, withFresh.sql);
+  assert.deepEqual(plain.params, withFresh.params);
+  assert.throws(() => buildSearchQuery({ query: "a", fresh: "yes" }), (err) => err instanceof RpcError && err.code === -32602);
+  assert.throws(() => buildListQuery({ cursor: "abc" }), (err) => err instanceof RpcError && err.code === -32602);
+  assert.throws(() => buildGetQuery({ resend_id: EMAIL_ID, fresh: 1 }), (err) => err instanceof RpcError && err.code === -32602);
+
+  const { env } = sqliteEnv();
+  const cache = memoryCache();
+  const listed = await mcpCall(env, { jsonrpc: "2.0", id: 1, method: "tools/list" }, { cache, nowMs: NOW_MS });
+  assert.equal(listed.status, 200);
+  for (const tool of listed.body.result.tools) {
+    assert.equal(tool.inputSchema.additionalProperties, false);
+    assert.equal(tool.inputSchema.properties.fresh.type, "boolean");
+    assert.equal((tool.inputSchema.required || []).includes("fresh"), false);
+  }
+  assert.equal(cache.puts.length, 0);
+  assert.equal(cache.matches.length, 0);
+
+  const skill = readFileSync(new URL("../skill/mail_archive.py", import.meta.url), "utf8");
+  assert.match(skill, /d1\/database\/\{\}\/query/);
+  assert.equal(skill.includes("cache.internal"), false);
+  assert.equal(skill.includes("caches.default"), false);
+});
+
+test("MCP reads hit the cache and stay no-store", async () => {
+  const { db, bucket, env } = sqliteEnv();
+  const row = mapEmailForStorage(
+    {
+      id: EMAIL_ID,
+      from: "alice@example.com",
+      to: ["eric@abot.run"],
+      subject: "invoice",
+      text: "please pay",
+      html: "<p>pay</p>",
+      created_at: "2026-09-28T00:00:00.000Z",
+    },
+    {
+      direction: "in",
+      eventCreatedAt: "2026-09-28T00:00:00.000Z",
+      attachments: [{ filename: "a.png", content_type: "image/png", size: 3, r2_key: `attachments/${EMAIL_ID}/a.png` }],
+    },
+  );
+  const insert = buildInsertQuery(row);
+  db.prepare(insert.sql).run(...insert.params);
+  await env.ARCHIVE_BUCKET.put(`raw/${EMAIL_ID}.eml`, new TextEncoder().encode("Subject: invoice\r\n\r\nplease pay\r\n"));
+  const sqls = instrumentDb(env);
+  const r2Gets = instrumentBucket(env);
+  const cache = memoryCache();
+  const deps = { cache, nowMs: NOW_MS };
+
+  const search = await mcpCall(env, toolMessage(1, "search_emails", { query: "invoice", limit: 500 }), deps);
+  const searchRows = toolValue(search);
+  assert.equal(searchRows.length, 1);
+  assert.equal(searchRows[0].resend_id, EMAIL_ID);
+  assert.equal("text_body" in searchRows[0], false);
+  assert.equal(search.cacheControl, "no-store");
+  const searchUrl = cache.puts.find((put) => put.url.startsWith("https://cache.internal/mcp/search?")).url;
+  assert.equal(searchUrl, searchCacheUrl(await hashCacheFields(searchCacheFields({ query: "invoice", limit: 100 })), 0));
+  assert.equal(cache.puts.find((put) => put.url === searchUrl).cacheControl, "max-age=10");
+  assert.equal(cache.puts.find((put) => put.url === searchUrl).status, 200);
+  assert.equal(cache.puts.find((put) => put.url === searchUrl).method, "GET");
+  sqls.reset();
+  const searchAgain = toolValue(await mcpCall(env, toolMessage(2, "search_emails", { limit: 100, query: "invoice" }), deps));
+  assert.equal(searchAgain.length, 1);
+  assert.equal(sqls.sqls.length, 0);
+  sqls.reset();
+  const other = toolValue(await mcpCall(env, toolMessage(3, "search_emails", { query: "missing" }), deps));
+  assert.equal(other.length, 0);
+  assert.equal(sqls.sqls.length, 1);
+
+  sqls.reset();
+  const listed = toolValue(await mcpCall(env, toolMessage(4, "list_emails", { direction: "in", since: "2026-09-01" }), deps));
+  assert.equal(listed.length, 1);
+  const listUrl = cache.puts.find((put) => put.url.startsWith("https://cache.internal/mcp/list?")).url;
+  assert.equal(
+    listUrl,
+    listCacheUrl(await hashCacheFields(listCacheFields({ direction: "in", since: "2026-09-01" })), 0),
+  );
+  assert.equal(cache.puts.find((put) => put.url === listUrl).cacheControl, "max-age=10");
+  sqls.reset();
+  toolValue(await mcpCall(env, toolMessage(5, "list_emails", { since: "2026-09-01T00:00:00.000Z", direction: "in" }), deps));
+  assert.equal(sqls.sqls.length, 0);
+
+  sqls.reset();
+  const stats = toolValue(await mcpCall(env, toolMessage(6, "email_stats", {}), deps));
+  assert.equal(stats.total, 1);
+  assert.equal(stats.by_direction.in, 1);
+  assert.equal(cache.puts.filter((put) => put.url === STATS_CACHE_URL).length, 1);
+  assert.equal(cache.puts.find((put) => put.url === STATS_CACHE_URL).cacheControl, "max-age=120");
+  assert.equal(sqls.sqls.length, 4);
+  sqls.reset();
+  const statsAgain = toolValue(await mcpCall(env, toolMessage(7, "email_stats", {}), deps));
+  assert.deepEqual(statsAgain, stats);
+  assert.equal(sqls.sqls.length, 0);
+
+  sqls.reset();
+  const detail = toolValue(
+    await mcpCall(env, toolMessage(8, "get_email", { resend_id: EMAIL_ID, include_html: false, include_raw_eml: false }), deps),
+  );
+  assert.equal(detail.found, true);
+  assert.equal(detail.text_body, "please pay");
+  assert.equal("html_body" in detail, false);
+  assert.equal("raw_eml" in detail, false);
+  assert.equal("ai_status" in detail, false);
+  const plainUrl = getEmailCacheUrl(EMAIL_ID, false, false, "none");
+  assert.equal(cache.puts.find((put) => put.url === plainUrl).cacheControl, "max-age=86400");
+  sqls.reset();
+  const plainAgain = toolValue(await mcpCall(env, toolMessage(9, "get_email", { resend_id: EMAIL_ID }), deps));
+  assert.equal(plainAgain.text_body, "please pay");
+  assert.equal(sqls.sqls.length, 0);
+  assert.equal(r2Gets.length, 0);
+
+  sqls.reset();
+  const html = toolValue(await mcpCall(env, toolMessage(10, "get_email", { resend_id: EMAIL_ID, include_html: true }), deps));
+  assert.match(html.html_body, /pay/);
+  assert.ok(sqls.sqls.some((sql) => sql.includes("FROM emails")));
+  const raw = toolValue(
+    await mcpCall(env, toolMessage(11, "get_email", { resend_id: EMAIL_ID, include_raw_eml: true }), deps),
+  );
+  assert.match(raw.raw_eml, /Subject: invoice/);
+  assert.equal(r2Gets.length, 1);
+  assert.deepEqual(r2Gets, [`raw/${EMAIL_ID}.eml`]);
+  const rawPut = cache.puts.find((put) => put.url === r2CacheUrl(`raw/${EMAIL_ID}.eml`));
+  assert.equal(rawPut.cacheControl, "max-age=604800");
+  assert.match(rawPut.body, /Subject: invoice/);
+  const r2Before = r2Gets.length;
+  sqls.reset();
+  const rawHtml = toolValue(
+    await mcpCall(
+      env,
+      toolMessage(12, "get_email", { resend_id: EMAIL_ID, include_html: true, include_raw_eml: true }),
+      deps,
+    ),
+  );
+  assert.match(rawHtml.html_body, /pay/);
+  assert.match(rawHtml.raw_eml, /Subject: invoice/);
+  assert.equal(r2Gets.length, r2Before);
+  assert.equal(rawHtml.attachments[0].r2_key, `attachments/${EMAIL_ID}/a.png`);
+
+  sqls.reset();
+  const missing = toolValue(await mcpCall(env, toolMessage(13, "get_email", { resend_id: "missing-id" }), deps));
+  assert.deepEqual(missing, { found: false, resend_id: "missing-id" });
+  const readsAfterMiss = sqls.sqls.filter((sql) => sql.includes("FROM emails")).length;
+  assert.equal(readsAfterMiss, 1);
+  assert.equal(cache.puts.some((put) => put.url.includes("id=missing-id")), false);
+  toolValue(await mcpCall(env, toolMessage(14, "get_email", { resend_id: "missing-id" }), deps));
+  assert.equal(sqls.sqls.filter((sql) => sql.includes("FROM emails")).length, 2);
+
+  for (const put of cache.puts) {
+    assert.equal(put.authorization, null);
+    assert.equal(put.cacheControl.includes("public"), false);
+    assert.equal(put.cacheControl.includes("no-store"), false);
+    assert.equal(put.url.includes("test-mcp-token"), false);
+    assert.equal(put.url.includes("Bearer"), false);
+  }
+  for (const match of cache.matches) {
+    assert.equal(match.method, "GET");
+    assert.equal(match.authorization, null);
+  }
+});
+
+test("fresh bypasses the cache and TTLs expire entries", async () => {
+  const { db, env } = sqliteEnv();
+  const cache = memoryCache();
+  const deps = { cache, nowMs: NOW_MS };
+  const sqls = instrumentDb(env);
+
+  await cache.put(
+    new Request(STATS_CACHE_URL),
+    new Response(JSON.stringify({ total: 999, by_direction: { in: 0, out: 0 }, by_day: [], top_senders: [] }), {
+      status: 200,
+      headers: { "cache-control": "max-age=120", "content-type": "application/json" },
+    }),
+  );
+  cache.puts.length = 0;
+  const stale = toolValue(await mcpCall(env, toolMessage(1, "email_stats", {}), deps));
+  assert.equal(stale.total, 999);
+  assert.equal(sqls.sqls.length, 0);
+  const fresh = toolValue(await mcpCall(env, toolMessage(2, "email_stats", { fresh: true }), deps));
+  assert.equal(fresh.total, 0);
+  assert.equal(sqls.sqls.length, 4);
+  sqls.reset();
+  const updated = toolValue(await mcpCall(env, toolMessage(3, "email_stats", { fresh: false }), deps));
+  assert.equal(updated.total, 0);
+  assert.equal(sqls.sqls.length, 0);
+
+  const row = mapEmailForStorage(
+    { id: "ttl-1", from: "a@b.c", to: ["eric@abot.run"], subject: "ttl", text: "body", created_at: "2026-09-28T00:00:00.000Z" },
+    { direction: "in", eventCreatedAt: "2026-09-28T00:00:00.000Z", attachments: [] },
+  );
+  db.prepare(buildInsertQuery(row).sql).run(...buildInsertQuery(row).params);
+  sqls.reset();
+  toolValue(await mcpCall(env, toolMessage(4, "search_emails", { query: "ttl" }), deps));
+  cache.advance(9_000);
+  sqls.reset();
+  toolValue(await mcpCall(env, toolMessage(5, "search_emails", { query: "ttl" }), deps));
+  assert.equal(sqls.sqls.length, 0);
+  cache.advance(2_000);
+  sqls.reset();
+  toolValue(await mcpCall(env, toolMessage(6, "search_emails", { query: "ttl" }), deps));
+  assert.equal(sqls.sqls.length, 1);
+
+  sqls.reset();
+  toolValue(await mcpCall(env, toolMessage(7, "list_emails", { limit: 1 }), deps));
+  cache.advance(9_000);
+  sqls.reset();
+  toolValue(await mcpCall(env, toolMessage(8, "list_emails", { limit: 1 }), deps));
+  assert.equal(sqls.sqls.length, 0);
+  cache.advance(2_000);
+  sqls.reset();
+  toolValue(await mcpCall(env, toolMessage(9, "list_emails", { limit: 1 }), deps));
+  assert.equal(sqls.sqls.length, 1);
+
+  cache.advance(CACHE_TTL.stats * 1000);
+  sqls.reset();
+  toolValue(await mcpCall(env, toolMessage(10, "email_stats", {}), deps));
+  assert.equal(sqls.sqls.length, 4);
+  cache.advance(119_000);
+  sqls.reset();
+  toolValue(await mcpCall(env, toolMessage(11, "email_stats", {}), deps));
+  assert.equal(sqls.sqls.length, 0);
+  cache.advance(2_000);
+  sqls.reset();
+  toolValue(await mcpCall(env, toolMessage(12, "email_stats", {}), deps));
+  assert.equal(sqls.sqls.length, 4);
+
+  sqls.reset();
+  const email = toolValue(await mcpCall(env, toolMessage(13, "get_email", { resend_id: "ttl-1" }), deps));
+  assert.equal(email.text_body, "body");
+  db.prepare("UPDATE emails SET text_body = ? WHERE resend_id = ?").run("changed", "ttl-1");
+  sqls.reset();
+  const cachedEmail = toolValue(await mcpCall(env, toolMessage(14, "get_email", { resend_id: "ttl-1" }), deps));
+  assert.equal(cachedEmail.text_body, "body");
+  assert.equal(sqls.sqls.length, 0);
+  const refreshed = toolValue(await mcpCall(env, toolMessage(15, "get_email", { resend_id: "ttl-1", fresh: true }), deps));
+  assert.equal(refreshed.text_body, "changed");
+  cache.advance(CACHE_TTL.getEmail * 1000);
+  sqls.reset();
+  const expired = toolValue(await mcpCall(env, toolMessage(16, "get_email", { resend_id: "ttl-1" }), deps));
+  assert.equal(expired.text_body, "changed");
+  assert.ok(sqls.sqls.some((sql) => sql.includes("FROM emails")));
+});
+
+test("pending and null ai_status are not cached", async () => {
+  const { db, env } = sqliteEnv();
+  db.exec("ALTER TABLE emails ADD COLUMN ai_status TEXT");
+  const row = mapEmailForStorage(
+    { id: EMAIL_ID, from: "a@b.c", to: ["eric@abot.run"], subject: "ai", text: "first", created_at: "2026-09-28T00:00:00.000Z" },
+    { direction: "in", eventCreatedAt: "2026-09-28T00:00:00.000Z", attachments: [] },
+  );
+  db.prepare(buildInsertQuery(row).sql).run(...buildInsertQuery(row).params);
+  const cache = memoryCache();
+  const deps = { cache, nowMs: NOW_MS };
+  const sqls = instrumentDb(env);
+
+  async function readsFor(status, text) {
+    db.prepare("UPDATE emails SET ai_status = ?, text_body = ? WHERE resend_id = ?").run(status, text, EMAIL_ID);
+    sqls.reset();
+    const before = cache.puts.length;
+    const first = toolValue(await mcpCall(env, toolMessage(1, "get_email", { resend_id: EMAIL_ID }), deps));
+    const afterFirst = sqls.sqls.filter((sql) => sql.includes("FROM emails")).length;
+    sqls.reset();
+    const second = toolValue(await mcpCall(env, toolMessage(2, "get_email", { resend_id: EMAIL_ID }), deps));
+    const afterSecond = sqls.sqls.filter((sql) => sql.includes("FROM emails")).length;
+    return { first, second, afterFirst, afterSecond, puts: cache.puts.length - before };
+  }
+
+  const pending = await readsFor("pending", "first");
+  assert.equal(pending.first.text_body, "first");
+  assert.equal("ai_status" in pending.first, false);
+  assert.equal(pending.afterFirst, 1);
+  assert.equal(pending.afterSecond, 1);
+  assert.equal(pending.puts, 0);
+
+  const empty = await readsFor(null, "second");
+  assert.equal(empty.first.text_body, "second");
+  assert.equal(empty.afterSecond, 1);
+  assert.equal(empty.puts, 0);
+
+  const ok = await readsFor("ok", "third");
+  assert.equal(ok.afterFirst, 1);
+  assert.equal(ok.afterSecond, 0);
+  assert.equal(ok.second.text_body, "third");
+  assert.equal(ok.puts, 1);
+  assert.equal(cache.puts.at(-1).url, getEmailCacheUrl(EMAIL_ID, false, false, "ok"));
+
+  db.prepare("UPDATE emails SET ai_status = ?, text_body = ? WHERE resend_id = ?").run("failed", "fourth", EMAIL_ID);
+  sqls.reset();
+  const stale = toolValue(await mcpCall(env, toolMessage(3, "get_email", { resend_id: EMAIL_ID }), deps));
+  assert.equal(stale.text_body, "third");
+  assert.equal(sqls.sqls.filter((sql) => sql.includes("FROM emails")).length, 0);
+  const live = toolValue(await mcpCall(env, toolMessage(4, "get_email", { resend_id: EMAIL_ID, fresh: true }), deps));
+  assert.equal(live.text_body, "fourth");
+  assert.equal(cache.puts.at(-1).url, getEmailCacheUrl(EMAIL_ID, false, false, "failed"));
+});
+
+test("a queued insert invalidates reads and fills R2 cache", async () => {
+  const { db, env } = sqliteEnv();
+  const cache = memoryCache();
+  const sqls = instrumentDb(env);
+  const r2Gets = instrumentBucket(env);
+  const deps = { cache, nowMs: NOW_MS };
+
+  toolValue(await mcpCall(env, toolMessage(1, "search_emails", { query: "hello" }), deps));
+  toolValue(await mcpCall(env, toolMessage(2, "list_emails", {}), deps));
+  const before = toolValue(await mcpCall(env, toolMessage(3, "email_stats", {}), deps));
+  assert.equal(before.total, 0);
+
+  const fetchImpl = async (url) => {
+    const href = String(url);
+    if (href === `https://api.resend.com/emails/receiving/${EMAIL_ID}`) return receivedEmailResponse();
+    if (href === "https://cdn.resend.app/raw") return new Response("Subject: queued\r\n\r\nhello queue\r\n", { status: 200 });
+    if (href.startsWith(`https://api.resend.com/emails/receiving/${EMAIL_ID}/attachments`)) {
+      return jsonResponse({
+        object: "list",
+        has_more: false,
+        data: [{ id: "att_1", filename: "a.png", content_type: "image/png", size: 3, download_url: "https://cdn.resend.app/file" }],
+      });
+    }
+    if (href === "https://cdn.resend.app/file") return new Response("PNG", { status: 200 });
+    throw new Error(`unexpected fetch ${href}`);
+  };
+  const message = queueMessage(
+    { resend_id: EMAIL_ID, event_type: "email.received", received_at: "2026-09-28T00:00:01.000Z", svix_id: "msg_cache" },
+    1,
+  );
+  await handleQueue({ queue: "mail-ingest", messages: [message] }, env, { fetch: fetchImpl, nowMs: NOW_MS, cache });
+  assert.deepEqual(message.ops, [{ op: "ack" }]);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 1);
+
+  const rev = cache.puts.filter((put) => put.url === READ_REV_URL);
+  assert.equal(rev.length, 1);
+  assert.equal(rev[0].body, "1");
+  assert.equal(rev[0].method, "GET");
+  const rawKey = `raw/${EMAIL_ID}.eml`;
+  const attachmentKey = `attachments/${EMAIL_ID}/a.png`;
+  assert.ok(cache.puts.some((put) => put.url === r2CacheUrl(rawKey) && put.cacheControl === "max-age=604800"));
+  assert.ok(cache.puts.some((put) => put.url === r2CacheUrl(attachmentKey) && put.body === "PNG"));
+  const expectedDeletes = new Set([STATS_CACHE_URL]);
+  for (const html of [false, true]) {
+    for (const raw of [false, true]) {
+      for (const ai of ["none", "ok", "failed", "skipped", "deferred"]) {
+        expectedDeletes.add(getEmailCacheUrl(EMAIL_ID, html, raw, ai));
+      }
+    }
+  }
+  assert.deepEqual(new Set(cache.deletes), expectedDeletes);
+
+  sqls.reset();
+  const found = toolValue(await mcpCall(env, toolMessage(4, "search_emails", { query: "hello" }), deps));
+  assert.equal(found.length, 1);
+  assert.equal(found[0].resend_id, EMAIL_ID);
+  assert.equal(sqls.sqls.length, 1);
+  const listed = toolValue(await mcpCall(env, toolMessage(5, "list_emails", {}), deps));
+  assert.equal(listed.length, 1);
+  const stats = toolValue(await mcpCall(env, toolMessage(6, "email_stats", {}), deps));
+  assert.equal(stats.total, 1);
+  assert.equal(stats.by_direction.in, 1);
+
+  sqls.reset();
+  const email = toolValue(
+    await mcpCall(env, toolMessage(7, "get_email", { resend_id: EMAIL_ID, include_raw_eml: true }), deps),
+  );
+  assert.match(email.raw_eml, /hello queue/);
+  assert.equal(email.attachments[0].r2_key, attachmentKey);
+  assert.equal(r2Gets.length, 0);
+  sqls.reset();
+  toolValue(await mcpCall(env, toolMessage(8, "get_email", { resend_id: EMAIL_ID, include_raw_eml: true }), deps));
+  assert.equal(sqls.sqls.length, 0);
+  assert.equal(r2Gets.length, 0);
+
+  const deletesBeforeReplay = cache.deletes.length;
+  const revPuts = cache.puts.filter((put) => put.url === READ_REV_URL).length;
+  const replay = queueMessage(
+    { resend_id: EMAIL_ID, event_type: "email.received", received_at: "2026-09-28T00:00:01.000Z" },
+    1,
+  );
+  await handleQueue({ queue: "mail-ingest", messages: [replay] }, env, { fetch: fetchImpl, nowMs: NOW_MS, cache });
+  assert.deepEqual(replay.ops, [{ op: "ack" }]);
+  assert.equal(cache.deletes.length, deletesBeforeReplay);
+  assert.equal(cache.puts.filter((put) => put.url === READ_REV_URL).length, revPuts);
+  sqls.reset();
+  const still = toolValue(await mcpCall(env, toolMessage(9, "email_stats", {}), deps));
+  assert.equal(still.total, 1);
+  assert.equal(sqls.sqls.length, 0);
+});
+
+test("unauthorized, health, webhook, and failed ingest do not write the cache", async () => {
+  const { db, env } = sqliteEnv();
+  const cache = memoryCache();
+  const unauth = await handleFetch(
+    new Request("https://example.test/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    }),
+    env,
+    { cache, nowMs: NOW_MS },
+  );
+  assert.equal(unauth.status, 401);
+  const wrong = await handleFetch(
+    new Request("https://example.test/mcp", {
+      method: "POST",
+      headers: { authorization: "Bearer wrong-token", "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "email_stats" }),
+    }),
+    env,
+    { cache, nowMs: NOW_MS },
+  );
+  assert.equal(wrong.status, 401);
+
+  const health = await handleFetch(new Request("https://example.test/health"), env, { cache, nowMs: NOW_MS });
+  const healthAgain = await handleFetch(new Request("https://example.test/health"), env, { cache, nowMs: NOW_MS });
+  assert.equal(health.headers.get("cache-control"), "no-store");
+  assert.deepEqual(Object.keys(await health.json()).sort(), ["count_24h", "last_received_at", "ok"]);
+  assert.equal(healthAgain.status, 200);
+
+  const event = { type: "email.received", created_at: "2026-09-28T00:00:01.000Z", data: { email_id: EMAIL_ID } };
+  const body = JSON.stringify(event);
+  const queued = await handleFetch(
+    new Request("https://example.test/", {
+      method: "POST",
+      headers: {
+        "svix-id": "msg_cache",
+        "svix-timestamp": freshTimestamp(),
+        "svix-signature": sign("msg_cache", freshTimestamp(), body),
+      },
+      body,
+    }),
+    env,
+    { cache, nowMs: NOW_MS, fetch: async () => { throw new Error("webhook must not fetch"); } },
+  );
+  assert.equal(queued.status, 200);
+  assert.deepEqual(await queued.json(), { ok: true, queued: true });
+  const forged = await handleFetch(
+    new Request("https://example.test/", {
+      method: "POST",
+      headers: {
+        "svix-id": "msg_bad",
+        "svix-timestamp": freshTimestamp(),
+        "svix-signature": "v1,aaaa",
+      },
+      body,
+    }),
+    env,
+    { cache, nowMs: NOW_MS },
+  );
+  assert.equal(forged.status, 401);
+
+  const failed = queueMessage({ resend_id: EMAIL_ID, event_type: "email.received" }, 1);
+  await handleQueue({ queue: "mail-ingest", messages: [failed] }, env, {
+    cache,
+    nowMs: NOW_MS,
+    fetch: ingestFetch({ apiStatus: 404 }),
+  });
+  assert.deepEqual(failed.ops, [{ op: "ack" }]);
+  const dead = queueMessage({ resend_id: EMAIL_ID, event_type: "email.received" }, 4);
+  await handleQueue({ queue: "mail-ingest-dlq", messages: [dead] }, env, { cache, nowMs: NOW_MS });
+  assert.deepEqual(dead.ops, [{ op: "ack" }]);
+  assert.equal(cache.puts.length, 0);
+  assert.equal(cache.deletes.length, 0);
+  assert.equal(cache.matches.length, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 0);
+
+  const broken = memoryCache();
+  broken.match = async () => {
+    throw new Error("match down");
+  };
+  broken.put = async () => {
+    throw new Error("put down");
+  };
+  const rpc = await handleMcpRpc(
+    toolMessage(1, "email_stats", {}),
+    {
+      cache: broken,
+      nowMs: NOW_MS,
+      async queryAll(sql, params) {
+        const out = await env.DB.prepare(sql).bind(...(params || [])).all();
+        return out.results || [];
+      },
+    },
+  );
+  assert.equal(JSON.parse(rpc.result.content[0].text).total, 0);
+
+  const throwing = memoryCache();
+  throwing.put = async () => {
+    throw new Error("put down");
+  };
+  throwing.delete = async () => {
+    throw new Error("delete down");
+  };
+  const message = queueMessage(
+    { resend_id: EMAIL_ID, event_type: "email.received", received_at: "2026-09-28T00:00:01.000Z" },
+    1,
+  );
+  await handleQueue({ queue: "mail-ingest", messages: [message] }, env, {
+    cache: throwing,
+    nowMs: NOW_MS,
+    fetch: ingestFetch(),
+  });
+  assert.deepEqual(message.ops, [{ op: "ack" }]);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 1);
+});
+
+test("MCP cache fills through waitUntil when a context is present", async () => {
+  const { env } = sqliteEnv();
+  const cache = memoryCache();
+  const originalPut = cache.put.bind(cache);
+  let releasePut;
+  const putBlock = new Promise((resolve) => {
+    releasePut = resolve;
+  });
+  cache.put = async (request, response) => {
+    await putBlock;
+    return originalPut(request, response);
+  };
+  const pending = [];
+  const ctx = {
+    waitUntil(promise) {
+      pending.push(promise);
+    },
+  };
+  const firstPromise = mcpCall(env, toolMessage(1, "email_stats", {}), { cache, ctx, nowMs: NOW_MS });
+  const first = await firstPromise;
+  assert.equal(toolValue(first).total, 0);
+  assert.equal(first.cacheControl, "no-store");
+  assert.equal(cache.puts.length, 0);
+  assert.equal(pending.length, 1);
+  releasePut();
+  await Promise.all(pending);
+  assert.equal(cache.puts.length, 1);
+  assert.equal(cache.puts[0].url, STATS_CACHE_URL);
+  const sqls = instrumentDb(env);
+  const second = toolValue(await mcpCall(env, toolMessage(2, "email_stats", {}), { cache, nowMs: NOW_MS }));
+  assert.equal(second.total, 0);
+  assert.equal(sqls.sqls.length, 0);
 });
