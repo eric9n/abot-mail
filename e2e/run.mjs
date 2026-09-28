@@ -5,6 +5,8 @@
  *
  * The only write is an idempotent archive of TEST_EMAIL_ID. Point WORKER_URL
  * at the staging worker so this does not touch the production D1 database.
+ * A valid webhook returns as soon as the event is queued. The script polls
+ * get_email until the consumer has written the row, or the timeout fires.
  */
 
 import { createHmac, randomUUID } from "node:crypto";
@@ -43,6 +45,10 @@ function snippet(text) {
 
 function expect(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function request(url, { method = "GET", headers = {}, body, timeoutMs = 30000 } = {}) {
@@ -178,6 +184,21 @@ export async function main() {
     return stats.total;
   }
 
+  async function waitForEmail(emailIdToFind, { timeoutMs = 90000 } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    let delay = 250;
+    let last = null;
+    while (Date.now() < deadline) {
+      last = await tool("get_email", { resend_id: emailIdToFind, include_html: true, include_raw_eml: true });
+      if (last && last.found === true) return last;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await sleep(Math.min(delay, remaining));
+      delay = Math.min(Math.round(delay * 1.5), 4000);
+    }
+    throw new Error(`timed out waiting for consumer to archive ${emailIdToFind}: ${snippet(JSON.stringify(last))}`);
+  }
+
   const eventBody = JSON.stringify({
     type: "email.received",
     created_at: new Date().toISOString(),
@@ -212,11 +233,24 @@ export async function main() {
     expect(after === before, `rejected webhooks changed the archive total from ${before} to ${after}`);
   });
 
-  await runCase("a", "valid email.received webhook returns 200 and get_email reads the row", async () => {
-    const res = await postWebhook(ctx.delivery.body, ctx.delivery.headers);
+  await runCase("a", "valid email.received webhook returns queued:true and get_email reads the row after the consumer", async () => {
+    const before = await tool("get_email", { resend_id: emailId });
+    const started = Date.now();
+    const res = await postWebhook(ctx.delivery.body, ctx.delivery.headers, 20000);
+    const elapsed = Date.now() - started;
     assertHttp(res, 200, "valid webhook");
-    expect(res.json?.ok === true, `valid webhook body was ${snippet(res.text)}`);
-    const email = await tool("get_email", { resend_id: emailId, include_html: true });
+    expect(res.json?.ok === true && res.json?.queued === true, `valid webhook body was ${snippet(res.text)}`);
+    expect(res.json?.duplicate !== true, "queued webhook body included duplicate:true");
+    expect(elapsed < 20000, `webhook took ${elapsed}ms`);
+    if (before.found !== true) {
+      const immediate = await tool("get_email", { resend_id: emailId });
+      if (immediate.found === true) {
+        console.log("note: consumer archived the row before the first follow-up read");
+      } else {
+        console.log("note: row was not visible when the webhook returned");
+      }
+    }
+    const email = before.found === true ? await tool("get_email", { resend_id: emailId, include_html: true, include_raw_eml: true }) : await waitForEmail(emailId);
     expect(email.found === true, `get_email did not find ${emailId}: ${snippet(JSON.stringify(email))}`);
     expect(email.resend_id === emailId, `get_email resend_id was ${email.resend_id}`);
     expect(email.direction === "in", `stored direction was ${email.direction}, expected in`);
@@ -225,6 +259,12 @@ export async function main() {
     }
     expect(Array.isArray(email.to), "get_email to is not an array");
     expect(typeof email.date === "string" && email.date.length > 0, "get_email date is empty");
+    const hasRaw = typeof email.raw_eml === "string" && email.raw_eml.length > 0;
+    if (before.found !== true) {
+      expect(hasRaw, `R2 eml missing for ${emailId}: ${email.raw_eml_note || snippet(JSON.stringify(email))}`);
+    } else if (!hasRaw) {
+      console.log(`note: existing row has no raw eml (${email.raw_eml_note || "missing"}); consumer will not refetch it`);
+    }
     ctx.email = email;
     ctx.totalAfterArchive = await totalCount();
   });
@@ -255,15 +295,25 @@ export async function main() {
 
   await runCase("b", "replaying the same webhook leaves a single row", async () => {
     expect(ctx.email && ctx.totalAfterArchive != null, "prerequisite failed: case a did not archive the email");
-    const replay = await postWebhook(ctx.delivery.body, ctx.delivery.headers);
+    const replay = await postWebhook(ctx.delivery.body, ctx.delivery.headers, 20000);
     assertHttp(replay, 200, "replayed webhook");
-    expect(replay.json?.ok === true && replay.json?.duplicate === true, `replay body was ${snippet(replay.text)}`);
-    const after = await totalCount();
-    expect(after === ctx.totalAfterArchive, `replay changed the archive total from ${ctx.totalAfterArchive} to ${after}`);
-    const email = await tool("get_email", { resend_id: emailId, include_html: true });
-    expect(email.found === true && email.resend_id === emailId, "get_email after replay did not return the same id");
-    expect(email.text_body === ctx.email.text_body, "text_body changed after replay");
-    expect(email.html_body === ctx.email.html_body, "html_body changed after replay");
+    expect(replay.json?.ok === true && replay.json?.queued === true, `replay body was ${snippet(replay.text)}`);
+    expect(replay.json?.duplicate !== true, "replay body included duplicate:true");
+    const deadline = Date.now() + 45000;
+    let delay = 400;
+    let samples = 0;
+    while (samples < 3 && Date.now() < deadline) {
+      const after = await totalCount();
+      expect(after === ctx.totalAfterArchive, `replay changed the archive total from ${ctx.totalAfterArchive} to ${after}`);
+      const email = await tool("get_email", { resend_id: emailId, include_html: true });
+      expect(email.found === true && email.resend_id === emailId, "get_email after replay did not return the same id");
+      expect(email.text_body === ctx.email.text_body, "text_body changed after replay");
+      expect(email.html_body === ctx.email.html_body, "html_body changed after replay");
+      samples += 1;
+      if (samples < 3) await sleep(delay);
+      delay = Math.min(delay * 2, 4000);
+    }
+    expect(samples === 3, "timed out confirming the replay left a single unchanged row");
   });
 
   await runCase("f", "unauthenticated responses do not contain the message body", async () => {

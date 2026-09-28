@@ -17,3 +17,15 @@ CREATE TABLE IF NOT EXISTS emails (
 
 CREATE INDEX IF NOT EXISTS idx_emails_date ON emails(date);
 CREATE INDEX IF NOT EXISTS idx_emails_from ON emails(msg_from);
+
+-- Ingest dead letters. Queryable replay list. Does not change emails.
+CREATE TABLE IF NOT EXISTS ingest_failures (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  resend_id   TEXT,
+  event_type  TEXT,
+  error       TEXT,
+  attempts    INTEGER,
+  failed_at   TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ingest_failures_resend_id ON ingest_failures(resend_id);

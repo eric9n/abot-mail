@@ -1,6 +1,7 @@
 /**
  * abot.run mail archive.
- * POST /      Resend webhook (Svix) → D1 + R2
+ * POST /      Resend webhook (Svix): verify, enqueue, return
+ * queue       mail-ingest consumer: Resend API → D1 + R2
  * POST /mcp   MCP (Streamable HTTP, JSON-RPC), Bearer MCP_TOKEN
  * GET /health public counts only
  *
@@ -10,6 +11,10 @@
 const TIMESTAMP_TOLERANCE_SEC = 5 * 60;
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const MAX_BODY_BYTES = 1_000_000;
+/** Deliveries after this many attempts are recorded and acknowledged. */
+export const INGEST_MAX_RETRIES = 3;
+/** First retry waits this long; each later retry doubles it. */
+export const INGEST_RETRY_BASE_SEC = 60;
 
 export class RpcError extends Error {
   constructor(code, message) {
@@ -728,7 +733,12 @@ async function resendJson(doFetch, apiKey, path) {
     },
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(`resend ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(`resend ${res.status}`);
+    err.status = res.status;
+    err.source = "resend";
+    throw err;
+  }
   return text ? JSON.parse(text) : {};
 }
 
@@ -773,7 +783,12 @@ async function fetchAllowedBytes(url, doFetch, redirectsLeft = 3) {
     if (!loc) throw new Error("download redirect missing location");
     return fetchAllowedBytes(new URL(loc, allowed).toString(), doFetch, redirectsLeft - 1);
   }
-  if (!res.ok) throw new Error(`download ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(`download ${res.status}`);
+    err.status = res.status;
+    err.source = "download";
+    throw err;
+  }
   return res.arrayBuffer();
 }
 
@@ -836,6 +851,234 @@ export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now() }
   await db.queryRun(insert.sql, insert.params);
   console.log(JSON.stringify({ msg: "archived", direction, email_id: storedId }));
   return { status: 200, body: { ok: true } };
+}
+
+export function retryDelaySeconds(attempts) {
+  const n = Number.isInteger(attempts) && attempts > 0 ? attempts : 1;
+  const exp = Math.min(n - 1, 6);
+  return INGEST_RETRY_BASE_SEC * 2 ** exp;
+}
+
+/** 4xx from Resend or a download (except 429) and local refusals do not get another try. */
+export function isRetryableIngestError(err) {
+  if (!err || typeof err !== "object") return true;
+  const status = Number(err.status);
+  if (err.source === "resend" && Number.isFinite(status)) {
+    return status === 429 || status >= 500;
+  }
+  if (err.source === "download" && Number.isFinite(status)) {
+    return status === 429 || status >= 500;
+  }
+  const message = String(err.message || "");
+  const resendStatus = /^resend (\d+)$/.exec(message);
+  if (resendStatus) {
+    const code = Number(resendStatus[1]);
+    return code === 429 || code >= 500;
+  }
+  if (
+    message.startsWith("invalid download url") ||
+    message.startsWith("refusing ") ||
+    message.startsWith("unexpected email payload") ||
+    message.startsWith("attachment missing download_url") ||
+    message.startsWith("too many download redirects") ||
+    message.startsWith("download redirect missing location")
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function clipStored(value, max) {
+  if (value == null) return null;
+  const text = typeof value === "string" ? value : String(value);
+  return text.replace(/Bearer\s+\S+/gi, "Bearer [redacted]").slice(0, max);
+}
+
+export function buildFailureInsert(row) {
+  const attempts = Number.isInteger(row.attempts) && row.attempts > 0 ? row.attempts : 1;
+  return {
+    sql: `INSERT INTO ingest_failures (resend_id, event_type, error, attempts, failed_at)
+VALUES (?, ?, ?, ?, ?)`,
+    params: [
+      clipStored(row.resend_id, 200),
+      clipStored(row.event_type, 80),
+      clipStored(row.error, 500),
+      attempts,
+      row.failed_at,
+    ],
+  };
+}
+
+function failedAtIso(nowMs) {
+  return new Date(nowMs ?? Date.now()).toISOString();
+}
+
+async function recordIngestFailure(env, row) {
+  const db = d1Deps(env);
+  const insert = buildFailureInsert(row);
+  await db.queryRun(insert.sql, insert.params);
+}
+
+function messageAttempts(message) {
+  return Number.isInteger(message && message.attempts) && message.attempts > 0 ? message.attempts : 1;
+}
+
+function queueEventType(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  if (typeof body.event_type === "string") return body.event_type;
+  if (typeof body.type === "string") return body.type;
+  return null;
+}
+
+function queueResendId(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  return typeof body.resend_id === "string" ? body.resend_id : null;
+}
+
+/**
+ * Verify-and-enqueue. Does not call Resend or touch D1/R2.
+ * send() failure throws so the caller can return 500 and let Svix retry.
+ */
+export async function enqueueWebhook({ event, env, svixId }) {
+  const type = event && event.type;
+  if (type !== "email.received" && type !== "email.sent") {
+    return { status: 200, body: { ok: true, ignored: true } };
+  }
+  const emailId = event.data && event.data.email_id;
+  if (!isSafeResendId(emailId)) {
+    return { status: 400, body: { ok: false, error: "invalid email_id" } };
+  }
+  const queue = env && env.INGEST_QUEUE;
+  if (!queue || typeof queue.send !== "function") {
+    throw new Error("ingest queue is not configured");
+  }
+  const message = {
+    resend_id: emailId,
+    event_type: type,
+    received_at: typeof event.created_at === "string" ? event.created_at.slice(0, 80) : null,
+    svix_id: typeof svixId === "string" && svixId ? svixId.slice(0, 200) : null,
+  };
+  await queue.send(message);
+  console.log(JSON.stringify({ msg: "queued", resend_id: emailId, event_type: type }));
+  return { status: 200, body: { ok: true, queued: true } };
+}
+
+/**
+ * One queue message. Idempotent on emails.resend_id.
+ * Returns { action: "ack" } or { action: "retry", delaySeconds }.
+ * Permanent failures are written to ingest_failures before ack.
+ */
+export async function consumeIngestMessage(message, env, deps = {}) {
+  const attempts = messageAttempts(message);
+  const body = message && message.body;
+  const eventType = queueEventType(body);
+  const resendId = queueResendId(body);
+  const nowMs = deps.nowMs;
+
+  const permanent = async (error, id = resendId, type = eventType) => {
+    await recordIngestFailure(env, {
+      resend_id: typeof id === "string" ? id : null,
+      event_type: typeof type === "string" ? type : null,
+      error,
+      attempts,
+      failed_at: failedAtIso(nowMs),
+    });
+    const loggedId = typeof id === "string" ? id.slice(0, 200) : null;
+    console.log(JSON.stringify({ msg: "ingest", outcome: "dead", resend_id: loggedId, attempts }));
+    return { action: "ack", recorded: true };
+  };
+
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return permanent("invalid queue payload", null, null);
+  }
+  if (eventType !== "email.received" && eventType !== "email.sent") {
+    return permanent("unsupported event_type");
+  }
+  if (!isSafeResendId(resendId)) {
+    return permanent("invalid email_id");
+  }
+
+  try {
+    const result = await archiveEvent({
+      event: {
+        type: eventType,
+        created_at: typeof body.received_at === "string" ? body.received_at : body.event_created_at,
+        data: { email_id: resendId },
+      },
+      env,
+      fetchImpl: deps.fetch,
+      nowMs,
+    });
+    if (result.status >= 400 && result.status < 500) {
+      return permanent((result.body && result.body.error) || "rejected");
+    }
+    if (result.status >= 500) {
+      const err = new Error("archive failed");
+      err.status = result.status;
+      err.source = "archive";
+      throw err;
+    }
+    console.log(
+      JSON.stringify({
+        msg: "ingest",
+        outcome: result.body && result.body.duplicate ? "duplicate" : "ok",
+        resend_id: resendId,
+        attempts,
+      }),
+    );
+    return { action: "ack", duplicate: !!(result.body && result.body.duplicate) };
+  } catch (err) {
+    const retryable = isRetryableIngestError(err);
+    if (!retryable || attempts > INGEST_MAX_RETRIES) {
+      return permanent((err && err.message) || "ingest failed");
+    }
+    const delaySeconds = retryDelaySeconds(attempts);
+    console.log(
+      JSON.stringify({
+        msg: "ingest",
+        outcome: "retry",
+        resend_id: resendId,
+        attempts,
+        delay_seconds: delaySeconds,
+      }),
+    );
+    return { action: "retry", delaySeconds };
+  }
+}
+
+export function isDeadLetterQueue(name) {
+  return typeof name === "string" && name.endsWith("-dlq");
+}
+
+/** DLQ consumer only records the payload. It does not call Resend. */
+export async function consumeDeadLetter(message, env, deps = {}) {
+  const body = message && message.body;
+  const attempts = messageAttempts(message);
+  await recordIngestFailure(env, {
+    resend_id: queueResendId(body),
+    event_type: queueEventType(body),
+    error: "retries exhausted",
+    attempts,
+    failed_at: failedAtIso(deps.nowMs),
+  });
+  console.log(JSON.stringify({ msg: "ingest", outcome: "dlq", resend_id: queueResendId(body), attempts }));
+  return { action: "ack", recorded: true };
+}
+
+export async function handleQueue(batch, env, deps = {}) {
+  const dead = isDeadLetterQueue(batch && batch.queue);
+  for (const message of (batch && batch.messages) || []) {
+    try {
+      const decision = dead
+        ? await consumeDeadLetter(message, env, deps)
+        : await consumeIngestMessage(message, env, deps);
+      if (decision.action === "retry") message.retry({ delaySeconds: decision.delaySeconds });
+      else message.ack();
+    } catch (err) {
+      console.error(JSON.stringify({ msg: "ingest failed", error: err && err.message }));
+      message.retry({ delaySeconds: retryDelaySeconds(messageAttempts(message)) });
+    }
+  }
 }
 
 function json(body, status = 200) {
@@ -944,7 +1187,11 @@ export async function handleFetch(request, env, deps = {}) {
       return json({ ok: false, error: "invalid json" }, 400);
     }
     try {
-      const result = await archiveEvent({ event, env, fetchImpl, nowMs: deps.nowMs });
+      const result = await enqueueWebhook({
+        event,
+        env,
+        svixId: request.headers.get("svix-id"),
+      });
       return json(result.body, result.status);
     } catch (err) {
       console.error(JSON.stringify({ msg: "webhook failed", error: err && err.message }));
@@ -958,5 +1205,8 @@ export async function handleFetch(request, env, deps = {}) {
 export default {
   fetch(request, env) {
     return handleFetch(request, env);
+  },
+  queue(batch, env) {
+    return handleQueue(batch, env);
   },
 };

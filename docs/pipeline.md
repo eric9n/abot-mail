@@ -16,30 +16,18 @@ npm run gate
 
 ## Stage 2 — 部署到 staging Worker
 
-Staging 使用独立的 D1，不使用生产库 `779058bf-f5c1-44de-b2c8-99350ec7748e`。R2 也单独建桶，避免 `raw/{resend_id}.eml` 覆盖生产对象。
+Staging 使用独立的 D1，不使用生产库 `779058bf-f5c1-44de-b2c8-99350ec7748e`。R2 也单独建桶，避免 `raw/{resend_id}.eml` 覆盖生产对象。队列用 `mail-ingest-staging`，死信用 `mail-ingest-staging-dlq`，不能消费生产的 `mail-ingest`。
 
-在 `worker/` 目录：
+在 `worker/` 目录。队列也要单独建，staging 用 `mail-ingest-staging`，不要把生产的 `mail-ingest` 绑到 staging Worker：
 
 ```bash
 npx wrangler d1 create abot-mail-archive-staging
 npx wrangler r2 bucket create abot-mail-archive-staging
+npx wrangler queues create mail-ingest-staging
+npx wrangler queues create mail-ingest-staging-dlq
 ```
 
-把创建命令打印的 database id 写进 `worker/wrangler.toml` 的 staging 环境（生产的 `database_id` 保持不动）：
-
-```toml
-[env.staging]
-name = "resend-agent-mail-relay-staging"
-
-[[env.staging.d1_databases]]
-binding = "DB"
-database_name = "abot-mail-archive-staging"
-database_id = "<wrangler d1 create 输出的 id>"
-
-[[env.staging.r2_buckets]]
-binding = "ARCHIVE_BUCKET"
-bucket_name = "abot-mail-archive-staging"
-```
+`worker/wrangler.toml` 里已经有 `[env.staging]`：D1 `abot-mail-archive-staging`、R2 `abot-mail-archive-staging`、队列 `mail-ingest-staging` / `mail-ingest-staging-dlq`，binding 仍是 `DB`、`ARCHIVE_BUCKET`、`INGEST_QUEUE`。把 `wrangler d1 create` 打印的 database id 写进 staging 的 `database_id`（生产的 `779058bf-f5c1-44de-b2c8-99350ec7748e` 保持不动）。文件里的 `00000000-0000-4000-8000-000000000000` 是占位符，部署前必须换掉。
 
 然后只对 staging 建表、写 secrets、部署：
 
@@ -71,8 +59,8 @@ npm run e2e
 
 | 用例 | 期望 |
 | --- | --- |
-| a | 签名正确、时间戳新鲜的 `email.received` 返回 200，随后 MCP `get_email` 读到该 id 的结构化字段 |
-| b | 同一请求原样再投一次，返回 `duplicate: true`，归档总数不变，正文不变 |
+| a | 签名正确、时间戳新鲜的 `email.received` 很快返回 200 `{"ok":true,"queued":true}`（没有 `duplicate`）。脚本轮询 `get_email` 直到消费者写入；读到结构化字段，并且 `include_raw_eml` 能读到 R2 上的原文 |
+| b | 同一请求原样再投一次，仍返回 `queued: true`，不再要求 `duplicate: true`。轮询期间归档总数不变，正文不变 |
 | c | 伪造签名返回 401；时间戳早于 5 分钟且签名本身正确也返回 401；归档总数不变 |
 | d | `POST /mcp` 不带 token 返回 401；token 错误返回 401 |
 | e | 正确 token 下 `search_emails` 能搜到 (a) 的邮件，`get_email` 能读到正文 |
