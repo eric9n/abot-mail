@@ -2168,6 +2168,18 @@ test("prompt injection stays inside the email delimiters and is not executed", (
   assert.equal(guarded.points.includes("HACKED"), false);
 });
 
+test("summary prompt forbids deadline placeholders that fail validation", () => {
+  const system = buildSummaryMessages("审批", "请周五前审批。")[0].content;
+  assert.match(system, /Never write the literal text YYYY-MM-DD/);
+  assert.match(system, /never write the quoted string "null"/);
+  assert.match(system, /use JSON null/);
+  const points = ["请周五前审批", "邮件没有写出具体日期"];
+  assert.equal(parseSummaryOutput(summaryJson({ points, todos: [{ text: "周五前审批", deadline: "YYYY-MM-DD" }] })), null);
+  assert.equal(parseSummaryOutput(summaryJson({ points, todos: [{ text: "周五前审批", deadline: "null" }] })), null);
+  const valid = parseSummaryOutput(summaryJson({ points, todos: [{ text: "周五前审批", deadline: null }] }));
+  assert.equal(valid.todos[0].deadline, null);
+});
+
 function plainEmailFetch(id, text = "hello queue") {
   return async (url) => {
     const href = String(url);
