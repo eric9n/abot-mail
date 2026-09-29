@@ -43,6 +43,20 @@ max_batch_timeout = 1
 max_retries = 3
 max_concurrency = 1
 
+# Workers Logs. One structured line per invocation; head sampling stays at 1.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+# One Analytics Engine point per invocation. Index is the low-cardinality stage.
+[[analytics_engine_datasets]]
+binding = "METRICS"
+dataset = "mail_metrics"
+
+# 01:20 UTC. Alert cron only. Does not read Analytics Engine and does not add a secret.
+[triggers]
+crons = ["20 1 * * *"]
+
 [env.staging]
 name = "resend-agent-mail-relay-staging"
 # Separate worker, D1, R2, and queue. Do not point these at production.
@@ -84,3 +98,14 @@ max_batch_size = 1
 max_batch_timeout = 1
 max_retries = 3
 max_concurrency = 1
+
+[env.staging.observability]
+enabled = true
+head_sampling_rate = 1
+
+[[env.staging.analytics_engine_datasets]]
+binding = "METRICS"
+dataset = "mail_metrics_staging"
+
+[env.staging.triggers]
+crons = ["20 1 * * *"]

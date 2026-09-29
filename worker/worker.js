@@ -6,8 +6,10 @@
  *             reads may use the Cache API after auth; HTTP responses stay no-store
  *             search/list/stats/get_email keys include a D1 revision bumped on insert
  * GET /health public counts only (never cached)
+ * scheduled   01:20 UTC D1 alert cron (no new secret; Analytics Engine is for later)
  *
  * Secrets come from the Worker env: WEBHOOK_SECRET, RESEND_API_KEY, MCP_TOKEN.
+ * Observability uses the METRICS binding. It does not change archive responses.
  */
 
 const TIMESTAMP_TOLERANCE_SEC = 5 * 60;
@@ -17,6 +19,43 @@ const MAX_BODY_BYTES = 1_000_000;
 export const INGEST_MAX_RETRIES = 3;
 /** First retry waits this long; each later retry doubles it. */
 export const INGEST_RETRY_BASE_SEC = 60;
+
+/** Daily alert. 01:20 UTC, after the free-tier neuron reset at 00:00. */
+export const ALERT_CRON = "20 1 * * *";
+/** Mailbox this archive serves. Override with env.ALERT_TO / env.ALERT_FROM (not secrets). */
+export const ALERT_TO = "eric@abot.run";
+export const ALERT_FROM = "abot-mail <alerts@abot.run>";
+/**
+ * Neurons per million tokens for Llama 3.1 8B, from the phase-A design rates
+ * published for the 8B instruct model. The bound model is llama-3.1-8b-instruct-fp8.
+ * Missing usage writes 0; we do not estimate from the prompt.
+ */
+export const LLAMA_8B_NEURONS_PER_MILLION_INPUT = 4119;
+export const LLAMA_8B_NEURONS_PER_MILLION_OUTPUT = 34868;
+export const METRIC_STAGES = ["webhook", "ingest", "enrich", "dlq", "mcp", "health", "alert"];
+export const METRIC_OUTCOMES = ["ok", "duplicate", "retry", "dlq", "unauthorized", "ignored", "fresh", "rejected", "error"];
+export const METRIC_DOUBLES = ["lag_ms", "wall_ms", "cache", "neurons", "validator_discards"];
+const MCP_TOOL_NAMES = new Set(["search_emails", "get_email", "list_emails", "email_stats"]);
+const SUMMARY_STATUSES = new Set(["ok", "failed", "discarded", "skipped"]);
+const SAFE_LOG_ERRORS = new Set([
+  "missing_header",
+  "bad_timestamp",
+  "timestamp_out_of_range",
+  "bad_secret",
+  "bad_signature",
+  "enqueue_failed",
+  "health_failed",
+  "alert_failed",
+  "unhandled",
+  "resend_429",
+  "resend_5xx",
+  "resend_4xx",
+  "download_429",
+  "download",
+  "ai_timeout",
+  "ai_failed",
+  "ingest_error",
+]);
 
 export class RpcError extends Error {
   constructor(code, message) {
@@ -669,8 +708,11 @@ export function storedSummary(value) {
  * Workers AI summary. Failures, timeouts, and unparseable output return null.
  * Does not throw, so ingest can still insert the row.
  */
-export async function summarizeEmail({ subject, textBody, ai, timeoutMs = SUMMARY_TIMEOUT_MS } = {}) {
-  if (!ai || typeof ai.run !== "function") return null;
+export async function summarizeEmail({ subject, textBody, ai, timeoutMs = SUMMARY_TIMEOUT_MS, trace } = {}) {
+  if (!ai || typeof ai.run !== "function") {
+    if (trace) trace.summary_status = "skipped";
+    return null;
+  }
   const messages = buildSummaryMessages(subject, textBody);
   const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : SUMMARY_TIMEOUT_MS;
   let timer;
@@ -683,11 +725,23 @@ export async function summarizeEmail({ subject, textBody, ai, timeoutMs = SUMMAR
         }, timeout);
       }),
     ]);
+    const usage = result && typeof result === "object" ? result.usage : null;
+    if (trace) trace.neurons = (Number(trace.neurons) || 0) + estimateNeurons(usage);
     const parsed = parseSummaryOutput(result);
-    if (!parsed) console.error(JSON.stringify({ msg: "summary failed", error: "invalid json" }));
+    if (!parsed) {
+      if (trace) {
+        trace.validator_discards = (Number(trace.validator_discards) || 0) + 1;
+        trace.summary_status = "discarded";
+      }
+      return null;
+    }
+    if (trace) trace.summary_status = "ok";
     return parsed;
   } catch (err) {
-    console.error(JSON.stringify({ msg: "summary failed", error: err && err.message ? String(err.message).slice(0, 200) : "ai failed" }));
+    if (trace) {
+      trace.summary_status = "failed";
+      trace.error = err && err.source === "ai" ? "ai_timeout" : "ai_failed";
+    }
     return null;
   } finally {
     if (timer) clearTimeout(timer);
@@ -808,8 +862,7 @@ async function matchCache(cache, request) {
   try {
     const hit = await cache.match(request);
     return hit || null;
-  } catch (err) {
-    console.error(JSON.stringify({ msg: "cache match failed", error: err && err.message }));
+  } catch {
     return null;
   }
 }
@@ -818,9 +871,7 @@ async function scheduleCachePut(cache, ctx, request, response) {
   if (!cache || typeof cache.put !== "function") return;
   const op = Promise.resolve()
     .then(() => cache.put(request, response))
-    .catch((err) => {
-      console.error(JSON.stringify({ msg: "cache put failed", error: err && err.message }));
-    });
+    .catch(() => {});
   if (ctx && typeof ctx.waitUntil === "function") {
     ctx.waitUntil(op);
     return;
@@ -856,11 +907,14 @@ async function readThrough(deps, { fresh, url, ttl, load, store }) {
     const hit = await matchCache(cache, new Request(url));
     if (hit) {
       try {
-        return JSON.parse(await hit.text());
+        const parsed = JSON.parse(await hit.text());
+        noteCache(deps && deps.trace, true);
+        return parsed;
       } catch {
         // A damaged entry is a miss. The next put replaces it.
       }
     }
+    noteCache(deps && deps.trace, false);
   }
   const value = await load();
   if (cache && store(value)) {
@@ -913,8 +967,8 @@ async function rememberR2(cache, key, bytes) {
       new Request(r2CacheUrl(key)),
       cacheResponse(bytes, CACHE_TTL.r2, "application/octet-stream"),
     );
-  } catch (err) {
-    console.error(JSON.stringify({ msg: "cache put failed", error: err && err.message }));
+  } catch {
+    // A cache write never fails the archive.
   }
 }
 
@@ -1041,7 +1095,6 @@ export async function handleMcpRpc(message, deps) {
     if (err instanceof RpcError) {
       return { type: "error", id, error: { code: err.code, message: err.message } };
     }
-    console.error(JSON.stringify({ msg: "mcp failed", error: err && err.message }));
     return { type: "error", id, error: { code: -32603, message: "internal error" } };
   }
 }
@@ -1065,8 +1118,8 @@ async function deleteEmailCacheEntries(deps, resendId, rev) {
     urls.map(async (url) => {
       try {
         await cache.delete(new Request(url));
-      } catch (err) {
-        console.error(JSON.stringify({ msg: "cache delete failed", error: err && err.message }));
+      } catch {
+        // A missed delete expires on its own. It does not fail the read.
       }
     }),
   );
@@ -1087,6 +1140,7 @@ async function fillNullSummary(deps, row, resendId, rev) {
     textBody: row.text_body ?? null,
     ai: deps.ai,
     timeoutMs: deps.summaryTimeoutMs,
+    trace: deps.trace,
   });
   if (!generated) return null;
   let summary = generated;
@@ -1105,7 +1159,23 @@ async function fillNullSummary(deps, row, resendId, rev) {
   return summary;
 }
 
+function noteTool(trace, name, args) {
+  if (!trace) return;
+  if (MCP_TOOL_NAMES.has(name)) trace.tool = name;
+  if (args && args.fresh === true) {
+    trace.outcome = "fresh";
+    trace.fresh = true;
+  }
+  if (name === "get_email" && args && isSafeResendId(args.resend_id)) trace.resend_id = args.resend_id;
+}
+
+function noteCache(trace, hit) {
+  if (!trace || trace.fresh) return;
+  trace.cache = hit ? 1 : 0;
+}
+
 async function callTool(name, args, deps) {
+  noteTool(deps && deps.trace, name, args);
   if (name === "search_emails") {
     const query = buildSearchQuery(args);
     const [hash, rev] = await Promise.all([
@@ -1150,11 +1220,13 @@ async function callTool(name, args, deps) {
           const cached = JSON.parse(await hit.text());
           // A cached null summary is incomplete once AI can fill it. UPDATE does not bump rev.
           if (cached && cached.found !== false && cached.summary == null && aiConfigured(deps)) continue;
+          noteCache(deps && deps.trace, true);
           return cached;
         } catch {
           // Keep looking. A later variant, or D1, still answers.
         }
       }
+      noteCache(deps && deps.trace, false);
     }
     const columnPresent = await emailsHaveAiStatus(deps);
     const query = columnPresent ? buildGetQuery(args, { includeAiStatus: true }) : parsed;
@@ -1338,7 +1410,7 @@ async function fetchAllowedBytes(url, doFetch, redirectsLeft = 3) {
   return res.arrayBuffer();
 }
 
-export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now(), cache = null, summaryTimeoutMs } = {}) {
+export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now(), cache = null, summaryTimeoutMs, trace } = {}) {
   const type = event && event.type;
   if (type !== "email.received" && type !== "email.sent") {
     return { status: 200, body: { ok: true, ignored: true } };
@@ -1347,10 +1419,17 @@ export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now(), 
   if (!isSafeResendId(emailId)) {
     return { status: 400, body: { ok: false, error: "invalid email_id" } };
   }
+  if (trace && isSafeResendId(emailId)) trace.resend_id = emailId;
   const db = d1Deps(env);
   const exists = buildExistsQuery(emailId);
   const existing = await db.queryFirst(exists.sql, exists.params);
-  if (existing) return { status: 200, body: { ok: true, duplicate: true } };
+  if (existing) {
+    if (trace) {
+      trace.d1 = "duplicate";
+      trace.r2_puts = 0;
+    }
+    return { status: 200, body: { ok: true, duplicate: true } };
+  }
 
   const direction = type === "email.received" ? "in" : "out";
   const doFetch = fetchImpl || fetch;
@@ -1368,6 +1447,7 @@ export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now(), 
     await env.ARCHIVE_BUCKET.put(rawObjectKey(storedId), bytes, {
       httpMetadata: { contentType: "message/rfc822" },
     });
+    if (trace) trace.r2_puts = (Number(trace.r2_puts) || 0) + 1;
     await rememberR2(cache, rawObjectKey(storedId), bytes);
   }
 
@@ -1382,6 +1462,7 @@ export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now(), 
     await env.ARCHIVE_BUCKET.put(key, bytes, {
       httpMetadata: { contentType: safeContentType(att.content_type) },
     });
+    if (trace) trace.r2_puts = (Number(trace.r2_puts) || 0) + 1;
     await rememberR2(cache, key, bytes);
     attachments.push({
       filename,
@@ -1401,6 +1482,7 @@ export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now(), 
     textBody: email.text ?? null,
     ai: env && env.AI,
     timeoutMs: summaryTimeoutMs,
+    trace,
   });
   const row = mapEmailForStorage(
     { ...email, id: storedId },
@@ -1412,7 +1494,7 @@ export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now(), 
   // value into cache keys. A caches.default delete here would stay in this
   // colo; queue consumers and fetch handlers do not share one.
   await db.queryRun(insert.sql, insert.params);
-  console.log(JSON.stringify({ msg: "archived", direction, email_id: storedId }));
+  if (trace) trace.d1 = "inserted";
   return { status: 200, body: { ok: true } };
 }
 
@@ -1522,7 +1604,6 @@ export async function enqueueWebhook({ event, env, svixId }) {
     svix_id: typeof svixId === "string" && svixId ? svixId.slice(0, 200) : null,
   };
   await queue.send(message);
-  console.log(JSON.stringify({ msg: "queued", resend_id: emailId, event_type: type }));
   return { status: 200, body: { ok: true, queued: true } };
 }
 
@@ -1546,8 +1627,11 @@ export async function consumeIngestMessage(message, env, deps = {}) {
       attempts,
       failed_at: failedAtIso(nowMs),
     });
-    const loggedId = typeof id === "string" ? id.slice(0, 200) : null;
-    console.log(JSON.stringify({ msg: "ingest", outcome: "dead", resend_id: loggedId, attempts }));
+    if (deps.trace) {
+      deps.trace.outcome = "dlq";
+      deps.trace.d1 = "failure";
+      if (isSafeResendId(id)) deps.trace.resend_id = id;
+    }
     return { action: "ack", recorded: true };
   };
 
@@ -1573,6 +1657,7 @@ export async function consumeIngestMessage(message, env, deps = {}) {
       nowMs,
       cache: deps.cache || null,
       summaryTimeoutMs: deps.summaryTimeoutMs,
+      trace: deps.trace,
     });
     if (result.status >= 400 && result.status < 500) {
       return permanent((result.body && result.body.error) || "rejected");
@@ -1583,14 +1668,10 @@ export async function consumeIngestMessage(message, env, deps = {}) {
       err.source = "archive";
       throw err;
     }
-    console.log(
-      JSON.stringify({
-        msg: "ingest",
-        outcome: result.body && result.body.duplicate ? "duplicate" : "ok",
-        resend_id: resendId,
-        attempts,
-      }),
-    );
+    if (deps.trace) {
+      const body = result.body || {};
+      deps.trace.outcome = body.duplicate ? "duplicate" : body.ignored ? "ignored" : "ok";
+    }
     return { action: "ack", duplicate: !!(result.body && result.body.duplicate) };
   } catch (err) {
     const retryable = isRetryableIngestError(err);
@@ -1598,15 +1679,10 @@ export async function consumeIngestMessage(message, env, deps = {}) {
       return permanent((err && err.message) || "ingest failed");
     }
     const delaySeconds = retryDelaySeconds(attempts);
-    console.log(
-      JSON.stringify({
-        msg: "ingest",
-        outcome: "retry",
-        resend_id: resendId,
-        attempts,
-        delay_seconds: delaySeconds,
-      }),
-    );
+    if (deps.trace) {
+      deps.trace.outcome = "retry";
+      deps.trace.error = ingestErrorClass(err);
+    }
     return { action: "retry", delaySeconds };
   }
 }
@@ -1626,24 +1702,285 @@ export async function consumeDeadLetter(message, env, deps = {}) {
     attempts,
     failed_at: failedAtIso(deps.nowMs),
   });
-  console.log(JSON.stringify({ msg: "ingest", outcome: "dlq", resend_id: queueResendId(body), attempts }));
+  if (deps.trace) {
+    deps.trace.outcome = "dlq";
+    deps.trace.d1 = "failure";
+    deps.trace.r2_puts = 0;
+  }
   return { action: "ack", recorded: true };
 }
 
 export async function handleQueue(batch, env, deps = {}) {
   const dead = isDeadLetterQueue(batch && batch.queue);
-  const nextDeps = { ...deps, cache: resolveCache(deps) };
+  const cache = resolveCache(deps);
   for (const message of (batch && batch.messages) || []) {
+    const started = Date.now();
+    const body = message && message.body;
+    const trace = { stage: dead ? "dlq" : "ingest", validator_discards: 0, neurons: 0, r2_puts: 0 };
+    const resendId = queueResendId(body);
+    if (isSafeResendId(resendId)) trace.resend_id = resendId;
+    if (!dead) {
+      const eventTime = body && (typeof body.event_created_at === "string" ? body.event_created_at : body.received_at);
+      const lag = eventLagMs(eventTime, deps.nowMs);
+      if (lag != null) trace.lag_ms = lag;
+    }
+    const nextDeps = { ...deps, cache, trace };
     try {
       const decision = dead
         ? await consumeDeadLetter(message, env, nextDeps)
         : await consumeIngestMessage(message, env, nextDeps);
+      if (!trace.outcome) trace.outcome = "ok";
       if (decision.action === "retry") message.retry({ delaySeconds: decision.delaySeconds });
       else message.ack();
-    } catch (err) {
-      console.error(JSON.stringify({ msg: "ingest failed", error: err && err.message }));
+    } catch {
+      trace.outcome = "retry";
+      trace.error = "ingest_error";
       message.retry({ delaySeconds: retryDelaySeconds(messageAttempts(message)) });
+    } finally {
+      trace.wall_ms = Date.now() - started;
+      if (!trace.outcome) trace.outcome = "error";
+      emitObservation(env, trace);
     }
+  }
+}
+
+/** Wall-clock lag from the queue message's event time. Not emails.date and not created_at. */
+export function eventLagMs(eventTime, nowMs) {
+  if (typeof eventTime !== "string" || !eventTime) return null;
+  const parsed = Date.parse(eventTime);
+  if (!Number.isFinite(parsed)) return null;
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  return Math.max(0, now - parsed);
+}
+
+export function estimateNeurons(usage) {
+  if (!usage || typeof usage !== "object") return 0;
+  const input = Number(usage.prompt_tokens ?? usage.input_tokens);
+  const output = Number(usage.completion_tokens ?? usage.output_tokens);
+  const inTok = Number.isFinite(input) && input > 0 ? input : 0;
+  const outTok = Number.isFinite(output) && output > 0 ? output : 0;
+  if (inTok === 0 && outTok === 0) return 0;
+  return (inTok / 1e6) * LLAMA_8B_NEURONS_PER_MILLION_INPUT + (outTok / 1e6) * LLAMA_8B_NEURONS_PER_MILLION_OUTPUT;
+}
+
+export function ingestErrorClass(err) {
+  const status = Number(err && err.status);
+  const source = err && err.source;
+  if (source === "resend" && Number.isFinite(status)) {
+    if (status === 429) return "resend_429";
+    if (status >= 500) return "resend_5xx";
+    if (status >= 400) return "resend_4xx";
+  }
+  if (source === "download" && Number.isFinite(status)) return status === 429 ? "download_429" : "download";
+  if (source === "ai") return "ai_timeout";
+  const message = String((err && err.message) || "");
+  if (message === "resend 429" || message.startsWith("resend 429")) return "resend_429";
+  if (/^resend 5\d\d$/.test(message)) return "resend_5xx";
+  if (/^resend 4\d\d$/.test(message)) return "resend_4xx";
+  if (message.startsWith("download ")) return "download";
+  return "ingest_error";
+}
+
+export function buildMetricPoint(fields) {
+  const stage = METRIC_STAGES.includes(fields && fields.stage) ? fields.stage : "webhook";
+  const outcome = METRIC_OUTCOMES.includes(fields && fields.outcome) ? fields.outcome : "error";
+  const tool = fields && MCP_TOOL_NAMES.has(fields.tool) ? fields.tool : "";
+  const lag = fields && Number.isFinite(fields.lag_ms) && fields.lag_ms >= 0 ? fields.lag_ms : -1;
+  const wall = fields && Number.isFinite(fields.wall_ms) && fields.wall_ms >= 0 ? fields.wall_ms : 0;
+  const cache = fields && (fields.cache === 0 || fields.cache === 1) ? fields.cache : -1;
+  const neurons = fields && Number.isFinite(fields.neurons) && fields.neurons >= 0 ? fields.neurons : 0;
+  const discards = fields && Number.isFinite(fields.validator_discards) && fields.validator_discards >= 0 ? fields.validator_discards : 0;
+  return {
+    indexes: [stage],
+    blobs: [stage, outcome, tool, METRIC_DOUBLES.join(",")],
+    doubles: [lag, wall, cache, neurons, discards],
+  };
+}
+
+/** One Workers Logs line. Drops bodies, addresses, tokens, signatures, and summary text. */
+export function buildInvocationLog(fields) {
+  const stage = METRIC_STAGES.includes(fields && fields.stage) ? fields.stage : "webhook";
+  const outcome = METRIC_OUTCOMES.includes(fields && fields.outcome) ? fields.outcome : "error";
+  const wall = fields && Number.isFinite(fields.wall_ms) && fields.wall_ms >= 0 ? fields.wall_ms : 0;
+  const log = { msg: "invoke", stage, outcome, wall_ms: wall };
+  if (fields && isSafeResendId(fields.resend_id)) log.resend_id = fields.resend_id;
+  if (fields && MCP_TOOL_NAMES.has(fields.tool)) log.tool = fields.tool;
+  if (fields && Number.isFinite(fields.lag_ms) && fields.lag_ms >= 0) log.lag_ms = fields.lag_ms;
+  if (fields && (fields.cache === 0 || fields.cache === 1)) log.cache = fields.cache;
+  if (fields && SUMMARY_STATUSES.has(fields.summary_status)) {
+    log.summary_status = fields.summary_status;
+    log.validator_discards = Number.isFinite(fields.validator_discards) ? fields.validator_discards : 0;
+    log.neurons = Number.isFinite(fields.neurons) && fields.neurons >= 0 ? fields.neurons : 0;
+  }
+  if (fields && (fields.d1 === "inserted" || fields.d1 === "duplicate" || fields.d1 === "failure")) log.d1 = fields.d1;
+  if (fields && (stage === "ingest" || stage === "dlq") && Number.isFinite(fields.r2_puts) && fields.r2_puts >= 0) {
+    log.r2_puts = fields.r2_puts;
+  }
+  if (fields && (fields.enqueued === true || fields.enqueued === false)) log.enqueued = fields.enqueued;
+  if (fields && SAFE_LOG_ERRORS.has(fields.error)) log.error = fields.error;
+  if (fields && typeof fields.alert_sent === "boolean") log.alert_sent = fields.alert_sent;
+  if (fields && typeof fields.skipped === "string" && /^[a-z0-9_,]+$/.test(fields.skipped)) log.skipped = fields.skipped;
+  return log;
+}
+
+export function emitObservation(env, fields) {
+  console.log(JSON.stringify(buildInvocationLog(fields)));
+  const metrics = env && env.METRICS;
+  if (!metrics || typeof metrics.writeDataPoint !== "function") return;
+  try {
+    metrics.writeDataPoint(buildMetricPoint(fields));
+  } catch {
+    // A metric write must not change the invocation's response or ack.
+  }
+}
+
+export function alertWindow(nowMs) {
+  const end = Number.isFinite(nowMs) ? nowMs : Date.now();
+  return {
+    start: new Date(end - 24 * 60 * 60 * 1000).toISOString(),
+    end: new Date(end).toISOString(),
+  };
+}
+
+export function buildIngestFailureCountQuery(startIso, endIso) {
+  return {
+    sql: "SELECT COUNT(*) AS n FROM ingest_failures WHERE failed_at >= ? AND failed_at < ?",
+    params: [startIso, endIso],
+  };
+}
+
+export function buildAiStatusRatioQuery(sinceIso) {
+  return {
+    sql: `SELECT COUNT(*) AS ingested,
+      SUM(CASE WHEN ai_status IN ('failed', 'deferred') THEN 1 ELSE 0 END) AS degraded
+      FROM emails WHERE created_at >= ?`,
+    params: [sinceIso],
+  };
+}
+
+export function buildStatsDailyLatestQuery() {
+  return {
+    sql: "SELECT day, inbound, outbound FROM stats_daily ORDER BY day DESC LIMIT 1",
+    params: [],
+  };
+}
+
+async function alertTableExists(db, name) {
+  try {
+    const rows = await db.queryAll("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1", [name]);
+    return Array.isArray(rows) && rows.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function alertColumnExists(db, column) {
+  try {
+    const rows = await db.queryAll("SELECT name FROM pragma_table_info('emails') WHERE name = ?", [column]);
+    return Array.isArray(rows) && rows.some((row) => row && row.name === column);
+  } catch {
+    return false;
+  }
+}
+
+/** D1 checks only. Missing tables and columns are skipped. Nothing here reads Analytics Engine. */
+export async function collectAlertSignals(env, nowMs) {
+  const db = d1Deps(env);
+  const signals = [];
+  const skipped = [];
+  try {
+    const health = buildHealthQuery(nowMs);
+    const row = await db.queryFirst(health.sql, health.params);
+    signals.push({ name: "count_24h", value: row ? Number(row.count_24h) || 0 : 0, breached: false });
+  } catch {
+    skipped.push("count_24h");
+  }
+  if (await alertTableExists(db, "ingest_failures")) {
+    const window = alertWindow(nowMs);
+    const query = buildIngestFailureCountQuery(window.start, window.end);
+    const row = await db.queryFirst(query.sql, query.params);
+    const value = row ? Number(row.n) || 0 : 0;
+    signals.push({ name: "ingest_failures", value, breached: value > 0 });
+  } else {
+    skipped.push("ingest_failures");
+  }
+  if (await alertColumnExists(db, "ai_status")) {
+    const since = new Date((Number.isFinite(nowMs) ? nowMs : Date.now()) - 60 * 60 * 1000).toISOString();
+    const query = buildAiStatusRatioQuery(since);
+    const row = await db.queryFirst(query.sql, query.params);
+    const ingested = row ? Number(row.ingested) || 0 : 0;
+    const degraded = row ? Number(row.degraded) || 0 : 0;
+    const ratio = ingested > 0 ? degraded / ingested : 0;
+    signals.push({ name: "ai_status", value: ratio, breached: ingested > 0 && ratio > 0.2 });
+  } else {
+    skipped.push("ai_status");
+  }
+  if (await alertTableExists(db, "stats_daily")) {
+    const query = buildStatsDailyLatestQuery();
+    const row = await db.queryFirst(query.sql, query.params);
+    const inbound = row ? Number(row.inbound) || 0 : 0;
+    const outbound = row ? Number(row.outbound) || 0 : 0;
+    signals.push({ name: "stats_daily", value: inbound + outbound, breached: false });
+  } else {
+    skipped.push("stats_daily");
+  }
+  return { signals, skipped, breaches: signals.filter((signal) => signal.breached) };
+}
+
+export function buildAlertEmail(report, env) {
+  const lines = (report.breaches || []).map((signal) => {
+    const name = signal.name === "ingest_failures" || signal.name === "ai_status" ? signal.name : "signal";
+    const value = Number.isFinite(Number(signal.value)) ? String(signal.value) : "0";
+    return `${name} ${value}`;
+  });
+  const from = env && typeof env.ALERT_FROM === "string" && env.ALERT_FROM ? env.ALERT_FROM : ALERT_FROM;
+  const to = env && typeof env.ALERT_TO === "string" && env.ALERT_TO ? env.ALERT_TO : ALERT_TO;
+  return {
+    from,
+    to: [to],
+    subject: "abot-mail alert",
+    text: `threshold crossed\n${lines.join("\n")}\n`,
+  };
+}
+
+export async function sendAlertEmail(env, email, fetchImpl) {
+  if (!env || !env.RESEND_API_KEY) throw new Error("RESEND_API_KEY is not configured");
+  const doFetch = fetchImpl || fetch;
+  const res = await doFetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify(email),
+  });
+  if (!res.ok) {
+    const err = new Error("alert email failed");
+    err.status = res.status;
+    throw err;
+  }
+}
+
+export async function handleScheduled(event, env, deps = {}) {
+  const started = Date.now();
+  const nowMs = deps.nowMs ?? (event && Number.isFinite(event.scheduledTime) ? event.scheduledTime : Date.now());
+  const trace = { stage: "alert", outcome: "ok", validator_discards: 0, neurons: 0, alert_sent: false };
+  try {
+    const report = await collectAlertSignals(env, nowMs);
+    if (report.skipped.length) trace.skipped = report.skipped.join(",");
+    if (report.breaches.length === 0) return { sent: false, breaches: [] };
+    await sendAlertEmail(env, buildAlertEmail(report, env), deps.fetch);
+    trace.alert_sent = true;
+    return { sent: true, breaches: report.breaches.map((signal) => signal.name) };
+  } catch (err) {
+    trace.outcome = "error";
+    trace.error = "alert_failed";
+    trace.alert_sent = false;
+    throw err;
+  } finally {
+    trace.wall_ms = Date.now() - started;
+    emitObservation(env, trace);
   }
 }
 
@@ -1677,101 +2014,159 @@ function jsonContentType(header) {
 }
 
 export async function handleFetch(request, env, deps = {}) {
+  const started = Date.now();
+  const trace = { validator_discards: 0, neurons: 0 };
+  deps = { ...deps, trace };
   const path = pathOf(request);
-  const fetchImpl = deps.fetch || fetch;
+  trace.stage = path === "/health" ? "health" : path === "/mcp" ? "mcp" : "webhook";
+  try {
+    if (path === "/health") {
+      if (request.method !== "GET") {
+        trace.outcome = "rejected";
+        return json({ ok: false, error: "method not allowed" }, 405);
+      }
+      try {
+        const q = buildHealthQuery(deps.nowMs);
+        const row = await d1Deps(env).queryFirst(q.sql, q.params);
+        trace.outcome = "ok";
+        return json({
+          ok: true,
+          last_received_at: row && row.last_received_at ? row.last_received_at : null,
+          count_24h: row ? Number(row.count_24h) || 0 : 0,
+        });
+      } catch {
+        trace.outcome = "error";
+        trace.error = "health_failed";
+        return json({ ok: false, last_received_at: null, count_24h: null }, 503);
+      }
+    }
 
-  if (path === "/health") {
-    if (request.method !== "GET") return json({ ok: false, error: "method not allowed" }, 405);
-    try {
-      const q = buildHealthQuery(deps.nowMs);
-      const row = await d1Deps(env).queryFirst(q.sql, q.params);
-      return json({
-        ok: true,
-        last_received_at: row && row.last_received_at ? row.last_received_at : null,
-        count_24h: row ? Number(row.count_24h) || 0 : 0,
+    if (path === "/mcp") {
+      if (request.method !== "POST") {
+        trace.outcome = "rejected";
+        return json({ ok: false, error: "method not allowed" }, 405);
+      }
+      if (!bearerOk(request.headers.get("authorization"), env && env.MCP_TOKEN)) {
+        trace.outcome = "unauthorized";
+        return json({ ok: false, error: "unauthorized" }, 401);
+      }
+      if (!jsonContentType(request.headers.get("content-type"))) {
+        trace.outcome = "rejected";
+        return json(
+          { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Content-Type must be application/json" } },
+          415,
+        );
+      }
+      const raw = await request.arrayBuffer();
+      if (raw.byteLength > MAX_BODY_BYTES) {
+        trace.outcome = "rejected";
+        return json({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "payload too large" } }, 413);
+      }
+      let message;
+      try {
+        message = JSON.parse(new TextDecoder("utf-8").decode(raw));
+      } catch {
+        trace.outcome = "rejected";
+        return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400);
+      }
+      const db = d1Deps(env);
+      const rpc = await handleMcpRpc(message, {
+        queryAll: (sql, params) => db.queryAll(sql, params),
+        queryFirst: (sql, params) => db.queryFirst(sql, params),
+        queryRun: (sql, params) => db.queryRun(sql, params),
+        getObjectText: (key) => db.getObjectText(key),
+        nowMs: deps.nowMs,
+        cache: resolveCache(deps),
+        ctx: deps.ctx || null,
+        ai: env && env.AI ? env.AI : null,
+        summaryTimeoutMs: deps.summaryTimeoutMs,
+        trace,
       });
-    } catch (err) {
-      console.error(JSON.stringify({ msg: "health failed", error: err && err.message }));
-      return json({ ok: false, last_received_at: null, count_24h: null }, 503);
+      if (rpc.type === "notification") {
+        trace.outcome = "ok";
+        return new Response(null, { status: 202 });
+      }
+      if (rpc.type === "error") {
+        trace.outcome = rpc.error && rpc.error.code === -32603 ? "error" : "rejected";
+        if (trace.outcome === "error") trace.error = "unhandled";
+        return json({ jsonrpc: "2.0", id: rpc.id ?? null, error: rpc.error });
+      }
+      if (trace.outcome !== "fresh") trace.outcome = "ok";
+      return json({ jsonrpc: "2.0", id: rpc.id, result: rpc.result });
     }
-  }
 
-  if (path === "/mcp") {
-    if (request.method !== "POST") return json({ ok: false, error: "method not allowed" }, 405);
-    if (!bearerOk(request.headers.get("authorization"), env && env.MCP_TOKEN)) {
-      return json({ ok: false, error: "unauthorized" }, 401);
-    }
-    if (!jsonContentType(request.headers.get("content-type"))) {
-      return json(
-        { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Content-Type must be application/json" } },
-        415,
-      );
-    }
-    const raw = await request.arrayBuffer();
-    if (raw.byteLength > MAX_BODY_BYTES) {
-      return json({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "payload too large" } }, 413);
-    }
-    let message;
-    try {
-      message = JSON.parse(new TextDecoder("utf-8").decode(raw));
-    } catch {
-      return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400);
-    }
-    const db = d1Deps(env);
-    const rpc = await handleMcpRpc(message, {
-      queryAll: (sql, params) => db.queryAll(sql, params),
-      queryFirst: (sql, params) => db.queryFirst(sql, params),
-      queryRun: (sql, params) => db.queryRun(sql, params),
-      getObjectText: (key) => db.getObjectText(key),
-      nowMs: deps.nowMs,
-      cache: resolveCache(deps),
-      ctx: deps.ctx || null,
-      ai: env && env.AI ? env.AI : null,
-      summaryTimeoutMs: deps.summaryTimeoutMs,
-    });
-    if (rpc.type === "notification") return new Response(null, { status: 202 });
-    if (rpc.type === "error") {
-      return json({ jsonrpc: "2.0", id: rpc.id ?? null, error: rpc.error });
-    }
-    return json({ jsonrpc: "2.0", id: rpc.id, result: rpc.result });
-  }
-
-  if (path === "/") {
-    if (request.method !== "POST") return json({ ok: false, error: "method not allowed" }, 405);
-    const rawBuf = new Uint8Array(await request.arrayBuffer());
-    if (rawBuf.byteLength > MAX_BODY_BYTES) return json({ ok: false, error: "payload too large" }, 413);
-    const verdict = await verifySvixSignature({
-      secret: env && env.WEBHOOK_SECRET,
-      svixId: request.headers.get("svix-id"),
-      svixTimestamp: request.headers.get("svix-timestamp"),
-      svixSignature: request.headers.get("svix-signature"),
-      rawBody: rawBuf,
-      nowMs: deps.nowMs,
-    });
-    if (!verdict.ok) {
-      console.log(JSON.stringify({ msg: "webhook rejected", reason: verdict.reason }));
-      return json({ ok: false, error: "unauthorized" }, 401);
-    }
-    let event;
-    try {
-      event = JSON.parse(new TextDecoder("utf-8").decode(rawBuf));
-    } catch {
-      return json({ ok: false, error: "invalid json" }, 400);
-    }
-    try {
-      const result = await enqueueWebhook({
-        event,
-        env,
+    if (path === "/") {
+      if (request.method !== "POST") {
+        trace.outcome = "rejected";
+        return json({ ok: false, error: "method not allowed" }, 405);
+      }
+      const rawBuf = new Uint8Array(await request.arrayBuffer());
+      if (rawBuf.byteLength > MAX_BODY_BYTES) {
+        trace.outcome = "rejected";
+        return json({ ok: false, error: "payload too large" }, 413);
+      }
+      const verdict = await verifySvixSignature({
+        secret: env && env.WEBHOOK_SECRET,
         svixId: request.headers.get("svix-id"),
+        svixTimestamp: request.headers.get("svix-timestamp"),
+        svixSignature: request.headers.get("svix-signature"),
+        rawBody: rawBuf,
+        nowMs: deps.nowMs,
       });
-      return json(result.body, result.status);
-    } catch (err) {
-      console.error(JSON.stringify({ msg: "webhook failed", error: err && err.message }));
-      return json({ ok: false }, 500);
+      if (!verdict.ok) {
+        trace.outcome = "unauthorized";
+        if (SAFE_LOG_ERRORS.has(verdict.reason)) trace.error = verdict.reason;
+        return json({ ok: false, error: "unauthorized" }, 401);
+      }
+      let event;
+      try {
+        event = JSON.parse(new TextDecoder("utf-8").decode(rawBuf));
+      } catch {
+        trace.outcome = "rejected";
+        trace.enqueued = false;
+        return json({ ok: false, error: "invalid json" }, 400);
+      }
+      try {
+        const result = await enqueueWebhook({
+          event,
+          env,
+          svixId: request.headers.get("svix-id"),
+        });
+        const emailId = event && event.data && event.data.email_id;
+        if (isSafeResendId(emailId)) trace.resend_id = emailId;
+        if (result.status === 200 && result.body && result.body.queued) {
+          trace.outcome = "ok";
+          trace.enqueued = true;
+        } else if (result.body && result.body.ignored) {
+          trace.outcome = "ignored";
+          trace.enqueued = false;
+        } else if (result.status >= 400 && result.status < 500) {
+          trace.outcome = "rejected";
+          trace.enqueued = false;
+        } else {
+          trace.outcome = "error";
+          trace.enqueued = false;
+        }
+        return json(result.body, result.status);
+      } catch {
+        trace.outcome = "error";
+        trace.error = "enqueue_failed";
+        trace.enqueued = false;
+        return json({ ok: false }, 500);
+      }
     }
-  }
 
-  return json({ ok: false, error: "not found" }, 404);
+    trace.outcome = "rejected";
+    return json({ ok: false, error: "not found" }, 404);
+  } catch (err) {
+    if (!trace.outcome) trace.outcome = "error";
+    if (!trace.error) trace.error = "unhandled";
+    throw err;
+  } finally {
+    trace.wall_ms = Date.now() - started;
+    if (!trace.outcome) trace.outcome = "ok";
+    emitObservation(env, trace);
+  }
 }
 
 export default {
@@ -1780,5 +2175,8 @@ export default {
   },
   queue(batch, env, ctx) {
     return handleQueue(batch, env, { ctx });
+  },
+  scheduled(event, env, ctx) {
+    return handleScheduled(event, env, { ctx });
   },
 };
