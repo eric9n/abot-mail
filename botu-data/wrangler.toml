@@ -1,0 +1,19 @@
+# Not the deployed worker. `wrangler deploy` without `--env staging` must not
+# replace the staging worker and drop its D1 binding.
+name = "botu-data-unconfigured"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+
+# v1 provisions staging only. There is no production D1, R2, queue, or secret
+# in this file. Do not point database_id at the mail archive.
+# Deploy with: npx wrangler deploy --env staging
+# Secret (staging worker only): npx wrangler secret put DATA_MCP_TOKEN --env staging
+# The placeholder database_id is not a real database and is not the mail archive.
+
+[env.staging]
+name = "botu-data"
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "botu-data"
+database_id = "00000000-0000-4000-8000-000000000001"
