@@ -81,6 +81,26 @@ notes: `create_note({title?, body?, tags?, links?})` → `{id}`；`get_note({id}
 ### 非目标（v1 不做）
 全文搜索（先 LIKE）、完整 RRULE、Google 同步（由外部 cron 做，不在 Worker 内）、多用户、大附件 R2。
 
+## URL 寻址
+
+每条联系人、事件、笔记都有一个 canonical URL。agent 在 bot 之间交接、或跨 session 引用时，传这个 URL，不拷贝记录内容。v1 只提供 JSON，不提供给人读的 HTML。
+
+URL 不入库。Worker 用当次请求的 origin 拼出来：`{origin}/{kind}/{id}`。
+
+| 资源 | 方法与路径 | id |
+| --- | --- | --- |
+| 联系人 | `GET /ctc/{id}` | `ctc_` + 12 位 |
+| 日历事件 | `GET /cal/{id}` | `cal_` + 12 位 |
+| 笔记 | `GET /note/{id}` | `note_` + 12 位 |
+
+例子：`https://<host>/cal/cal_abc123def456`。
+
+- 鉴权与 `POST /mcp` 相同：`Authorization: Bearer <DATA_MCP_TOKEN>`。无 token 或 token 不对返回 401，并且不查 D1。
+- 命中时 HTTP 200，body 与对应的 `get_contact` / `get_event` / `get_note` 相同，包含 `found: true` 和 `url`。
+- id 不存在、前缀和路径不一致、或格式不对，返回 404，body 为 `{"found":false,"id":"..."}`。
+- `create_*` 返回 `{id, url}`。`get_*` 命中、`update_*`、`list_*` 的每条记录都带同一个 `url`。`get_*` 未命中不带 `url`。
+- 事件标成 `cancelled` 之后，原来的 URL 仍然返回这条记录。contacts / notes 硬删除之后，URL 变为 404。
+
 ## 实现说明
 
 `schema.sql` 与上面的规格相同，语句前加了 `IF NOT EXISTS`，重复执行不会清掉已有行。
@@ -88,6 +108,7 @@ notes: `create_note({title?, body?, tags?, links?})` → `{id}`；`get_note({id}
 | 方法 | 路径 | 鉴权 | 作用 |
 | --- | --- | --- | --- |
 | `POST` | `/mcp` | `Authorization: Bearer <DATA_MCP_TOKEN>` | MCP JSON-RPC 2.0 |
+| `GET` | `/ctc/{id}`、`/cal/{id}`、`/note/{id}` | 同上 | 记录的 canonical JSON |
 | `GET` | `/health` | 无 | `{"ok":true}` |
 
 `initialize` 的协议版本是 `2025-06-18`。`notifications/*` 回 HTTP 202 和空 body。校验失败是 JSON-RPC `-32602`，不写库。无 token 或 token 不对是 HTTP 401，发生在读 body 和 D1 之前。
@@ -95,7 +116,7 @@ notes: `create_note({title?, body?, tags?, links?})` → `{id}`；`get_note({id}
 行为里规格没有写死的部分：
 
 - 三个 create 额外接受可选 `created_by`（`human` 或 `bot:main`，默认 `human`）。`source` 用表默认：contacts / notes 为 `manual`，events 为 `bot`。`created_by` 和 `source` 创建后不改。
-- create 只返回 `{id}`。get 命中返回整行且 `found: true`；未命中返回 `{found: false, id}`。update 返回更新后的整行。contacts / notes 删除返回 `{id, deleted: true}`。`delete_event` 返回 `{id, status: "cancelled"}`，行仍在；再删一次仍然成功。update / delete 找不到 id 时是 `-32602` `not found`。
+- create 返回 `{id, url}`。get 命中返回整行且 `found: true`，并带 `url`；未命中返回 `{found: false, id}`。update 返回更新后的整行（含 `url`）。list 的每条记录带 `url`。contacts / notes 删除返回 `{id, deleted: true}`。`delete_event` 返回 `{id, status: "cancelled"}`，行还在，URL 仍可读；再删一次仍然成功。update / delete 找不到 id 时是 `-32602` `not found`。
 - 数组字段在响应里解析回数组，`repeat` 解析回对象，`all_day` 为布尔。库里仍然是 JSON 文本和 0/1。
 - `list_events` 取与窗口重叠的事件：`start_utc < 窗口 end` 且 `end_utc > 窗口 start`。`status` 省略时 `confirmed` 和 `cancelled` 都返回。
 - `list_contacts` / `list_notes` 的 `limit` 默认 20、最大 100。`list_events` 默认 100、最大 500。

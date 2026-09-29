@@ -1,6 +1,7 @@
 /**
  * botu-data: personal structured data (contacts, calendar, notes).
  * POST /mcp   MCP (Streamable HTTP, JSON-RPC), Bearer DATA_MCP_TOKEN
+ * GET /ctc/{id}  GET /cal/{id}  GET /note/{id}   canonical JSON, same token
  * GET /health liveness, no personal data
  *
  * D1 binding is DB. This worker does not read the mail archive.
@@ -278,9 +279,22 @@ function nowIso(deps) {
   return new Date(ms).toISOString();
 }
 
-function contactView(row) {
+const RESOURCE_KIND = { ctc_: "ctc", cal_: "cal", note_: "note" };
+
+/** Absolute canonical URL for a record. Origin is the request origin, not stored. */
+export function canonicalUrl(origin, id) {
+  const prefix = typeof id === "string" ? id.slice(0, id.indexOf("_") + 1) : "";
+  const kind = RESOURCE_KIND[prefix];
+  if (!kind) throw new Error("bad id");
+  const path = `/${kind}/${id}`;
+  if (typeof origin !== "string" || origin === "") return path;
+  return `${origin.replace(/\/+$/, "")}${path}`;
+}
+
+function contactView(row, origin) {
   return {
     id: row.id,
+    url: canonicalUrl(origin, row.id),
     name: row.name,
     aliases: parseJson(row.aliases, []),
     org: row.org ?? null,
@@ -296,9 +310,10 @@ function contactView(row) {
   };
 }
 
-function eventView(row) {
+function eventView(row, origin) {
   return {
     id: row.id,
+    url: canonicalUrl(origin, row.id),
     title: row.title,
     start_utc: row.start_utc,
     end_utc: row.end_utc,
@@ -318,9 +333,10 @@ function eventView(row) {
   };
 }
 
-function noteView(row) {
+function noteView(row, origin) {
   return {
     id: row.id,
+    url: canonicalUrl(origin, row.id),
     title: row.title,
     body: row.body,
     tags: parseJson(row.tags, []),
@@ -395,7 +411,7 @@ async function createContact(args, deps) {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?)`,
     [name, aliases, org ?? null, title ?? null, email ?? null, phone ?? null, relation ?? null, notes ?? null, createdBy, now, now],
   );
-  return { id };
+  return { id, url: canonicalUrl(deps && deps.origin, id) };
 }
 
 async function getContact(args, deps) {
@@ -404,7 +420,7 @@ async function getContact(args, deps) {
   const id = requireId(args.id, "ctc_");
   const row = await queryFirst(deps, `SELECT ${CONTACT_FIELDS} FROM contacts WHERE id = ?`, [id]);
   if (!row) return { found: false, id };
-  return { found: true, ...contactView(row) };
+  return { found: true, ...contactView(row, deps.origin) };
 }
 
 async function listContacts(args, deps) {
@@ -428,7 +444,7 @@ ${where}ORDER BY updated_at DESC, id ASC
 LIMIT ?`,
     params,
   );
-  return rows.map(contactView);
+  return rows.map((row) => contactView(row, deps.origin));
 }
 
 async function updateContact(args, deps) {
@@ -453,7 +469,7 @@ async function updateContact(args, deps) {
   params.push(now, id);
   await queryRun(deps, `UPDATE contacts SET ${sets.join(", ")} WHERE id = ?`, params);
   const row = await queryFirst(deps, `SELECT ${CONTACT_FIELDS} FROM contacts WHERE id = ?`, [id]);
-  return { found: true, ...contactView(row) };
+  return { found: true, ...contactView(row, deps.origin) };
 }
 
 async function deleteContact(args, deps) {
@@ -506,7 +522,7 @@ async function createEvent(args, deps) {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, 'bot', ?, ?, ?, ?, 'confirmed', ?, ?, ?)`,
     [title, start, end, timezone, allDay, repeat, attendees, reminders, location ?? null, notes ?? null, createdBy, now, now],
   );
-  return { id };
+  return { id, url: canonicalUrl(deps && deps.origin, id) };
 }
 
 async function getEvent(args, deps) {
@@ -515,7 +531,7 @@ async function getEvent(args, deps) {
   const id = requireId(args.id, "cal_");
   const row = await queryFirst(deps, `SELECT ${EVENT_FIELDS} FROM calendar_events WHERE id = ?`, [id]);
   if (!row) return { found: false, id };
-  return { found: true, ...eventView(row) };
+  return { found: true, ...eventView(row, deps.origin) };
 }
 
 async function listEvents(args, deps) {
@@ -542,7 +558,7 @@ ORDER BY start_utc ASC, id ASC
 LIMIT ?`,
     params,
   );
-  return rows.map(eventView);
+  return rows.map((row) => eventView(row, deps.origin));
 }
 
 async function updateEvent(args, deps) {
@@ -599,7 +615,7 @@ async function updateEvent(args, deps) {
   params.push(now, id);
   await queryRun(deps, `UPDATE calendar_events SET ${sets.join(", ")} WHERE id = ?`, params);
   const row = await queryFirst(deps, `SELECT ${EVENT_FIELDS} FROM calendar_events WHERE id = ?`, [id]);
-  return { found: true, ...eventView(row) };
+  return { found: true, ...eventView(row, deps.origin) };
 }
 
 async function deleteEvent(args, deps) {
@@ -630,7 +646,7 @@ async function createNote(args, deps) {
     ) VALUES (?, ?, ?, ?, ?, 'manual', ?, ?, ?)`,
     [title, body, tags, links, createdBy, now, now],
   );
-  return { id };
+  return { id, url: canonicalUrl(deps && deps.origin, id) };
 }
 
 async function getNote(args, deps) {
@@ -639,7 +655,7 @@ async function getNote(args, deps) {
   const id = requireId(args.id, "note_");
   const row = await queryFirst(deps, `SELECT ${NOTE_FIELDS} FROM notes WHERE id = ?`, [id]);
   if (!row) return { found: false, id };
-  return { found: true, ...noteView(row) };
+  return { found: true, ...noteView(row, deps.origin) };
 }
 
 async function listNotes(args, deps) {
@@ -669,7 +685,7 @@ ${whereSql}ORDER BY updated_at DESC, id ASC
 LIMIT ?`,
     params,
   );
-  return rows.map(noteView);
+  return rows.map((row) => noteView(row, deps.origin));
 }
 
 async function updateNote(args, deps) {
@@ -690,7 +706,7 @@ async function updateNote(args, deps) {
   params.push(now, id);
   await queryRun(deps, `UPDATE notes SET ${sets.join(", ")} WHERE id = ?`, params);
   const row = await queryFirst(deps, `SELECT ${NOTE_FIELDS} FROM notes WHERE id = ?`, [id]);
-  return { found: true, ...noteView(row) };
+  return { found: true, ...noteView(row, deps.origin) };
 }
 
 async function deleteNote(args, deps) {
@@ -706,7 +722,7 @@ async function deleteNote(args, deps) {
 export const TOOLS = [
   {
     name: "create_contact",
-    description: "新建联系人。name 必填。aliases 为字符串数组。返回 {id}，前缀 ctc_。created_by 可选：human 或 bot:main。",
+    description: "新建联系人。name 必填。aliases 为字符串数组。返回 {id, url}，id 前缀 ctc_，url 是 canonical URL。created_by 可选：human 或 bot:main。",
     inputSchema: {
       type: "object",
       properties: {
@@ -726,7 +742,7 @@ export const TOOLS = [
   },
   {
     name: "get_contact",
-    description: "按 id 读取一个联系人。不存在时 found 为 false。",
+    description: "按 id 读取一个联系人。命中时带 url。不存在时 found 为 false。",
     inputSchema: {
       type: "object",
       properties: { id: { type: "string" } },
@@ -779,7 +795,7 @@ export const TOOLS = [
   {
     name: "create_event",
     description:
-      "新建日历事件。start_utc / end_utc 为 UTC ISO8601，end 必须晚于 start。repeat.freq 为 none、daily、weekly 或 monthly。返回 {id}，前缀 cal_。不检查 attendee_ids 是否已有联系人。",
+      "新建日历事件。start_utc / end_utc 为 UTC ISO8601，end 必须晚于 start。repeat.freq 为 none、daily、weekly 或 monthly。返回 {id, url}，id 前缀 cal_。不检查 attendee_ids 是否已有联系人。",
     inputSchema: {
       type: "object",
       properties: {
@@ -801,7 +817,7 @@ export const TOOLS = [
   },
   {
     name: "get_event",
-    description: "按 id 读取一个事件，包括已取消的事件。",
+    description: "按 id 读取一个事件，包括已取消的事件。命中时带 url。",
     inputSchema: {
       type: "object",
       properties: { id: { type: "string" } },
@@ -860,7 +876,7 @@ export const TOOLS = [
   },
   {
     name: "create_note",
-    description: "新建笔记。title、body、tags、links 都可选。返回 {id}，前缀 note_。",
+    description: "新建笔记。title、body、tags、links 都可选。返回 {id, url}，id 前缀 note_。",
     inputSchema: {
       type: "object",
       properties: {
@@ -875,7 +891,7 @@ export const TOOLS = [
   },
   {
     name: "get_note",
-    description: "按 id 读取一条笔记。不存在时 found 为 false。",
+    description: "按 id 读取一条笔记。命中时带 url。不存在时 found 为 false。",
     inputSchema: {
       type: "object",
       properties: { id: { type: "string" } },
@@ -1070,7 +1086,30 @@ function jsonContentType(header) {
   return media === "application/json";
 }
 
+const RESOURCE_READ = {
+  ctc: { idPrefix: "ctc_", sql: `SELECT ${CONTACT_FIELDS} FROM contacts WHERE id = ?`, view: contactView },
+  cal: { idPrefix: "cal_", sql: `SELECT ${EVENT_FIELDS} FROM calendar_events WHERE id = ?`, view: eventView },
+  note: { idPrefix: "note_", sql: `SELECT ${NOTE_FIELDS} FROM notes WHERE id = ?`, view: noteView },
+};
+
+function resourceFromPath(path) {
+  const match = /^\/(ctc|cal|note)\/([^/]+)$/.exec(path);
+  if (!match) return null;
+  let id = match[2];
+  try {
+    id = decodeURIComponent(match[2]);
+  } catch {
+    return { kind: match[1], id: match[2], malformed: true };
+  }
+  return { kind: match[1], id };
+}
+
+function isResourceId(id, prefix) {
+  return typeof id === "string" && new RegExp(`^${prefix}[a-z0-9]{12}$`).test(id);
+}
+
 export async function handleFetch(request, env, deps = {}) {
+  const origin = new URL(request.url).origin;
   const path = pathOf(request);
 
   if (path === "/health") {
@@ -1112,12 +1151,33 @@ export async function handleFetch(request, env, deps = {}) {
       queryFirst: (sql, params) => db.queryFirst(sql, params),
       queryRun: (sql, params) => db.queryRun(sql, params),
       nowMs: deps.nowMs,
+      origin,
     });
     if (rpc.type === "notification") return new Response(null, { status: 202 });
     if (rpc.type === "error") {
       return json({ jsonrpc: "2.0", id: rpc.id ?? null, error: rpc.error });
     }
     return json({ jsonrpc: "2.0", id: rpc.id, result: rpc.result });
+  }
+
+  const resource = resourceFromPath(path);
+  if (resource) {
+    if (request.method !== "GET") return json({ ok: false, error: "method not allowed" }, 405);
+    if (!bearerOk(request.headers.get("authorization"), env && env.DATA_MCP_TOKEN)) {
+      return json({ ok: false, error: "unauthorized" }, 401);
+    }
+    const spec = RESOURCE_READ[resource.kind];
+    if (resource.malformed || !isResourceId(resource.id, spec.idPrefix)) {
+      return json({ found: false, id: resource.id }, 404);
+    }
+    try {
+      const row = await d1Deps(env).queryFirst(spec.sql, [resource.id]);
+      if (!row) return json({ found: false, id: resource.id }, 404);
+      return json({ found: true, ...spec.view(row, origin) });
+    } catch (err) {
+      console.error(JSON.stringify({ msg: "resource read failed", error: err && err.message }));
+      return json({ ok: false }, 500);
+    }
   }
 
   return json({ ok: false, error: "not found" }, 404);

@@ -5,6 +5,7 @@ import test from "node:test";
 
 import worker, {
   TOOLS,
+  canonicalUrl,
   handleFetch,
   handleMcpRpc,
   idFromBytes,
@@ -65,7 +66,7 @@ async function mcp(env, name, args, opts = {}) {
   const headers = { "content-type": "application/json" };
   if (opts.token !== null) headers.authorization = `Bearer ${opts.token === undefined ? TOKEN : opts.token}`;
   const res = await handleFetch(
-    new Request("https://botu-data.test/mcp", {
+    new Request(opts.url ?? "https://botu-data.test/mcp", {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -101,6 +102,9 @@ test("idFromBytes uses the alphabet and skips biased bytes", () => {
   assert.equal(idFromBytes("ctc_", bytes), "ctc_abcdefghijkl");
   assert.equal(idFromBytes("cal_", bytes), "cal_abcdefghijkl");
   assert.equal(idFromBytes("note_", bytes), "note_abcdefghijkl");
+  assert.equal(canonicalUrl("https://bot.example", "cal_abcdefghijkl"), "https://bot.example/cal/cal_abcdefghijkl");
+  assert.equal(canonicalUrl("https://bot.example/", "ctc_abcdefghijkl"), "https://bot.example/ctc/ctc_abcdefghijkl");
+  assert.equal(canonicalUrl("https://bot.example", "note_abcdefghijkl"), "https://bot.example/note/note_abcdefghijkl");
   assert.throws(() => idFromBytes("nope_", bytes), /bad id prefix/);
   assert.throws(() => idFromBytes("ctc_", Uint8Array.from([252, 253, 254, 255])), /not enough entropy/);
 });
@@ -280,10 +284,12 @@ test("contact tools create, read, list, update, and hard-delete", async () => {
     }),
   );
   assert.match(created.id, /^ctc_[a-z0-9]{12}$/);
-  assert.deepEqual(Object.keys(created), ["id"]);
+  assert.equal(created.url, `https://botu-data.test/ctc/${created.id}`);
+  assert.deepEqual(Object.keys(created).sort(), ["id", "url"]);
 
   const got = unwrap(await mcp(env, "get_contact", { id: created.id }));
   assert.equal(got.found, true);
+  assert.equal(got.url, created.url);
   assert.equal(got.name, "100% Ada");
   assert.deepEqual(got.aliases, ["艾达", "a_b"]);
   assert.equal(got.org, "Analytical");
@@ -295,6 +301,7 @@ test("contact tools create, read, list, update, and hard-delete", async () => {
   const byAlias = unwrap(await mcp(env, "list_contacts", { query: "艾达" }));
   assert.equal(byAlias.length, 1);
   assert.equal(byAlias[0].id, created.id);
+  assert.equal(byAlias[0].url, created.url);
   const byOrg = unwrap(await mcp(env, "list_contacts", { query: "Analytical" }));
   assert.equal(byOrg.length, 1);
   const byPercent = unwrap(await mcp(env, "list_contacts", { query: "%" }));
@@ -310,6 +317,7 @@ test("contact tools create, read, list, update, and hard-delete", async () => {
   const updated = unwrap(
     await mcp(env, "update_contact", { id: created.id, org: "Babbage", title: null }, { nowMs: LATER }),
   );
+  assert.equal(updated.url, created.url);
   assert.equal(updated.org, "Babbage");
   assert.equal(updated.title, null);
   assert.equal(updated.name, "100% Ada");
@@ -350,6 +358,7 @@ test("event tools create, list by overlap, update, and cancel in place", async (
     }),
   );
   assert.match(meeting.id, /^cal_[a-z0-9]{12}$/);
+  assert.equal(meeting.url, `https://botu-data.test/cal/${meeting.id}`);
   const later = unwrap(
     await mcp(env, "create_event", {
       title: "tomorrow",
@@ -361,6 +370,7 @@ test("event tools create, list by overlap, update, and cancel in place", async (
 
   const got = unwrap(await mcp(env, "get_event", { id: meeting.id }));
   assert.equal(got.found, true);
+  assert.equal(got.url, meeting.url);
   assert.equal(got.title, "standup");
   assert.equal(got.start_utc, "2026-09-29T06:00:00.000Z");
   assert.equal(got.end_utc, "2026-09-29T07:00:00.000Z");
@@ -385,6 +395,7 @@ test("event tools create, list by overlap, update, and cancel in place", async (
     window.map((row) => row.id),
     [meeting.id],
   );
+  assert.equal(window[0].url, meeting.url);
 
   const updated = unwrap(
     await mcp(
@@ -394,6 +405,7 @@ test("event tools create, list by overlap, update, and cancel in place", async (
       { nowMs: LATER },
     ),
   );
+  assert.equal(updated.url, meeting.url);
   assert.equal(updated.title, "standup moved");
   assert.equal(updated.all_day, true);
   assert.equal(updated.location, null);
@@ -409,6 +421,7 @@ test("event tools create, list by overlap, update, and cancel in place", async (
 
   const still = unwrap(await mcp(env, "get_event", { id: meeting.id }));
   assert.equal(still.found, true);
+  assert.equal(still.url, meeting.url);
   assert.equal(still.status, "cancelled");
   const confirmed = unwrap(
     await mcp(env, "list_events", {
@@ -442,6 +455,7 @@ test("note tools create, filter, update, and hard-delete", async () => {
     }),
   );
   assert.match(work.id, /^note_[a-z0-9]{12}$/);
+  assert.equal(work.url, `https://botu-data.test/note/${work.id}`);
   const home = unwrap(
     await mcp(env, "create_note", { title: "grocery", body: "milk", tags: ["home"] }, { nowMs: LATER }),
   );
@@ -450,6 +464,7 @@ test("note tools create, filter, update, and hard-delete", async () => {
 
   const got = unwrap(await mcp(env, "get_note", { id: work.id }));
   assert.equal(got.found, true);
+  assert.equal(got.url, work.url);
   assert.equal(got.title, "plan");
   assert.equal(got.body, "ship botu");
   assert.deepEqual(got.tags, ["work"]);
@@ -463,6 +478,7 @@ test("note tools create, filter, update, and hard-delete", async () => {
     byText.map((row) => row.id),
     [home.id],
   );
+  assert.equal(byText[0].url, home.url);
   const byTag = unwrap(await mcp(env, "list_notes", { tag: "work" }));
   assert.deepEqual(
     byTag.map((row) => row.id),
@@ -480,6 +496,7 @@ test("note tools create, filter, update, and hard-delete", async () => {
   const updated = unwrap(
     await mcp(env, "update_note", { id: work.id, body: "ship the data layer", tags: ["work", "v1"] }, { nowMs: LATER }),
   );
+  assert.equal(updated.url, work.url);
   assert.equal(updated.body, "ship the data layer");
   assert.deepEqual(updated.tags, ["work", "v1"]);
   assert.equal(updated.title, "plan");
@@ -568,4 +585,93 @@ test("rejects inverted times and illegal repeat without writing", async () => {
   const row = db.prepare("SELECT end_utc, repeat FROM calendar_events WHERE id = ?").get(ok.id);
   assert.equal(row.end_utc, "2026-09-29T07:00:00.000Z");
   assert.equal(row.repeat, '{"freq":"monthly"}');
+});
+
+test("canonical GET routes match get_* and reject a bad token before D1", async () => {
+  const { db, env } = sqliteEnv();
+  const contact = unwrap(
+    await mcp(env, "create_contact", { name: "Ada" }, { url: "https://bot.example/mcp" }),
+  );
+  assert.equal(contact.url, `https://bot.example/ctc/${contact.id}`);
+  const event = unwrap(
+    await mcp(env, "create_event", {
+      title: "sync",
+      start_utc: "2026-09-29T06:00:00Z",
+      end_utc: "2026-09-29T07:00:00Z",
+    }),
+  );
+  const note = unwrap(await mcp(env, "create_note", { title: "pointer", body: "pass the url" }));
+
+  async function read(url, token = TOKEN) {
+    const headers = {};
+    if (token !== null) headers.authorization = `Bearer ${token}`;
+    const res = await handleFetch(new Request(url, { headers }), env);
+    const text = await res.text();
+    return { status: res.status, body: text ? JSON.parse(text) : null };
+  }
+
+  const contactPage = await read(contact.url);
+  assert.equal(contactPage.status, 200);
+  assert.deepEqual(contactPage.body, unwrap(await mcp(env, "get_contact", { id: contact.id }, { url: "https://bot.example/mcp" })));
+
+  const eventPage = await read(event.url);
+  assert.equal(eventPage.status, 200);
+  assert.equal(eventPage.body.url, event.url);
+  assert.deepEqual(eventPage.body, unwrap(await mcp(env, "get_event", { id: event.id })));
+
+  const notePage = await read(note.url);
+  assert.equal(notePage.status, 200);
+  assert.deepEqual(notePage.body, unwrap(await mcp(env, "get_note", { id: note.id })));
+
+  unwrap(await mcp(env, "delete_event", { id: event.id }));
+  const cancelled = await read(event.url);
+  assert.equal(cancelled.status, 200);
+  assert.equal(cancelled.body.status, "cancelled");
+  assert.equal(cancelled.body.found, true);
+
+  unwrap(await mcp(env, "delete_note", { id: note.id }));
+  const gone = await read(note.url);
+  assert.equal(gone.status, 404);
+  assert.deepEqual(gone.body, { found: false, id: note.id });
+
+  const missing = await read("https://botu-data.test/ctc/ctc_abcdefghijkl");
+  assert.equal(missing.status, 404);
+  assert.deepEqual(missing.body, { found: false, id: "ctc_abcdefghijkl" });
+
+  const wrongKind = await read(`https://botu-data.test/cal/${contact.id}`);
+  assert.equal(wrongKind.status, 404);
+
+  const badShape = await read("https://botu-data.test/note/nope");
+  assert.equal(badShape.status, 404);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM contacts").get().n, 1);
+
+  let touched = false;
+  const closed = {
+    DATA_MCP_TOKEN: TOKEN,
+    DB: {
+      prepare() {
+        touched = true;
+        throw new Error("db touched");
+      },
+    },
+  };
+  const unauth = await handleFetch(new Request(contact.url), closed);
+  assert.equal(unauth.status, 401);
+  const wrong = await handleFetch(
+    new Request(event.url, { headers: { authorization: "Bearer wrong-token" } }),
+    closed,
+  );
+  assert.equal(wrong.status, 401);
+  const badId = await handleFetch(
+    new Request("https://botu-data.test/cal/not-an-id", { headers: { authorization: `Bearer ${TOKEN}` } }),
+    closed,
+  );
+  assert.equal(badId.status, 404);
+  assert.equal(touched, false);
+
+  const posted = await handleFetch(
+    new Request(note.url, { method: "POST", headers: { authorization: `Bearer ${TOKEN}` } }),
+    env,
+  );
+  assert.equal(posted.status, 405);
 });
