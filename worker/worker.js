@@ -4,6 +4,7 @@
  * queue       mail-ingest consumer: Resend API → D1 + R2
  * POST /mcp   MCP (Streamable HTTP, JSON-RPC), Bearer MCP_TOKEN
  *             reads may use the Cache API after auth; HTTP responses stay no-store
+ *             search/list/stats/get_email keys include a D1 revision bumped on insert
  * GET /health public counts only (never cached)
  *
  * Secrets come from the Worker env: WEBHOOK_SECRET, RESEND_API_KEY, MCP_TOKEN.
@@ -544,18 +545,18 @@ export function toEmailDetail(row, options = {}) {
   return detail;
 }
 
-/** TTLs from the phase-2 cache table. Revision only outlives search/list entries. */
+/** TTLs from the phase-2 cache table. */
 export const CACHE_TTL = {
   getEmail: 24 * 60 * 60,
   r2: 7 * 24 * 60 * 60,
   search: 10,
   list: 10,
   stats: 120,
-  revision: 24 * 60 * 60,
 };
 
 export const STATS_CACHE_URL = "https://cache.internal/mcp/stats";
-export const READ_REV_URL = "https://cache.internal/mcp/rev";
+/** Point read. Fetch and the consumer share this row; they do not share caches.default. */
+export const READ_REVISION_SQL = "SELECT rev FROM cache_revision WHERE id = 1";
 
 const TERMINAL_AI = ["ok", "failed", "skipped", "deferred"];
 const GET_AI_VARIANTS = ["none", ...TERMINAL_AI];
@@ -566,7 +567,7 @@ export function emailCacheDecision(columnPresent, aiStatus) {
   return { cache: false };
 }
 
-export function getEmailCacheUrl(resendId, includeHtml, includeRaw, ai) {
+export function getEmailCacheUrl(resendId, includeHtml, includeRaw, ai, rev) {
   return (
     "https://cache.internal/mcp/get?id=" +
     encodeURIComponent(resendId) +
@@ -575,8 +576,14 @@ export function getEmailCacheUrl(resendId, includeHtml, includeRaw, ai) {
     "&raw=" +
     (includeRaw ? "1" : "0") +
     "&ai=" +
-    encodeURIComponent(ai)
+    encodeURIComponent(ai) +
+    "&rev=" +
+    encodeURIComponent(String(rev))
   );
+}
+
+export function statsCacheUrl(rev) {
+  return `${STATS_CACHE_URL}?rev=${encodeURIComponent(String(rev))}`;
 }
 
 export function r2CacheUrl(r2Key) {
@@ -665,16 +672,26 @@ async function scheduleCachePut(cache, ctx, request, response) {
   await op;
 }
 
-async function readRevision(cache) {
-  if (!cache) return 0;
-  const hit = await matchCache(cache, new Request(READ_REV_URL));
-  if (!hit) return 0;
-  try {
-    const n = Number((await hit.text()).trim());
-    return Number.isInteger(n) && n >= 0 ? n : 0;
-  } catch {
-    return 0;
+function revisionFromRow(row) {
+  const n = row == null ? NaN : Number(row.rev);
+  return Number.isInteger(n) && n >= 0 ? n : 0;
+}
+
+/**
+ * Current cache generation from D1, not from caches.default.
+ * Callers must use the same session as the archive read that follows, so a
+ * replica cannot pair a new generation with an older result set.
+ */
+async function readRevision(deps) {
+  if (!deps) return 0;
+  if (typeof deps.queryFirst === "function") {
+    return revisionFromRow(await deps.queryFirst(READ_REVISION_SQL, []));
   }
+  if (typeof deps.queryAll === "function") {
+    const rows = await deps.queryAll(READ_REVISION_SQL, []);
+    return revisionFromRow(Array.isArray(rows) ? rows[0] : null);
+  }
+  return 0;
 }
 
 async function readThrough(deps, { fresh, url, ttl, load, store }) {
@@ -742,30 +759,6 @@ async function rememberR2(cache, key, bytes) {
     );
   } catch (err) {
     console.error(JSON.stringify({ msg: "cache put failed", error: err && err.message }));
-  }
-}
-
-/** New mail makes search/list/stats/get stale in this colo. R2 keys are immutable, so they stay. */
-export async function invalidateReadCache(cache, resendId) {
-  if (!cache) return;
-  try {
-    const next = String((await readRevision(cache)) + 1);
-    await cache.put(
-      new Request(READ_REV_URL),
-      cacheResponse(next, CACHE_TTL.revision, "text/plain; charset=utf-8"),
-    );
-    if (typeof cache.delete !== "function") return;
-    const deletions = [cache.delete(new Request(STATS_CACHE_URL))];
-    for (const html of [false, true]) {
-      for (const raw of [false, true]) {
-        for (const ai of GET_AI_VARIANTS) {
-          deletions.push(cache.delete(new Request(getEmailCacheUrl(resendId, html, raw, ai))));
-        }
-      }
-    }
-    await Promise.all(deletions);
-  } catch (err) {
-    console.error(JSON.stringify({ msg: "cache invalidate failed", error: err && err.message }));
   }
 }
 
@@ -900,7 +893,7 @@ async function callTool(name, args, deps) {
     const query = buildSearchQuery(args);
     const [hash, rev] = await Promise.all([
       hashCacheFields(searchCacheFields(args)),
-      readRevision(deps && deps.cache),
+      readRevision(deps),
     ]);
     return readThrough(deps, {
       fresh: args.fresh === true,
@@ -914,7 +907,7 @@ async function callTool(name, args, deps) {
     const query = buildListQuery(args);
     const [hash, rev] = await Promise.all([
       hashCacheFields(listCacheFields(args)),
-      readRevision(deps && deps.cache),
+      readRevision(deps),
     ]);
     return readThrough(deps, {
       fresh: args.fresh === true,
@@ -928,11 +921,12 @@ async function callTool(name, args, deps) {
     const parsed = buildGetQuery(args);
     const fresh = args.fresh === true;
     const id = args.resend_id;
+    const rev = await readRevision(deps);
     if (deps && deps.cache && !fresh) {
       for (const ai of GET_AI_VARIANTS) {
         const hit = await matchCache(
           deps.cache,
-          new Request(getEmailCacheUrl(id, parsed.includeHtml, parsed.includeRaw, ai)),
+          new Request(getEmailCacheUrl(id, parsed.includeHtml, parsed.includeRaw, ai, rev)),
         );
         if (!hit) continue;
         try {
@@ -961,7 +955,7 @@ async function callTool(name, args, deps) {
       await scheduleCachePut(
         deps.cache,
         deps.ctx,
-        new Request(getEmailCacheUrl(id, query.includeHtml, query.includeRaw, decision.ai)),
+        new Request(getEmailCacheUrl(id, query.includeHtml, query.includeRaw, decision.ai, rev)),
         cacheResponse(JSON.stringify(value), CACHE_TTL.getEmail, "application/json; charset=utf-8"),
       );
     }
@@ -970,9 +964,10 @@ async function callTool(name, args, deps) {
   if (name === "email_stats") {
     assertOnlyKeys(args, new Set(["fresh"]));
     assertOptionalFresh(args);
+    const rev = await readRevision(deps);
     return readThrough(deps, {
       fresh: args.fresh === true,
-      url: STATS_CACHE_URL,
+      url: statsCacheUrl(rev),
       ttl: CACHE_TTL.stats,
       load: async () => {
         const queries = buildStatsQueries(deps && deps.nowMs);
@@ -996,17 +991,23 @@ function bindStmt(db, sql, params) {
   return stmt;
 }
 
+function d1Session(db) {
+  if (db && typeof db.withSession === "function") return db.withSession("first-primary");
+  return db;
+}
+
 function d1Deps(env) {
+  const source = d1Session(env && env.DB);
   return {
     async queryAll(sql, params) {
-      const out = await bindStmt(env.DB, sql, params).all();
+      const out = await bindStmt(source, sql, params).all();
       return out.results || [];
     },
     async queryFirst(sql, params) {
-      return bindStmt(env.DB, sql, params).first();
+      return bindStmt(source, sql, params).first();
     },
     async queryRun(sql, params) {
-      return bindStmt(env.DB, sql, params).run();
+      return bindStmt(source, sql, params).run();
     },
     async getObjectText(key) {
       const obj = await env.ARCHIVE_BUCKET.get(key);
@@ -1142,8 +1143,10 @@ export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now(), 
     { direction, eventCreatedAt: event.created_at, attachments, nowMs },
   );
   const insert = buildInsertQuery(row);
+  // cache_revision advances in this commit via AFTER INSERT. Readers fold that
+  // value into cache keys. A caches.default delete here would stay in this
+  // colo; queue consumers and fetch handlers do not share one.
   await db.queryRun(insert.sql, insert.params);
-  await invalidateReadCache(cache, storedId);
   console.log(JSON.stringify({ msg: "archived", direction, email_id: storedId }));
   return { status: 200, body: { ok: true } };
 }
@@ -1451,6 +1454,7 @@ export async function handleFetch(request, env, deps = {}) {
     const db = d1Deps(env);
     const rpc = await handleMcpRpc(message, {
       queryAll: (sql, params) => db.queryAll(sql, params),
+      queryFirst: (sql, params) => db.queryFirst(sql, params),
       getObjectText: (key) => db.getObjectText(key),
       nowMs: deps.nowMs,
       cache: resolveCache(deps),

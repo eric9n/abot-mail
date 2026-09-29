@@ -29,3 +29,22 @@ CREATE TABLE IF NOT EXISTS ingest_failures (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ingest_failures_resend_id ON ingest_failures(resend_id);
+
+-- Generation for MCP read-cache keys. One row, advanced in the same commit as
+-- an emails insert. Fetch handlers read it from the primary on every read and
+-- put it in the cache key, so a stale colo entry is never addressed.
+-- caches.default is per-colo, and a queue consumer does not share it with fetch.
+CREATE TABLE IF NOT EXISTS cache_revision (
+  id  INTEGER PRIMARY KEY CHECK (id = 1),
+  rev INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO cache_revision (id, rev) VALUES (1, 0);
+
+DROP TRIGGER IF EXISTS cache_revision_after_email_insert;
+CREATE TRIGGER cache_revision_after_email_insert
+AFTER INSERT ON emails
+BEGIN
+  INSERT INTO cache_revision (id, rev) VALUES (1, 1)
+  ON CONFLICT(id) DO UPDATE SET rev = rev + 1;
+END;
