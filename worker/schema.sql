@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS emails (
   message_id  TEXT,
   auth        TEXT,                     -- JSON {spf,dkim,dmarc}, inbound only
   attachments TEXT,                     -- JSON [{filename, content_type, size, r2_key}]
+  summary     TEXT,                     -- JSON {"points":[...],"todos":[{"text","deadline"}]} or NULL
   created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
@@ -48,3 +49,10 @@ BEGIN
   INSERT INTO cache_revision (id, rev) VALUES (1, 1)
   ON CONFLICT(id) DO UPDATE SET rev = rev + 1;
 END;
+
+-- summary is nullable and is not indexed. This file is safe to re-run:
+-- CREATE TABLE IF NOT EXISTS does not add columns to a table that already
+-- exists, and AFTER INSERT is the only revision bump (UPDATE does not fire).
+-- The worker adds summary on "no such column: summary" and ignores
+-- "duplicate column name: summary", so an already-deployed database picks
+-- the column up without a second manual ALTER.

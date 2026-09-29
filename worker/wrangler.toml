@@ -13,6 +13,10 @@ database_id = "779058bf-f5c1-44de-b2c8-99350ec7748e"
 binding = "ARCHIVE_BUCKET"
 bucket_name = "abot-mail-archive"
 
+# Workers AI. No external model key. Summaries stay on Cloudflare.
+[ai]
+binding = "AI"
+
 # Production ingest queue. Staging must not bind this name; see [env.staging].
 # Secrets stay in `wrangler secret put` (WEBHOOK_SECRET, RESEND_API_KEY, MCP_TOKEN).
 [[queues.producers]]
@@ -57,6 +61,9 @@ database_id = "00000000-0000-4000-8000-000000000000"
 [[env.staging.r2_buckets]]
 binding = "ARCHIVE_BUCKET"
 bucket_name = "abot-mail-archive-staging"
+
+[env.staging.ai]
+binding = "AI"
 
 [[env.staging.queues.producers]]
 binding = "INGEST_QUEUE"
