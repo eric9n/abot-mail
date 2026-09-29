@@ -1395,12 +1395,20 @@ test("cache keys follow the phase-2 table and fresh is optional", async () => {
     limit: 500,
   });
   const record = canonicalCacheRecord(fields);
+  const entries = JSON.parse(record);
   assert.deepEqual(
-    record.split("\n").map((line) => line.split("=")[0]),
+    entries.map(([key]) => key),
     ["direction", "from", "limit", "query", "since", "to", "until"],
   );
-  assert.match(record, /^direction=in\nfrom=a@b\.c\nlimit=100\nquery=invoice\n/);
-  assert.match(record, /since=2026-09-01T00:00:00\.000Z/);
+  assert.deepEqual(Object.fromEntries(entries), {
+    direction: "in",
+    from: "a@b.c",
+    limit: 100,
+    query: "invoice",
+    since: "2026-09-01T00:00:00.000Z",
+    to: "eric@abot.run",
+    until: "2026-09-28T00:00:00.000Z",
+  });
   assert.equal(record.includes("fresh"), false);
   assert.equal(record.includes("cursor"), false);
   assert.equal(record.includes("token"), false);
@@ -1409,10 +1417,11 @@ test("cache keys follow the phase-2 table and fresh is optional", async () => {
   assert.equal(await hashCacheFields(fields), same);
   assert.match(same, /^[0-9a-f]{64}$/);
   const listRecord = canonicalCacheRecord(listCacheFields({ limit: 20, direction: "out", since: "2026-09-15" }));
-  assert.deepEqual(
-    listRecord.split("\n").map((line) => line.split("=")[0]),
-    ["direction", "limit", "since"],
-  );
+  assert.deepEqual(JSON.parse(listRecord), [
+    ["direction", "out"],
+    ["limit", 20],
+    ["since", "2026-09-15T00:00:00.000Z"],
+  ]);
   assert.equal(listRecord.includes("cursor"), false);
 
   const plain = buildSearchQuery({ query: "a", limit: 5 });
@@ -1439,6 +1448,51 @@ test("cache keys follow the phase-2 table and fresh is optional", async () => {
   assert.match(skill, /d1\/database\/\{\}\/query/);
   assert.equal(skill.includes("cache.internal"), false);
   assert.equal(skill.includes("caches.default"), false);
+});
+
+test("search cache keys stay distinct when query or from contains a newline", async () => {
+  const first = searchCacheFields({ query: "c", from: "a\nlimit=5\nquery=b", limit: 20 });
+  const second = searchCacheFields({ query: "b\nlimit=20\nquery=c", from: "a", limit: 5 });
+  const firstRecord = canonicalCacheRecord(first);
+  const secondRecord = canonicalCacheRecord(second);
+  assert.notEqual(firstRecord, secondRecord);
+  assert.equal(firstRecord.includes("\n"), false);
+  assert.equal(secondRecord.includes("\n"), false);
+  assert.equal(JSON.parse(firstRecord).find(([key]) => key === "from")[1], "a\nlimit=5\nquery=b");
+  assert.equal(JSON.parse(secondRecord).find(([key]) => key === "query")[1], "b\nlimit=20\nquery=c");
+  assert.notEqual(await hashCacheFields(first), await hashCacheFields(second));
+
+  const normal = searchCacheFields({
+    query: "invoice",
+    from: "a@b.c",
+    to: "eric@abot.run",
+    since: "2026-09-01",
+    until: "2026-09-28T00:00:00.000Z",
+    direction: "in",
+    limit: 500,
+  });
+  const normalAgain = searchCacheFields({
+    limit: 100,
+    query: "invoice",
+    from: "a@b.c",
+    to: "eric@abot.run",
+    since: "2026-09-01T00:00:00.000Z",
+    until: "2026-09-28T00:00:00.000Z",
+    direction: "in",
+  });
+  assert.equal(canonicalCacheRecord(normal), canonicalCacheRecord(normalAgain));
+  assert.equal(await hashCacheFields(normal), await hashCacheFields(normalAgain));
+  assert.match(await hashCacheFields(normal), /^[0-9a-f]{64}$/);
+
+  const listed = listCacheFields({ limit: 20, direction: "out", since: "2026-09-15" });
+  assert.equal(
+    canonicalCacheRecord(listed),
+    JSON.stringify(
+      Object.keys(listed)
+        .sort()
+        .map((key) => [key, listed[key]]),
+    ),
+  );
 });
 
 test("MCP reads hit the cache and stay no-store", async () => {

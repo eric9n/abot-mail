@@ -611,10 +611,13 @@ export function listCacheFields(args) {
 }
 
 export function canonicalCacheRecord(fields) {
-  return Object.keys(fields)
-    .sort()
-    .map((key) => `${key}=${fields[key] == null ? "" : String(fields[key])}`)
-    .join("\n");
+  // JSON escapes newlines (and other separators) inside values. A raw
+  // key=value join let `from`/`query` forge extra fields and share a hash.
+  return JSON.stringify(
+    Object.keys(fields)
+      .sort()
+      .map((key) => [key, fields[key]]),
+  );
 }
 
 export async function hashCacheFields(fields) {
