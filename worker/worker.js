@@ -3,7 +3,9 @@
  * POST /      Resend webhook (Svix): verify, enqueue, return
  * queue       mail-ingest consumer: Resend API → D1 + R2
  * POST /mcp   MCP (Streamable HTTP, JSON-RPC), Bearer MCP_TOKEN
- * GET /health public counts only
+ *             reads may use the Cache API after auth; HTTP responses stay no-store
+ *             search/list/stats/get_email keys include a D1 revision bumped on insert
+ * GET /health public counts only (never cached)
  *
  * Secrets come from the Worker env: WEBHOOK_SECRET, RESEND_API_KEY, MCP_TOKEN.
  */
@@ -297,6 +299,11 @@ function assertOnlyKeys(obj, allowed) {
   }
 }
 
+function assertOptionalFresh(args) {
+  if (!Object.prototype.hasOwnProperty.call(args, "fresh") || args.fresh == null) return;
+  if (typeof args.fresh !== "boolean") throw new RpcError(-32602, "fresh must be a boolean");
+}
+
 const METADATA_SELECT = `
   resend_id,
   direction,
@@ -343,7 +350,8 @@ export function buildInsertQuery(row) {
 
 export function buildSearchQuery(input) {
   const args = input || {};
-  assertOnlyKeys(args, new Set(["query", "from", "to", "since", "until", "direction", "limit"]));
+  assertOnlyKeys(args, new Set(["query", "from", "to", "since", "until", "direction", "limit", "fresh"]));
+  assertOptionalFresh(args);
   if (typeof args.query !== "string" || args.query.trim() === "") {
     throw new RpcError(-32602, "query is required");
   }
@@ -388,7 +396,8 @@ LIMIT ?`,
 
 export function buildListQuery(input) {
   const args = input || {};
-  assertOnlyKeys(args, new Set(["limit", "direction", "since"]));
+  assertOnlyKeys(args, new Set(["limit", "direction", "since", "fresh"]));
+  assertOptionalFresh(args);
   assertDirection(args.direction);
   const limit = clampLimit(args.limit);
   const where = [];
@@ -412,9 +421,10 @@ LIMIT ?`,
   };
 }
 
-export function buildGetQuery(input) {
+export function buildGetQuery(input, options = {}) {
   const args = input || {};
-  assertOnlyKeys(args, new Set(["resend_id", "include_html", "include_raw_eml"]));
+  assertOnlyKeys(args, new Set(["resend_id", "include_html", "include_raw_eml", "fresh"]));
+  assertOptionalFresh(args);
   if (!isSafeResendId(args.resend_id)) throw new RpcError(-32602, "resend_id is required");
   if (args.include_html != null && typeof args.include_html !== "boolean") {
     throw new RpcError(-32602, "include_html must be a boolean");
@@ -423,8 +433,9 @@ export function buildGetQuery(input) {
     throw new RpcError(-32602, "include_raw_eml must be a boolean");
   }
   const includeHtml = args.include_html === true;
+  const aiSql = options.includeAiStatus ? ",\n  ai_status" : "";
   const columns = `${METADATA_SELECT},
-  text_body${includeHtml ? ",\n  html_body" : ""}`;
+  text_body${includeHtml ? ",\n  html_body" : ""}${aiSql}`;
   return {
     sql: `SELECT ${columns}
 FROM emails
@@ -534,6 +545,226 @@ export function toEmailDetail(row, options = {}) {
   return detail;
 }
 
+/** TTLs from the phase-2 cache table. */
+export const CACHE_TTL = {
+  getEmail: 24 * 60 * 60,
+  r2: 7 * 24 * 60 * 60,
+  search: 10,
+  list: 10,
+  stats: 120,
+};
+
+export const STATS_CACHE_URL = "https://cache.internal/mcp/stats";
+/** Point read. Fetch and the consumer share this row; they do not share caches.default. */
+export const READ_REVISION_SQL = "SELECT rev FROM cache_revision WHERE id = 1";
+
+const TERMINAL_AI = ["ok", "failed", "skipped", "deferred"];
+const GET_AI_VARIANTS = ["none", ...TERMINAL_AI];
+
+export function emailCacheDecision(columnPresent, aiStatus) {
+  if (!columnPresent) return { cache: true, ai: "none" };
+  if (typeof aiStatus === "string" && TERMINAL_AI.includes(aiStatus)) return { cache: true, ai: aiStatus };
+  return { cache: false };
+}
+
+export function getEmailCacheUrl(resendId, includeHtml, includeRaw, ai, rev) {
+  return (
+    "https://cache.internal/mcp/get?id=" +
+    encodeURIComponent(resendId) +
+    "&html=" +
+    (includeHtml ? "1" : "0") +
+    "&raw=" +
+    (includeRaw ? "1" : "0") +
+    "&ai=" +
+    encodeURIComponent(ai) +
+    "&rev=" +
+    encodeURIComponent(String(rev))
+  );
+}
+
+export function statsCacheUrl(rev) {
+  return `${STATS_CACHE_URL}?rev=${encodeURIComponent(String(rev))}`;
+}
+
+export function r2CacheUrl(r2Key) {
+  return `https://cache.internal/r2/${r2Key}`;
+}
+
+export function searchCacheFields(args) {
+  return {
+    direction: args.direction ?? null,
+    from: args.from ? args.from : null,
+    limit: clampLimit(args.limit),
+    query: args.query,
+    since: args.since == null ? null : canonicalBound(args.since, "start"),
+    to: args.to ? args.to : null,
+    until: args.until == null ? null : canonicalBound(args.until, "end"),
+  };
+}
+
+export function listCacheFields(args) {
+  return {
+    direction: args.direction ?? null,
+    limit: clampLimit(args.limit),
+    since: args.since == null ? null : canonicalBound(args.since, "start"),
+  };
+}
+
+export function canonicalCacheRecord(fields) {
+  // JSON escapes newlines (and other separators) inside values. A raw
+  // key=value join let `from`/`query` forge extra fields and share a hash.
+  return JSON.stringify(
+    Object.keys(fields)
+      .sort()
+      .map((key) => [key, fields[key]]),
+  );
+}
+
+export async function hashCacheFields(fields) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonicalCacheRecord(fields)));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export function searchCacheUrl(hash, rev) {
+  return `https://cache.internal/mcp/search?h=${hash}&rev=${rev}`;
+}
+
+export function listCacheUrl(hash, rev) {
+  return `https://cache.internal/mcp/list?h=${hash}&rev=${rev}`;
+}
+
+export function resolveCache(deps) {
+  if (deps && Object.prototype.hasOwnProperty.call(deps, "cache")) return deps.cache || null;
+  const globalCache = globalThis.caches;
+  if (globalCache && globalCache.default) return globalCache.default;
+  return null;
+}
+
+function cacheResponse(body, ttl, contentType) {
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "content-type": contentType,
+      "cache-control": `max-age=${ttl}`,
+    },
+  });
+}
+
+async function matchCache(cache, request) {
+  if (!cache || typeof cache.match !== "function") return null;
+  try {
+    const hit = await cache.match(request);
+    return hit || null;
+  } catch (err) {
+    console.error(JSON.stringify({ msg: "cache match failed", error: err && err.message }));
+    return null;
+  }
+}
+
+async function scheduleCachePut(cache, ctx, request, response) {
+  if (!cache || typeof cache.put !== "function") return;
+  const op = Promise.resolve()
+    .then(() => cache.put(request, response))
+    .catch((err) => {
+      console.error(JSON.stringify({ msg: "cache put failed", error: err && err.message }));
+    });
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(op);
+    return;
+  }
+  await op;
+}
+
+function revisionFromRow(row) {
+  const n = row == null ? NaN : Number(row.rev);
+  return Number.isInteger(n) && n >= 0 ? n : 0;
+}
+
+/**
+ * Current cache generation from D1, not from caches.default.
+ * Callers must use the same session as the archive read that follows, so a
+ * replica cannot pair a new generation with an older result set.
+ */
+async function readRevision(deps) {
+  if (!deps) return 0;
+  if (typeof deps.queryFirst === "function") {
+    return revisionFromRow(await deps.queryFirst(READ_REVISION_SQL, []));
+  }
+  if (typeof deps.queryAll === "function") {
+    const rows = await deps.queryAll(READ_REVISION_SQL, []);
+    return revisionFromRow(Array.isArray(rows) ? rows[0] : null);
+  }
+  return 0;
+}
+
+async function readThrough(deps, { fresh, url, ttl, load, store }) {
+  const cache = deps && deps.cache;
+  if (cache && !fresh) {
+    const hit = await matchCache(cache, new Request(url));
+    if (hit) {
+      try {
+        return JSON.parse(await hit.text());
+      } catch {
+        // A damaged entry is a miss. The next put replaces it.
+      }
+    }
+  }
+  const value = await load();
+  if (cache && store(value)) {
+    await scheduleCachePut(
+      cache,
+      deps.ctx,
+      new Request(url),
+      cacheResponse(JSON.stringify(value), ttl, "application/json; charset=utf-8"),
+    );
+  }
+  return value;
+}
+
+async function emailsHaveAiStatus(deps) {
+  try {
+    const rows = await queryAll(deps, {
+      sql: "SELECT name FROM pragma_table_info('emails') WHERE name = 'ai_status'",
+      params: [],
+    });
+    return Array.isArray(rows) && rows.some((row) => row && row.name === "ai_status");
+  } catch {
+    return false;
+  }
+}
+
+async function cachedObjectText(deps, key, fresh) {
+  const cache = deps && deps.cache;
+  const url = r2CacheUrl(key);
+  if (cache && !fresh) {
+    const hit = await matchCache(cache, new Request(url));
+    if (hit) return hit.text();
+  }
+  if (!deps || typeof deps.getObjectText !== "function") throw new Error("object store is not configured");
+  const text = await deps.getObjectText(key);
+  if (cache && text != null) {
+    await scheduleCachePut(
+      cache,
+      deps.ctx,
+      new Request(url),
+      cacheResponse(text, CACHE_TTL.r2, "application/octet-stream"),
+    );
+  }
+  return text;
+}
+
+async function rememberR2(cache, key, bytes) {
+  if (!cache || bytes == null || typeof cache.put !== "function") return;
+  try {
+    await cache.put(
+      new Request(r2CacheUrl(key)),
+      cacheResponse(bytes, CACHE_TTL.r2, "application/octet-stream"),
+    );
+  } catch (err) {
+    console.error(JSON.stringify({ msg: "cache put failed", error: err && err.message }));
+  }
+}
+
 export const TOOLS = [
   {
     name: "search_emails",
@@ -549,6 +780,7 @@ export const TOOLS = [
         until: { type: "string", description: "Inclusive ISO8601 upper bound on date. YYYY-MM-DD is allowed." },
         direction: { type: "string", enum: ["in", "out"] },
         limit: { type: "integer", minimum: 1, maximum: 100, default: 20 },
+        fresh: { type: "boolean", description: "Skip the cache and read the archive again." },
       },
       required: ["query"],
       additionalProperties: false,
@@ -564,6 +796,7 @@ export const TOOLS = [
         resend_id: { type: "string" },
         include_html: { type: "boolean", default: false },
         include_raw_eml: { type: "boolean", default: false },
+        fresh: { type: "boolean", description: "Skip the cache and read the archive again." },
       },
       required: ["resend_id"],
       additionalProperties: false,
@@ -578,6 +811,7 @@ export const TOOLS = [
         limit: { type: "integer", minimum: 1, maximum: 100, default: 20 },
         direction: { type: "string", enum: ["in", "out"] },
         since: { type: "string", description: "Inclusive ISO8601 lower bound on date." },
+        fresh: { type: "boolean", description: "Skip the cache and read the archive again." },
       },
       additionalProperties: false,
     },
@@ -587,7 +821,9 @@ export const TOOLS = [
     description: "Archive counts: total, inbound vs outbound, daily counts for the last 30 days, and the top 10 senders.",
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        fresh: { type: "boolean", description: "Skip the cache and read the archive again." },
+      },
       additionalProperties: false,
     },
   },
@@ -658,24 +894,58 @@ export async function handleMcpRpc(message, deps) {
 async function callTool(name, args, deps) {
   if (name === "search_emails") {
     const query = buildSearchQuery(args);
-    const rows = await queryAll(deps, query);
-    return rows.map(toMetadata);
+    const [hash, rev] = await Promise.all([
+      hashCacheFields(searchCacheFields(args)),
+      readRevision(deps),
+    ]);
+    return readThrough(deps, {
+      fresh: args.fresh === true,
+      url: searchCacheUrl(hash, rev),
+      ttl: CACHE_TTL.search,
+      load: async () => (await queryAll(deps, query)).map(toMetadata),
+      store: () => true,
+    });
   }
   if (name === "list_emails") {
     const query = buildListQuery(args);
-    const rows = await queryAll(deps, query);
-    return rows.map(toMetadata);
+    const [hash, rev] = await Promise.all([
+      hashCacheFields(listCacheFields(args)),
+      readRevision(deps),
+    ]);
+    return readThrough(deps, {
+      fresh: args.fresh === true,
+      url: listCacheUrl(hash, rev),
+      ttl: CACHE_TTL.list,
+      load: async () => (await queryAll(deps, query)).map(toMetadata),
+      store: () => true,
+    });
   }
   if (name === "get_email") {
-    const query = buildGetQuery(args);
-    const rows = await queryAll(deps, query);
-    if (!rows.length) return { found: false, resend_id: args.resend_id };
-    let rawEml;
-    if (query.includeRaw) {
-      if (!deps || typeof deps.getObjectText !== "function") throw new Error("object store is not configured");
-      rawEml = await deps.getObjectText(rawObjectKey(args.resend_id));
+    const parsed = buildGetQuery(args);
+    const fresh = args.fresh === true;
+    const id = args.resend_id;
+    const rev = await readRevision(deps);
+    if (deps && deps.cache && !fresh) {
+      for (const ai of GET_AI_VARIANTS) {
+        const hit = await matchCache(
+          deps.cache,
+          new Request(getEmailCacheUrl(id, parsed.includeHtml, parsed.includeRaw, ai, rev)),
+        );
+        if (!hit) continue;
+        try {
+          return JSON.parse(await hit.text());
+        } catch {
+          // Keep looking. A later variant, or D1, still answers.
+        }
+      }
     }
-    return {
+    const columnPresent = await emailsHaveAiStatus(deps);
+    const query = columnPresent ? buildGetQuery(args, { includeAiStatus: true }) : parsed;
+    const rows = await queryAll(deps, query);
+    if (!rows.length) return { found: false, resend_id: id };
+    let rawEml;
+    if (query.includeRaw) rawEml = await cachedObjectText(deps, rawObjectKey(id), fresh);
+    const value = {
       found: true,
       ...toEmailDetail(rows[0], {
         includeHtml: query.includeHtml,
@@ -683,17 +953,37 @@ async function callTool(name, args, deps) {
         rawEml,
       }),
     };
+    const decision = emailCacheDecision(columnPresent, columnPresent ? rows[0].ai_status : undefined);
+    if (deps && deps.cache && decision.cache) {
+      await scheduleCachePut(
+        deps.cache,
+        deps.ctx,
+        new Request(getEmailCacheUrl(id, query.includeHtml, query.includeRaw, decision.ai, rev)),
+        cacheResponse(JSON.stringify(value), CACHE_TTL.getEmail, "application/json; charset=utf-8"),
+      );
+    }
+    return value;
   }
   if (name === "email_stats") {
-    assertOnlyKeys(args, new Set());
-    const queries = buildStatsQueries(deps && deps.nowMs);
-    const [totalRows, directionRows, dayRows, senderRows] = await Promise.all([
-      queryAll(deps, queries.total),
-      queryAll(deps, queries.byDirection),
-      queryAll(deps, queries.byDay),
-      queryAll(deps, queries.topSenders),
-    ]);
-    return assembleStats(totalRows, directionRows, dayRows, senderRows);
+    assertOnlyKeys(args, new Set(["fresh"]));
+    assertOptionalFresh(args);
+    const rev = await readRevision(deps);
+    return readThrough(deps, {
+      fresh: args.fresh === true,
+      url: statsCacheUrl(rev),
+      ttl: CACHE_TTL.stats,
+      load: async () => {
+        const queries = buildStatsQueries(deps && deps.nowMs);
+        const [totalRows, directionRows, dayRows, senderRows] = await Promise.all([
+          queryAll(deps, queries.total),
+          queryAll(deps, queries.byDirection),
+          queryAll(deps, queries.byDay),
+          queryAll(deps, queries.topSenders),
+        ]);
+        return assembleStats(totalRows, directionRows, dayRows, senderRows);
+      },
+      store: () => true,
+    });
   }
   throw new RpcError(-32601, `unknown tool: ${name}`);
 }
@@ -704,17 +994,23 @@ function bindStmt(db, sql, params) {
   return stmt;
 }
 
+function d1Session(db) {
+  if (db && typeof db.withSession === "function") return db.withSession("first-primary");
+  return db;
+}
+
 function d1Deps(env) {
+  const source = d1Session(env && env.DB);
   return {
     async queryAll(sql, params) {
-      const out = await bindStmt(env.DB, sql, params).all();
+      const out = await bindStmt(source, sql, params).all();
       return out.results || [];
     },
     async queryFirst(sql, params) {
-      return bindStmt(env.DB, sql, params).first();
+      return bindStmt(source, sql, params).first();
     },
     async queryRun(sql, params) {
-      return bindStmt(env.DB, sql, params).run();
+      return bindStmt(source, sql, params).run();
     },
     async getObjectText(key) {
       const obj = await env.ARCHIVE_BUCKET.get(key);
@@ -792,7 +1088,7 @@ async function fetchAllowedBytes(url, doFetch, redirectsLeft = 3) {
   return res.arrayBuffer();
 }
 
-export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now() }) {
+export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now(), cache = null }) {
   const type = event && event.type;
   if (type !== "email.received" && type !== "email.sent") {
     return { status: 200, body: { ok: true, ignored: true } };
@@ -822,6 +1118,7 @@ export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now() }
     await env.ARCHIVE_BUCKET.put(rawObjectKey(storedId), bytes, {
       httpMetadata: { contentType: "message/rfc822" },
     });
+    await rememberR2(cache, rawObjectKey(storedId), bytes);
   }
 
   const listed = await listAllAttachments(doFetch, env.RESEND_API_KEY, direction, emailId);
@@ -835,6 +1132,7 @@ export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now() }
     await env.ARCHIVE_BUCKET.put(key, bytes, {
       httpMetadata: { contentType: safeContentType(att.content_type) },
     });
+    await rememberR2(cache, key, bytes);
     attachments.push({
       filename,
       content_type: att.content_type || "application/octet-stream",
@@ -848,6 +1146,9 @@ export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now() }
     { direction, eventCreatedAt: event.created_at, attachments, nowMs },
   );
   const insert = buildInsertQuery(row);
+  // cache_revision advances in this commit via AFTER INSERT. Readers fold that
+  // value into cache keys. A caches.default delete here would stay in this
+  // colo; queue consumers and fetch handlers do not share one.
   await db.queryRun(insert.sql, insert.params);
   console.log(JSON.stringify({ msg: "archived", direction, email_id: storedId }));
   return { status: 200, body: { ok: true } };
@@ -1008,6 +1309,7 @@ export async function consumeIngestMessage(message, env, deps = {}) {
       env,
       fetchImpl: deps.fetch,
       nowMs,
+      cache: deps.cache || null,
     });
     if (result.status >= 400 && result.status < 500) {
       return permanent((result.body && result.body.error) || "rejected");
@@ -1067,11 +1369,12 @@ export async function consumeDeadLetter(message, env, deps = {}) {
 
 export async function handleQueue(batch, env, deps = {}) {
   const dead = isDeadLetterQueue(batch && batch.queue);
+  const nextDeps = { ...deps, cache: resolveCache(deps) };
   for (const message of (batch && batch.messages) || []) {
     try {
       const decision = dead
-        ? await consumeDeadLetter(message, env, deps)
-        : await consumeIngestMessage(message, env, deps);
+        ? await consumeDeadLetter(message, env, nextDeps)
+        : await consumeIngestMessage(message, env, nextDeps);
       if (decision.action === "retry") message.retry({ delaySeconds: decision.delaySeconds });
       else message.ack();
     } catch (err) {
@@ -1154,8 +1457,11 @@ export async function handleFetch(request, env, deps = {}) {
     const db = d1Deps(env);
     const rpc = await handleMcpRpc(message, {
       queryAll: (sql, params) => db.queryAll(sql, params),
+      queryFirst: (sql, params) => db.queryFirst(sql, params),
       getObjectText: (key) => db.getObjectText(key),
       nowMs: deps.nowMs,
+      cache: resolveCache(deps),
+      ctx: deps.ctx || null,
     });
     if (rpc.type === "notification") return new Response(null, { status: 202 });
     if (rpc.type === "error") {
@@ -1203,10 +1509,10 @@ export async function handleFetch(request, env, deps = {}) {
 }
 
 export default {
-  fetch(request, env) {
-    return handleFetch(request, env);
+  fetch(request, env, ctx) {
+    return handleFetch(request, env, { ctx });
   },
-  queue(batch, env) {
-    return handleQueue(batch, env);
+  queue(batch, env, ctx) {
+    return handleQueue(batch, env, { ctx });
   },
 };
