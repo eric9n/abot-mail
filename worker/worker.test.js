@@ -2168,16 +2168,53 @@ test("prompt injection stays inside the email delimiters and is not executed", (
   assert.equal(guarded.points.includes("HACKED"), false);
 });
 
-test("summary prompt forbids deadline placeholders that fail validation", () => {
+test("summary prompt forbids deadline placeholders", () => {
   const system = buildSummaryMessages("审批", "请周五前审批。")[0].content;
   assert.match(system, /Never write the literal text YYYY-MM-DD/);
   assert.match(system, /never write the quoted string "null"/);
   assert.match(system, /use JSON null/);
   const points = ["请周五前审批", "邮件没有写出具体日期"];
-  assert.equal(parseSummaryOutput(summaryJson({ points, todos: [{ text: "周五前审批", deadline: "YYYY-MM-DD" }] })), null);
-  assert.equal(parseSummaryOutput(summaryJson({ points, todos: [{ text: "周五前审批", deadline: "null" }] })), null);
   const valid = parseSummaryOutput(summaryJson({ points, todos: [{ text: "周五前审批", deadline: null }] }));
   assert.equal(valid.todos[0].deadline, null);
+});
+
+test("production summary with a quoted null deadline stays valid", () => {
+  const captured = '{"points":["Q4 规划初稿","参会名单","已批预算","投线上渠道"],"todos":[{"text":"提交 Q4 规划初稿","deadline":"2026-10-15"},{"text":"确认参会名单","deadline":"null"}]}';
+  const parsed = parseSummaryOutput(captured);
+  assert.deepEqual(parsed.points, ["Q4 规划初稿", "参会名单", "已批预算", "投线上渠道"]);
+  assert.equal(parsed.points.length, 4);
+  assert.deepEqual(parsed.todos, [
+    { text: "提交 Q4 规划初稿", deadline: "2026-10-15" },
+    { text: "确认参会名单", deadline: null },
+  ]);
+  assert.equal(parsed.todos[1].deadline, null);
+
+  const points = ["Q4 规划初稿", "参会名单"];
+  for (const deadline of ["", "null", "NULL", " none ", "N/A", "NA", "YYYY-MM-DD"]) {
+    const coerced = parseSummaryOutput(summaryJson({
+      points,
+      todos: [{ text: "确认参会名单", deadline }],
+    }));
+    assert.equal(coerced.todos[0].deadline, null, deadline);
+    assert.equal(coerced.points.length, 2, deadline);
+  }
+  assert.equal(parseSummaryOutput(summaryJson({
+    points,
+    todos: [{ text: "确认参会名单", deadline: "tomorrow" }],
+  })), null);
+});
+
+test("a todo with no deadline key is kept with a null deadline", () => {
+  const parsed = parseSummaryOutput(summaryJson({
+    points: ["Q4 规划初稿", "参会名单"],
+    todos: [{ text: "确认参会名单" }],
+  }));
+  assert.deepEqual(parsed, {
+    points: ["Q4 规划初稿", "参会名单"],
+    todos: [{ text: "确认参会名单", deadline: null }],
+  });
+  assert.equal(Object.hasOwn(parsed.todos[0], "deadline"), true);
+  assert.equal(parsed.todos[0].deadline, null);
 });
 
 function plainEmailFetch(id, text = "hello queue") {

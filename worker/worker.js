@@ -611,6 +611,7 @@ function normalizeSummary(value) {
     if (!text) return null;
     points.push(text);
   }
+  const absentDeadline = new Set(["", "null", "none", "n/a", "na", "yyyy-mm-dd"]);
   const todos = [];
   for (const todo of value.todos) {
     if (!todo || typeof todo !== "object" || Array.isArray(todo)) return null;
@@ -618,9 +619,13 @@ function normalizeSummary(value) {
     const text = todo.text.trim();
     if (!text) return null;
     let deadline = null;
-    if (todo.deadline != null) {
-      if (typeof todo.deadline !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(todo.deadline)) return null;
-      deadline = todo.deadline;
+    if (todo.deadline !== undefined && todo.deadline !== null) {
+      if (typeof todo.deadline !== "string") return null;
+      const token = todo.deadline.trim().toLowerCase();
+      if (!absentDeadline.has(token)) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(todo.deadline)) return null;
+        deadline = todo.deadline;
+      }
     }
     todos.push({ text, deadline });
   }
