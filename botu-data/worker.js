@@ -3,13 +3,26 @@
  * POST /mcp   MCP (Streamable HTTP, JSON-RPC), Bearer DATA_MCP_TOKEN
  * GET /ctc/{id}  GET /cal/{id}  GET /note/{id}   canonical JSON, same token
  * GET /health liveness, no personal data
+ * scheduled    detector and delivery repair (not a URL)
+ * queue        botu-deliver / botu-deliver-dlq (not a URL)
  *
  * D1 binding is DB. This worker does not read the mail archive.
  */
 
+import {
+  buildWebhookBody,
+  createPhase2,
+  signWebhook,
+  stableStringify,
+  verifyWebhookRequest,
+} from "./phase2.js";
+
+export { buildWebhookBody, signWebhook, stableStringify, verifyWebhookRequest };
+
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const MAX_BODY_BYTES = 1_000_000;
 const ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
+const ID_PREFIXES = new Set(["cal_", "ctc_", "note_", "evt_", "sub_", "dlv_"]);
 const REPEAT_FREQ = new Set(["none", "daily", "weekly", "monthly"]);
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 
@@ -50,7 +63,7 @@ export function likeContains(value) {
  * Throws if the buffer does not contain 12 usable bytes.
  */
 export function idFromBytes(prefix, bytes) {
-  if (prefix !== "cal_" && prefix !== "ctc_" && prefix !== "note_") {
+  if (!ID_PREFIXES.has(prefix)) {
     throw new Error("bad id prefix");
   }
   let body = "";
@@ -719,6 +732,25 @@ async function deleteNote(args, deps) {
   return { id, deleted: true };
 }
 
+const phase2 = createPhase2({
+  RpcError,
+  newId,
+  queryAll,
+  queryFirst,
+  queryRun,
+  nowIso,
+  canonicalUtc,
+  requireArgs,
+  assertOnlyKeys,
+  has,
+  requireId,
+  notFound,
+  clampLimit,
+  timingSafeEqual,
+  isUniqueError,
+  d1Deps,
+});
+
 export const TOOLS = [
   {
     name: "create_contact",
@@ -938,6 +970,7 @@ export const TOOLS = [
       additionalProperties: false,
     },
   },
+  ...phase2.tools,
 ];
 
 function toolText(value) {
@@ -976,8 +1009,11 @@ async function callTool(name, args, deps) {
       return updateNote(args, deps);
     case "delete_note":
       return deleteNote(args, deps);
-    default:
+    default: {
+      const handler = phase2.handlers[name];
+      if (handler) return handler(args, deps);
       throw new RpcError(-32601, `unknown tool: ${name}`);
+    }
   }
 }
 
@@ -1053,6 +1089,15 @@ function d1Deps(env) {
     },
     async queryRun(sql, params) {
       return bindStmt(source, sql, params).run();
+    },
+    async batch(statements) {
+      if (!source || typeof source.batch !== "function") throw new Error("batch is not configured");
+      const prepared = statements.map((statement) => {
+        const stmt = source.prepare(statement.sql);
+        return statement.params && statement.params.length ? stmt.bind(...statement.params) : stmt;
+      });
+      const out = await source.batch(prepared);
+      return Array.isArray(out) ? out : [];
     },
   };
 }
@@ -1145,14 +1190,7 @@ export async function handleFetch(request, env, deps = {}) {
     } catch {
       return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400);
     }
-    const db = d1Deps(env);
-    const rpc = await handleMcpRpc(message, {
-      queryAll: (sql, params) => db.queryAll(sql, params),
-      queryFirst: (sql, params) => db.queryFirst(sql, params),
-      queryRun: (sql, params) => db.queryRun(sql, params),
-      nowMs: deps.nowMs,
-      origin,
-    });
+    const rpc = await handleMcpRpc(message, phase2.bindRuntime(env, { nowMs: deps.nowMs, origin }));
     if (rpc.type === "notification") return new Response(null, { status: 202 });
     if (rpc.type === "error") {
       return json({ jsonrpc: "2.0", id: rpc.id ?? null, error: rpc.error });
@@ -1183,8 +1221,26 @@ export async function handleFetch(request, env, deps = {}) {
   return json({ ok: false, error: "not found" }, 404);
 }
 
+export async function handleScheduled(event, env, deps = {}) {
+  return phase2.handleScheduled(event, env, deps);
+}
+
+export async function handleQueue(batch, env, deps = {}) {
+  return phase2.handleQueue(batch, env, deps);
+}
+
+export async function consumeDelivery(message, env, deps = {}) {
+  return phase2.consumeDelivery(message, env, deps);
+}
+
 export default {
   fetch(request, env, ctx) {
     return handleFetch(request, env, { ctx });
+  },
+  scheduled(event, env, ctx) {
+    return handleScheduled(event, env, { ctx });
+  },
+  queue(batch, env, ctx) {
+    return handleQueue(batch, env, { ctx });
   },
 };
