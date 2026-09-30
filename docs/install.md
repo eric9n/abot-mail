@@ -23,12 +23,14 @@ openssl rand -base64 32    # 用作 <MCP_TOKEN>
 
 `<WEBHOOK_SECRET>` 先空着。它是创建 Resend webhook 之后返回的 `signing_secret`（`whsec_` 开头），原样放进 Worker，不要自己去掉前缀。
 
-所有 `curl` 都带：
+有 JSON body 的请求带 `Content-Type: application/json`。Cloudflare 再加 `Authorization: Bearer <CLOUDFLARE_API_TOKEN>`，Resend 改用 `Authorization: Bearer <RESEND_API_KEY>`。没有 body 的 GET 不必带 `Content-Type`。
 
 ```bash
 -H "Authorization: Bearer <CLOUDFLARE_API_TOKEN>"
 -H "Content-Type: application/json"
 ```
+
+第 6 步的脚本上传是 multipart（`-F`），不要加 `Content-Type: application/json`。curl 会自己带 `multipart/form-data` 和 boundary；这个 JSON 头会盖掉 boundary，上传失败。
 
 Cloudflare 的成功响应是 `{"success":true,"result":...}`。`success` 不是 `true` 就停，看 `errors`，不要继续下一步。
 
@@ -46,7 +48,10 @@ Cloudflare 的成功响应是 `{"success":true,"result":...}`。`success` 不是
 | `<RESEND_API_KEY>` | Resend API key |
 | `<WEBHOOK_SECRET>` | webhook 的 `signing_secret`，形如 `whsec_...` |
 | `<MCP_TOKEN>` | 自行生成的长随机串，只用于 `POST /mcp` |
-| `<MAIL_DOMAIN>` | 收件域名 |
+| `<MAIL_DOMAIN>` | 收件域名，须开通 Resend receiving |
+| `<RESEND_DOMAIN_ID>` | Resend 域名 id |
+| `<ALERT_TO>` | 告警收件地址，安装者自己的邮箱。普通变量，不是 secret |
+| `<ALERT_FROM>` | 告警发件人，须是 `<MAIL_DOMAIN>` 上已验证的地址。普通变量，不是 secret |
 | `<AGENT_SKILLS_DIR>` | 这个 agent 实际加载 skill 的目录 |
 
 Worker 的公开 origin 是：
@@ -187,6 +192,8 @@ BEGIN
 END;
 ```
 
+`BEGIN` 必须是大写，文件必须是 LF 换行。D1 的 query 接口按分号切语句；只有关键字是大写 `BEGIN`、并且换行是 LF，才会进入触发器模式，把 `BEGIN` 到 `END` 当成一条语句。CRLF（`\r\n`）或小写 `begin` 会被切碎，接口报 `incomplete input`。上面这段按原样保存，不要改大小写。在 Windows 上保存时用 LF，不要用记事本默认的 CRLF。下面的 `path.read_text()` 原样送出文件内容，不会改换行。
+
 每段的请求：
 
 ```bash
@@ -315,6 +322,8 @@ npx wrangler queues create mail-ingest
 
 把 metadata 写到仓库外的 `/tmp/abot-mail-worker-metadata.json`。第一次上传**不要**放 `secret_text`。密钥在第 9 步单独写。之后再次上传时也继续省略 `secret_text`：省略不会删除已有 secret，已有 secret 会保留。不要把这份 JSON 提交进仓库。
 
+告警地址不是 secret。`worker/worker.js` 里的默认值是 `ALERT_TO=eric@abot.run`、`ALERT_FROM=abot-mail <alerts@abot.run>`，只能用普通变量覆盖（wrangler 的 `[vars]`，这条 API 里是 `type: "plain_text"`）。不改的话，告警会发到生产邮箱；新的 Resend 账号通常也不能用 `alerts@abot.run` 当发件人。新安装默认关掉告警：`ALERT_ENABLED` 设为字符串 `false`（代码认的是 `"false"` 这四个字符）。`ALERT_TO` 改成安装者自己的地址 `<ALERT_TO>`。`ALERT_FROM` 改成 `<MAIL_DOMAIN>` 上已经能发信的地址 `<ALERT_FROM>`，不要留生产默认值。以后若把 `ALERT_ENABLED` 改成别的值，cron 才会按这两个地址发信。再次上传时这三条 `plain_text` 要留在 `bindings` 里：省略 `secret_text` 不会删 secret，省略 `plain_text` 会丢掉变量，告警又回到代码里的默认地址。
+
 ```json
 {
   "main_module": "worker.js",
@@ -325,7 +334,10 @@ npx wrangler queues create mail-ingest
     { "type": "r2_bucket", "name": "ARCHIVE_BUCKET", "bucket_name": "abot-mail-archive" },
     { "type": "queue", "name": "INGEST_QUEUE", "queue_name": "mail-ingest" },
     { "type": "ai", "name": "AI" },
-    { "type": "analytics_engine", "name": "METRICS", "dataset": "mail_metrics" }
+    { "type": "analytics_engine", "name": "METRICS", "dataset": "mail_metrics" },
+    { "type": "plain_text", "name": "ALERT_ENABLED", "text": "false" },
+    { "type": "plain_text", "name": "ALERT_TO", "text": "<ALERT_TO>" },
+    { "type": "plain_text", "name": "ALERT_FROM", "text": "<ALERT_FROM>" }
   ]
 }
 ```
@@ -338,7 +350,7 @@ curl -sS -X PUT \
   -F "worker.js=@worker/worker.js;type=application/javascript+module"
 ```
 
-在仓库根目录执行，这样 `worker/worker.js` 路径是对的。multipart 的文件字段名必须是 `worker.js`，和 `main_module` 一致。
+在仓库根目录执行，这样 `worker/worker.js` 路径是对的。multipart 的文件字段名必须是 `worker.js`，和 `main_module` 一致。这条 `curl` **不要**加 `-H "Content-Type: application/json"`。`-F` 会自己生成带 boundary 的 `multipart/form-data`；加上文那个 JSON 头会盖掉 boundary，上传失败。
 
 **预期输出。** `success: true`。`result.startup_time_ms` 一类字段出现即可。若 `errors[].code` 是 `10089`，回到第 5 步，等约 1 分钟再 PUT。
 
@@ -354,11 +366,18 @@ curl -sS -X PUT \
 npx wrangler deploy
 ```
 
-wrangler 会按 toml 绑上 consumer、cron（`20 1 * * *`）并打开 workers.dev。secrets 仍然要用第 9 步，wrangler 不会从 toml 读密钥。
+wrangler 会按 toml 绑上 consumer、cron（`20 1 * * *`）并打开 workers.dev。secrets 仍然要用第 9 步，wrangler 不会从 toml 读密钥。仓库里的 `worker/wrangler.toml` 没有 `[vars]`。选这条路时在**本地** toml 加上面那三项普通变量（不要提交回这个仓库），否则 deploy 仍用代码里的 `eric@abot.run` / `alerts@abot.run`：
+
+```toml
+[vars]
+ALERT_ENABLED = "false"
+ALERT_TO = "<ALERT_TO>"
+ALERT_FROM = "<ALERT_FROM>"
+```
 
 **预期输出。** 部署成功，并打印 `https://<WORKER_NAME>.<WORKERS_SUBDOMAIN>.workers.dev`。
 
-**验证。** 该 URL 的 `GET /health` 先不要当成功：secret 和 D1 还没配齐时，health 可能是 503。下面的「验证」小节再验。这里只确认 deploy 命令退出码为 0。
+**验证。** deploy 命令退出码为 0。`GET /health` 只查 D1，不读 `MCP_TOKEN`、`RESEND_API_KEY`、`WEBHOOK_SECRET`。secret 没设不影响 health。表和 `DB` 绑定正确时是 HTTP 200、`ok: true`。503 表示这次 D1 查询抛错（表没建完，或绑定的不是 `<D1_DATABASE_ID>`），不是缺 secret。字段核对放在文末「验证」A。
 
 ### 7. 打开 workers.dev
 
@@ -396,7 +415,7 @@ body 就是 `{"enabled":true}`。
 
 **预期输出。** `success: true`，`result.enabled` 为 `true`。
 
-**验证。** 再 GET 同一个 `/workers/scripts/<WORKER_NAME>/subdomain`，`enabled` 仍是 `true`。浏览器或 curl 访问 `https://<WORKER_NAME>.<WORKERS_SUBDOMAIN>.workers.dev/health` 应得到 JSON，而不是 Cloudflare 的找不到主机。这一步还没写 secret 时，body 可能是 `ok: false` 且 HTTP 503，路由通了就算过。
+**验证。** 再 GET 同一个 `/workers/scripts/<WORKER_NAME>/subdomain`，`enabled` 仍是 `true`。浏览器或 curl 访问 `https://<WORKER_NAME>.<WORKERS_SUBDOMAIN>.workers.dev/health` 应得到 JSON，而不是 Cloudflare 的找不到主机。`/health` 不读 `MCP_TOKEN`、`RESEND_API_KEY`、`WEBHOOK_SECRET`，secret 没设也不影响结果。表和 `DB` 绑定正确时是 HTTP 200、`ok: true`。503、`ok: false` 表示 D1 查询抛错（建表或绑定问题），不是缺 secret。字段是否完整放在文末「验证」A。
 
 用 wrangler 部署的跳过本步，只做这条 GET 核对。
 
@@ -501,7 +520,7 @@ curl -sS \
 
 ### 10. 配置 cron `20 1 * * *`
 
-**做什么。** 每天 01:20 UTC 跑一次 scheduled handler。这是告警 cron，不新增 secret。表达式是五段：`20 1 * * *`。
+**做什么。** 每天 01:20 UTC 跑一次 scheduled handler。这是告警 cron，不新增 secret。收件人、发件人和开关是第 6 步的普通变量：`ALERT_ENABLED=false` 时 cron 仍会跑，但不会发信。表达式是五段：`20 1 * * *`。
 
 **命令。** body 是**裸数组**。不要包一层 `{"schedules":[...]}`。
 
@@ -519,12 +538,43 @@ curl -sS -X PUT \
 
 ### 11. 把 Resend webhook 指到 Worker
 
-**做什么。** 在 Resend 打开 `<MAIL_DOMAIN>` 的收件，把 webhook 打到 Worker 的 `/`，只订阅 `email.received` 和 `email.sent`。其它事件类型即使打过来，验签通过后也只会 200 且不入库，但不要订阅它们。
+**做什么。** 在 Resend 开通 `<MAIL_DOMAIN>` 的收件，把 webhook 打到 Worker 的 `/`，只订阅 `email.received` 和 `email.sent`。其它事件类型即使打过来，验签通过后也只会 200 且不入库，但不要订阅它们。
 
 **命令。**
 
-1. 在 Resend 添加域名 `<MAIL_DOMAIN>`，DNS 按 Resend 给出的记录配（收件要有 MX）。等域名和 receiving 都是已启用。记录以 Resend 当时显示的为准。
-2. Worker 的 URL 必须已经能从公网访问（第 7 步）。创建 webhook：
+1. 创建域名时就把收件打开。`POST https://api.resend.com/domains` 只传 `name` 时，响应里 `capabilities.receiving` 默认是 `disabled`，`records` 是发信记录（DKIM、`send` 子域上的 SPF），不是入站 MX。
+
+```bash
+curl -sS -X POST "https://api.resend.com/domains" \
+  -H "Authorization: Bearer <RESEND_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"<MAIL_DOMAIN>","capabilities":{"sending":"enabled","receiving":"enabled"}}'
+```
+
+记下 `id`，就是 `<RESEND_DOMAIN_ID>`。域名已经存在时，用 `GET https://api.resend.com/domains` 按 `name` 找出这个 id，再 PATCH（没写的字段保持原值）：
+
+```bash
+curl -sS -X PATCH "https://api.resend.com/domains/<RESEND_DOMAIN_ID>" \
+  -H "Authorization: Bearer <RESEND_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"capabilities":{"receiving":"enabled"}}'
+```
+
+2. 再 GET 这个域名，按**这次**响应改 DNS。发信记录照配，出站测试要用。入站是另一条：`records` 里 `record` 为 `Receiving MX`、`type` 为 `MX` 的那条。用它的 `name`、`value`、`priority`，不要拿 `send` 子域上那条 `feedback-smtp...` 当入站 MX。入站 MX 的 `priority` 必须是该主机上最小的数字（Resend 说的 lowest priority value）。数字更小的 MX 先收到信；已经有更小或相同的 MX 时，信进不了 Resend。根域上已经有别的邮箱时，把 `<MAIL_DOMAIN>` 换成子域，只在子域上放这条 MX。
+
+3. DNS 写好后触发校验，然后轮询，直到收件生效。`POST /verify` 没有 JSON body，不要加 `Content-Type`。
+
+```bash
+curl -sS -X POST "https://api.resend.com/domains/<RESEND_DOMAIN_ID>/verify" \
+  -H "Authorization: Bearer <RESEND_API_KEY>"
+
+curl -sS "https://api.resend.com/domains/<RESEND_DOMAIN_ID>" \
+  -H "Authorization: Bearer <RESEND_API_KEY>"
+```
+
+`POST /verify` 会把状态暂时标成 `pending`。隔一会儿重复上面的 GET。过线要同时满足：`capabilities.receiving` 是 `enabled`，`Receiving MX` 那条的 `status` 是 `verified`。域名整体 `status` 可以是 `verified`。发信记录还没过、收件已经过时会是 `partially_verified`：验证 D 可以开始，验证 E 要等发信记录也是 `verified`。停在 `not_started`、`pending` 太久或 `failed`，先核对 DNS，不要发测试信。
+
+4. Worker 的 URL 必须已经能从公网访问（第 7 步）。创建 webhook：
 
 ```bash
 curl -sS -X POST "https://api.resend.com/webhooks" \
@@ -536,7 +586,7 @@ curl -sS -X POST "https://api.resend.com/webhooks" \
   }'
 ```
 
-3. 响应里的 `signing_secret` 就是 `<WEBHOOK_SECRET>`。立刻写入 Worker，不要打进日志：
+5. 响应里的 `signing_secret` 就是 `<WEBHOOK_SECRET>`。立刻写入 Worker，不要打进日志：
 
 ```bash
 curl -sS -X PUT \
@@ -567,9 +617,9 @@ curl -sS "https://<WORKER_NAME>.<WORKERS_SUBDOMAIN>.workers.dev/health"
 python3 skill/mcp_cli.py --url "https://<WORKER_NAME>.<WORKERS_SUBDOMAIN>.workers.dev" health
 ```
 
-**预期输出。** HTTP 200，JSON 只有三个字段：`ok` 为 `true`，`last_received_at`（还没有收件时是 `null`），`count_24h` 是数字。
+**预期输出。** HTTP 200，JSON 只有三个字段：`ok` 为 `true`，`last_received_at`（还没有收件时是 `null`），`count_24h` 是数字。`/health` 只查 D1，不读 `MCP_TOKEN`、`RESEND_API_KEY`、`WEBHOOK_SECRET`。这三个 secret 没设时，表和绑定正确仍然是这个结果。
 
-**验证。** 两个命令的 JSON 一致。响应里没有 subject、正文、token。
+**验证。** 两个命令的 JSON 一致。响应里没有 subject、正文、token。503、`ok: false`（`count_24h` 为 `null`）是 D1 查询抛错，去修表或绑定，不是去补 secret。
 
 ### B. `tools/list` 看到四个工具
 
@@ -618,7 +668,7 @@ python3 skill/mcp_cli.py --url "https://<WORKER_NAME>.<WORKERS_SUBDOMAIN>.worker
 
 ### D. 发一封测试信，用 skill 查到归档
 
-**做什么。** 走完 webhook → 队列 → Resend 拉取 → D1/R2 → MCP。从外部邮箱发一封到 `<MAIL_DOMAIN>` 上的任意地址，主题和正文都放同一段独特字符串 `<TEST_SUBJECT>`，带一个小附件。收件方向是 `in`。
+**做什么。** 走完 webhook → 队列 → Resend 拉取 → D1/R2 → MCP。从外部邮箱发一封到 `<MAIL_DOMAIN>` 上的任意地址，主题和正文都放同一段独特字符串 `<TEST_SUBJECT>`，带一个小附件。收件方向是 `in`。这封信必须发到第 11 步已经开通 receiving 的域名：`capabilities.receiving` 为 `enabled`，且入站 MX 的 `status` 为 `verified`。发到没开通 receiving 的域名不会产生 `email.received`。
 
 归档是异步的。webhook 只入队并立刻 `200 {"ok":true,"queued":true}`。消费者随后才写 D1。
 
@@ -640,6 +690,35 @@ python3 skill/mcp_cli.py get <resend_id> --include-raw-eml --fresh
 **预期输出。** `count_24h` 比发信前大。`search` 返回的数组里有这封信的元数据，有 `has_text` / `has_html`，没有 `text_body`。`get` 的 `found` 为 `true`，`direction` 为 `in`，`text_body` 含 `<TEST_SUBJECT>`，`raw_eml` 是原文文本。附件元数据里有 `r2_key`，形如 `attachments/<resend_id>/...`。
 
 **验证。** 三条都成立：health 计数增加、search 按主题命中、get 读到正文和 raw eml。查不到就看故障排查，不要改 `worker/worker.js`。
+
+### E. 发一封出站测试信
+
+**做什么。** Webhook 订了 `email.received` 和 `email.sent`。出站不走 Receiving API，消费者用 `GET /emails/{id}` 拉已发送的信。这个响应通常没有 `raw.download_url`，所以一般没有 `raw_eml`。这一步确认出站元数据和 `text_body` 能查到。
+
+**命令。** `from` 用第 11 步发信记录已经 `verified` 的 `<MAIL_DOMAIN>`。`<OUTBOUND_TO>` 是一个能收信的地址，让 Resend 把信发出去。主题和正文用另一段独特字符串 `<TEST_SUBJECT_OUT>`，不要和入站那封重复。
+
+```bash
+curl -sS -X POST "https://api.resend.com/emails" \
+  -H "Authorization: Bearer <RESEND_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from": "archive@<MAIL_DOMAIN>",
+    "to": ["<OUTBOUND_TO>"],
+    "subject": "<TEST_SUBJECT_OUT>",
+    "text": "<TEST_SUBJECT_OUT>"
+  }'
+```
+
+响应里的 `id` 就是 `resend_id`。和入站一样等消费者写入，然后用 skill 的 `get`：
+
+```bash
+python3 skill/mcp_cli.py search --query "<TEST_SUBJECT_OUT>" --direction out --fresh
+python3 skill/mcp_cli.py get <resend_id> --fresh
+```
+
+**预期输出。** `search` 返回这封信的元数据，`direction` 为 `out`，没有 `text_body`。`get` 的 `found` 为 `true`，`text_body` 含 `<TEST_SUBJECT_OUT>`。
+
+**验证。** 元数据和 `text_body` 都在。出站一般没有 `raw_eml`，不要把缺原文当成失败。加上 `--include-raw-eml` 时，通常是 `raw_eml: null`，并带 `raw_eml_note`（R2 里没有 `raw/<resend_id>.eml`）。对照 README「测试与部署后核对」第 6 条：`direction` 为 `out`，库里的 `auth` 为空。原文只在验证 D 的入站信上要求。
 
 ## 安装 skill
 
@@ -690,11 +769,11 @@ Secure Vault：credential 名 `custom.abot-mail`，字段名 `MCP_TOKEN`，值�
 
 **重新上传脚本之后 MCP 突然 401，或 webhook 突然 401。** 检查 metadata 里是不是写了空的 `secret_text`。正确做法是整段省略 `secret_text`，已有 secret 会留下。省略本身不会删除。确认 secret 列表里三个名字还在，值错了就再 PUT 一次。
 
-**D1 建表失败，或只建出了表、没有触发器。** 不要用 batch 端点，也不要把 `09.sql` 按分号拆开。每条语句单独 `POST .../d1/database/<D1_DATABASE_ID>/query`。触发器是一条语句。
+**D1 建表失败，或只建出了表、没有触发器。** 不要用 batch 端点，也不要把 `09.sql` 按分号拆开。每条语句单独 `POST .../d1/database/<D1_DATABASE_ID>/query`。触发器是一条语句。错误是 `incomplete input` 时，`BEGIN` 不是大写，或 `09.sql` 是 CRLF。改成大写 `BEGIN` 和 LF 换行，再 POST 这一段。
 
 **消费者创建失败，提示找不到脚本。** 先完成第 6 步。死信队列必须先于主队列的 consumer 存在。`max_wait_time_ms` 用 `1000`。
 
-**`/health` 是 503，`ok: false`。** D1 绑定的 id 不是 `<D1_DATABASE_ID>`，或第 2 步的表没建完。`count_24h` 在失败时会是 `null`。路由已经通了，修绑定或补表，不要重装账号。
+**`/health` 是 503，`ok: false`。** D1 查询抛错：绑定的 id 不是 `<D1_DATABASE_ID>`，或第 2 步的表没建完。`count_24h` 在失败时会是 `null`。这和 secret 无关。`MCP_TOKEN`、`RESEND_API_KEY`、`WEBHOOK_SECRET` 没设时，表和绑定正确仍然是 HTTP 200、`ok: true`。路由已经通了，修绑定或补表，不要重装账号。
 
 **`POST /mcp` 415。** `Content-Type` 不是 `application/json`。
 
