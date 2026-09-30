@@ -26,12 +26,15 @@ export const ALERT_CRON = "20 1 * * *";
 export const ALERT_TO = "eric@abot.run";
 export const ALERT_FROM = "abot-mail <alerts@abot.run>";
 /**
- * Neurons per million tokens for Llama 3.1 8B, from the phase-A design rates
- * published for the 8B instruct model. The bound model is llama-3.1-8b-instruct-fp8.
+ * Neurons per million tokens for `@cf/meta/llama-3.1-8b-instruct-fp8`,
+ * the model SUMMARY_MODEL binds. Workers AI list price (2026-09-17):
+ * https://developers.cloudflare.com/workers-ai/platform/pricing/
  * Missing usage writes 0; we do not estimate from the prompt.
  */
-export const LLAMA_8B_NEURONS_PER_MILLION_INPUT = 4119;
-export const LLAMA_8B_NEURONS_PER_MILLION_OUTPUT = 34868;
+export const LLAMA_8B_NEURONS_PER_MILLION_INPUT = 13778;
+export const LLAMA_8B_NEURONS_PER_MILLION_OUTPUT = 26128;
+/** In-window emails with an ai_status required before a ratio can alert. The design doc sets no floor; 5 blocks one failure from reading as 100%. */
+export const AI_STATUS_MIN_SAMPLE = 5;
 export const METRIC_STAGES = ["webhook", "ingest", "enrich", "dlq", "mcp", "health", "alert"];
 export const METRIC_OUTCOMES = ["ok", "duplicate", "retry", "dlq", "unauthorized", "ignored", "fresh", "rejected", "error"];
 export const METRIC_DOUBLES = ["lag_ms", "wall_ms", "cache", "neurons", "validator_discards"];
@@ -1849,12 +1852,12 @@ export function buildIngestFailureCountQuery(startIso, endIso) {
   };
 }
 
-export function buildAiStatusRatioQuery(sinceIso) {
+export function buildAiStatusRatioQuery(startIso, endIso) {
   return {
-    sql: `SELECT COUNT(*) AS ingested,
+    sql: `SELECT SUM(CASE WHEN ai_status IS NOT NULL AND ai_status != '' THEN 1 ELSE 0 END) AS attempted,
       SUM(CASE WHEN ai_status IN ('failed', 'deferred') THEN 1 ELSE 0 END) AS degraded
-      FROM emails WHERE created_at >= ?`,
-    params: [sinceIso],
+      FROM emails WHERE created_at >= ? AND created_at < ?`,
+    params: [startIso, endIso],
   };
 }
 
@@ -1895,33 +1898,49 @@ export async function collectAlertSignals(env, nowMs) {
   } catch {
     skipped.push("count_24h");
   }
-  if (await alertTableExists(db, "ingest_failures")) {
-    const window = alertWindow(nowMs);
-    const query = buildIngestFailureCountQuery(window.start, window.end);
-    const row = await db.queryFirst(query.sql, query.params);
-    const value = row ? Number(row.n) || 0 : 0;
-    signals.push({ name: "ingest_failures", value, breached: value > 0 });
-  } else {
+  try {
+    if (await alertTableExists(db, "ingest_failures")) {
+      const window = alertWindow(nowMs);
+      const query = buildIngestFailureCountQuery(window.start, window.end);
+      const row = await db.queryFirst(query.sql, query.params);
+      const value = row ? Number(row.n) || 0 : 0;
+      signals.push({ name: "ingest_failures", value, breached: value > 0 });
+    } else {
+      skipped.push("ingest_failures");
+    }
+  } catch {
     skipped.push("ingest_failures");
   }
-  if (await alertColumnExists(db, "ai_status")) {
-    const since = new Date((Number.isFinite(nowMs) ? nowMs : Date.now()) - 60 * 60 * 1000).toISOString();
-    const query = buildAiStatusRatioQuery(since);
-    const row = await db.queryFirst(query.sql, query.params);
-    const ingested = row ? Number(row.ingested) || 0 : 0;
-    const degraded = row ? Number(row.degraded) || 0 : 0;
-    const ratio = ingested > 0 ? degraded / ingested : 0;
-    signals.push({ name: "ai_status", value: ratio, breached: ingested > 0 && ratio > 0.2 });
-  } else {
+  try {
+    if (await alertColumnExists(db, "ai_status")) {
+      const window = alertWindow(nowMs);
+      const query = buildAiStatusRatioQuery(window.start, window.end);
+      const row = await db.queryFirst(query.sql, query.params);
+      const attempted = row ? Number(row.attempted) || 0 : 0;
+      const degraded = row ? Number(row.degraded) || 0 : 0;
+      const ratio = attempted > 0 ? degraded / attempted : 0;
+      signals.push({
+        name: "ai_status",
+        value: ratio,
+        breached: attempted >= AI_STATUS_MIN_SAMPLE && ratio > 0.2,
+      });
+    } else {
+      skipped.push("ai_status");
+    }
+  } catch {
     skipped.push("ai_status");
   }
-  if (await alertTableExists(db, "stats_daily")) {
-    const query = buildStatsDailyLatestQuery();
-    const row = await db.queryFirst(query.sql, query.params);
-    const inbound = row ? Number(row.inbound) || 0 : 0;
-    const outbound = row ? Number(row.outbound) || 0 : 0;
-    signals.push({ name: "stats_daily", value: inbound + outbound, breached: false });
-  } else {
+  try {
+    if (await alertTableExists(db, "stats_daily")) {
+      const query = buildStatsDailyLatestQuery();
+      const row = await db.queryFirst(query.sql, query.params);
+      const inbound = row ? Number(row.inbound) || 0 : 0;
+      const outbound = row ? Number(row.outbound) || 0 : 0;
+      signals.push({ name: "stats_daily", value: inbound + outbound, breached: false });
+    } else {
+      skipped.push("stats_daily");
+    }
+  } catch {
     skipped.push("stats_daily");
   }
   return { signals, skipped, breaches: signals.filter((signal) => signal.breached) };

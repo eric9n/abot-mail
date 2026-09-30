@@ -17,6 +17,8 @@ import worker, {
   ALERT_CRON,
   ALERT_FROM,
   ALERT_TO,
+  AI_STATUS_MIN_SAMPLE,
+  alertWindow,
   archiveEvent,
   assembleStats,
   assertAllowedDownloadUrl,
@@ -2577,6 +2579,8 @@ function assertSafeLog(log, needles) {
 }
 
 test("metric points keep stage and outcome low cardinality", () => {
+  assert.equal(LLAMA_8B_NEURONS_PER_MILLION_INPUT, 13778);
+  assert.equal(LLAMA_8B_NEURONS_PER_MILLION_OUTPUT, 26128);
   assert.equal(estimateNeurons(null), 0);
   assert.equal(estimateNeurons({}), 0);
   const neurons = estimateNeurons({ prompt_tokens: 1000, completion_tokens: 50 });
@@ -2886,26 +2890,45 @@ test("alert cron stays quiet under the threshold and emails when D1 checks trip"
   assert.equal(calls[0].init.headers.Authorization, "Bearer test-resend-key");
 
   db.exec("ALTER TABLE emails ADD COLUMN ai_status TEXT");
-  const hour = new Date(NOW_MS - 60 * 1000).toISOString();
-  for (let i = 0; i < 4; i += 1) {
-    db.prepare("INSERT INTO emails (resend_id, direction, created_at, ai_status) VALUES (?, 'in', ?, 'ok')").run(`ok-${i}`, hour);
+  assert.equal(AI_STATUS_MIN_SAMPLE, 5);
+  const recent = new Date(NOW_MS - 60 * 1000).toISOString();
+  const outside = new Date(NOW_MS - 25 * 60 * 60 * 1000).toISOString();
+  for (let i = 0; i < AI_STATUS_MIN_SAMPLE - 1; i += 1) {
+    db.prepare("INSERT INTO emails (resend_id, direction, created_at, ai_status) VALUES (?, 'in', ?, ?)").run(
+      `small-${i}`,
+      recent,
+      i === 0 ? "deferred" : "failed",
+    );
   }
-  db.prepare("INSERT INTO emails (resend_id, direction, created_at, ai_status) VALUES ('edge', 'in', ?, 'failed')").run(hour);
-  const edge = await collectAlertSignals(env, NOW_MS);
-  assert.equal(edge.breaches.some((signal) => signal.name === "ai_status"), false);
+  const small = await collectAlertSignals(env, NOW_MS);
+  const smallAi = small.signals.find((signal) => signal.name === "ai_status");
+  assert.equal(smallAi.value, 1);
+  assert.equal(smallAi.breached, false);
 
-  db.prepare("INSERT INTO emails (resend_id, direction, created_at, ai_status) VALUES ('bad', 'in', ?, 'deferred')").run(hour);
-  db.prepare("INSERT INTO emails (resend_id, direction, created_at, ai_status) VALUES ('old-bad', 'in', ?, 'failed')").run(
-    new Date(NOW_MS - 2 * 60 * 60 * 1000).toISOString(),
-  );
+  for (let i = 0; i < 5; i += 1) {
+    db.prepare("INSERT INTO emails (resend_id, direction, created_at, ai_status) VALUES (?, 'in', ?, 'failed')").run(
+      `old-bad-${i}`,
+      outside,
+    );
+  }
+  const stale = await collectAlertSignals(env, NOW_MS);
+  const staleAi = stale.signals.find((signal) => signal.name === "ai_status");
+  assert.equal(staleAi.value, 1);
+  assert.equal(staleAi.breached, false);
+
+  db.prepare("INSERT INTO emails (resend_id, direction, created_at, ai_status) VALUES ('ok-enough', 'in', ?, 'ok')").run(recent);
+  db.prepare("INSERT INTO emails (resend_id, direction, created_at, ai_status) VALUES ('not-attempted', 'in', ?, NULL)").run(recent);
   db.exec("CREATE TABLE stats_daily (day TEXT PRIMARY KEY, inbound INTEGER NOT NULL, outbound INTEGER NOT NULL)");
   db.prepare("INSERT INTO stats_daily (day, inbound, outbound) VALUES ('2026-09-27', 3, 1)").run();
   calls.length = 0;
   const both = await captureLogs(() => handleScheduled({ scheduledTime: NOW_MS }, env, { nowMs: NOW_MS, fetch: fetchImpl }));
   assert.deepEqual(both.value.breaches, ["ingest_failures", "ai_status"]);
-  assert.equal(JSON.parse(calls[0].init.body).text, `threshold crossed\ningest_failures 1\nai_status ${2 / 6}\n`);
-  const ratio = buildAiStatusRatioQuery(new Date(NOW_MS - 60 * 60 * 1000).toISOString());
+  assert.equal(JSON.parse(calls[0].init.body).text, `threshold crossed\ningest_failures 1\nai_status ${4 / 5}\n`);
+  const window = alertWindow(NOW_MS);
+  const ratio = buildAiStatusRatioQuery(window.start, window.end);
   assert.equal(ratio.sql.includes("ai_status"), true);
+  assert.equal(ratio.sql.includes("created_at < ?"), true);
+  assert.deepEqual(ratio.params, [window.start, window.end]);
   const failureQuery = buildIngestFailureCountQuery("a", "b");
   assert.deepEqual(failureQuery.params, ["a", "b"]);
   const report = await collectAlertSignals(env, NOW_MS);
@@ -2913,4 +2936,31 @@ test("alert cron stays quiet under the threshold and emails when D1 checks trip"
   assert.equal(buildAlertEmail({ breaches: [] }, env).text, "threshold crossed\n\n");
   assert.equal(ALERT_TO, "eric@abot.run");
   assert.match(ALERT_FROM, /alerts@abot\.run/);
+});
+
+test("one alert query failure does not drop breaches from the others", async () => {
+  const { db, env } = sqliteEnv();
+  db.prepare("INSERT INTO ingest_failures (resend_id, event_type, error, attempts, failed_at) VALUES (?, ?, ?, ?, ?)").run(
+    "fail-row",
+    "email.received",
+    "x",
+    1,
+    new Date(NOW_MS - 60 * 1000).toISOString(),
+  );
+  db.exec("ALTER TABLE emails ADD COLUMN ai_status TEXT");
+  db.exec("CREATE TABLE stats_daily (day TEXT PRIMARY KEY, inbound INTEGER NOT NULL, outbound INTEGER NOT NULL)");
+  db.prepare("INSERT INTO stats_daily (day, inbound, outbound) VALUES ('2026-09-27', 2, 2)").run();
+  const orig = env.DB.prepare.bind(env.DB);
+  env.DB.prepare = (sql) => {
+    if (String(sql).includes("ai_status IN")) throw new Error("ai_status query failed");
+    return orig(sql);
+  };
+  const report = await collectAlertSignals(env, NOW_MS);
+  assert.deepEqual(
+    report.breaches.map((signal) => signal.name),
+    ["ingest_failures"],
+  );
+  assert.equal(report.skipped.includes("ai_status"), true);
+  assert.equal(report.signals.some((signal) => signal.name === "count_24h"), true);
+  assert.equal(report.signals.some((signal) => signal.name === "stats_daily" && signal.value === 4), true);
 });
