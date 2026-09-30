@@ -3,13 +3,22 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
+import { createHmac } from "node:crypto";
+
 import worker, {
   TOOLS,
+  buildWebhookBody,
   canonicalUrl,
+  consumeDelivery,
   handleFetch,
   handleMcpRpc,
+  handleQueue,
+  handleScheduled,
   idFromBytes,
+  signWebhook,
+  stableStringify,
   timingSafeEqual,
+  verifyWebhookRequest,
 } from "./worker.js";
 
 const TOKEN = "test-data-token";
@@ -18,7 +27,7 @@ const NOW_ISO = "2026-09-29T04:00:00.000Z";
 const LATER = Date.parse("2026-09-29T05:00:00.000Z");
 const LATER_ISO = "2026-09-29T05:00:00.000Z";
 
-const TOOL_NAMES = [
+const PHASE1_TOOL_NAMES = [
   "create_contact",
   "get_contact",
   "list_contacts",
@@ -35,6 +44,20 @@ const TOOL_NAMES = [
   "update_note",
   "delete_note",
 ];
+const PHASE2_TOOL_NAMES = [
+  "poll_events",
+  "ack_event",
+  "heartbeat",
+  "emit_event",
+  "create_subscription",
+  "get_subscription",
+  "list_subscriptions",
+  "update_subscription",
+  "delete_subscription",
+  "rotate_subscription_secret",
+];
+const TOOL_NAMES = [...PHASE1_TOOL_NAMES, ...PHASE2_TOOL_NAMES];
+const SEAL = Buffer.alloc(32, 7).toString("base64");
 
 function schemaSql() {
   return readFileSync(new URL("./schema.sql", import.meta.url), "utf8");
@@ -43,8 +66,16 @@ function schemaSql() {
 function sqliteEnv() {
   const db = new DatabaseSync(":memory:");
   db.exec(schemaSql());
+  const sent = [];
   const env = {
     DATA_MCP_TOKEN: TOKEN,
+    SUBSCRIPTION_SEAL: SEAL,
+    DELIVER_QUEUE: {
+      sent,
+      async send(body) {
+        sent.push(body);
+      },
+    },
     DB: {
       prepare(sql) {
         const make = (params) => ({
@@ -57,9 +88,14 @@ function sqliteEnv() {
         });
         return { ...make([]), bind: (...params) => make(params) };
       },
+      async batch(statements) {
+        const results = [];
+        for (const stmt of statements) results.push(await stmt.run());
+        return results;
+      },
     },
   };
-  return { db, env };
+  return { db, env, sent };
 }
 
 async function mcp(env, name, args, opts = {}) {
@@ -164,6 +200,12 @@ test("wrangler config is staging-only and does not name the mail archive", () =>
   assert.match(toml, /database_name = "botu-data"/);
   assert.match(toml, /\[env\.staging\]/);
   assert.match(toml, /DATA_MCP_TOKEN/);
+  assert.match(toml, /\[env\.staging\.triggers\]\ncrons = \["\*\/5 \* \* \* \*"\]/);
+  assert.match(toml, /binding = "DELIVER_QUEUE"/);
+  assert.match(toml, /queue = "botu-deliver"\n/);
+  assert.match(toml, /dead_letter_queue = "botu-deliver-dlq"/);
+  assert.match(toml, /queue = "botu-deliver-dlq"/);
+  assert.equal(toml.includes("[env.production]"), false);
   assert.equal(toml.includes("779058bf-f5c1-44de-b2c8-99350ec7748e"), false);
   assert.equal(/database_name\s*=\s*"abot-mail/.test(toml), false);
   assert.equal(/bucket_name\s*=\s*"abot-mail/.test(toml), false);
@@ -225,7 +267,7 @@ test("health is public and MCP auth fails before the database", async () => {
   assert.equal(JSON.stringify(await down.json()).includes("db touched"), false);
 });
 
-test("tools/list exposes the fifteen tools", async () => {
+test("tools/list keeps the fifteen phase 1 tools then the ten phase 2 tools", async () => {
   const { env } = sqliteEnv();
   assert.deepEqual(
     TOOLS.map((tool) => tool.name),
@@ -674,4 +716,641 @@ test("canonical GET routes match get_* and reject a bad token before D1", async 
     env,
   );
   assert.equal(posted.status, 405);
+});
+
+function countOf(db, table) {
+  return db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n;
+}
+
+test("phase 2 schema appends four tables and reapplies without dropping rows", () => {
+  const sql = schemaSql();
+  assert.equal(/\balter\s+table\b/i.test(sql), false);
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS events/);
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS subscriptions/);
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS deliveries/);
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS heartbeats/);
+  assert.match(sql, /CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe_open/);
+  const db = new DatabaseSync(":memory:");
+  db.exec(sql);
+  db.exec(sql);
+  db.prepare(
+    `INSERT INTO contacts (id, name, created_at, updated_at) VALUES ('ctc_abcdefghijkl', 'Ada', ?, ?)`,
+  ).run(NOW_ISO, NOW_ISO);
+  db.prepare(
+    `INSERT INTO events (
+      id, type, payload, status, dedupe_key, created_at, not_before, source, updated_at
+    ) VALUES ('evt_abcdefghijkl', 'reminder.medication', '{}', 'pending', 'reminder.medication:a:t', ?, ?, 'emit', ?)`,
+  ).run(NOW_ISO, NOW_ISO, NOW_ISO);
+  db.exec(sql);
+  assert.equal(countOf(db, "contacts"), 1);
+  assert.equal(countOf(db, "events"), 1);
+  assert.equal(db.prepare("SELECT name FROM contacts").get().name, "Ada");
+});
+
+test("poll_events rejects a bad bearer before reading the body", async () => {
+  let touched = false;
+  const closed = {
+    DATA_MCP_TOKEN: TOKEN,
+    DB: {
+      prepare() {
+        touched = true;
+        throw new Error("db touched");
+      },
+    },
+  };
+  const missing = await handleFetch(
+    new Request("https://botu-data.test/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{",
+    }),
+    closed,
+  );
+  assert.equal(missing.status, 401);
+  assert.deepEqual(await missing.json(), { ok: false, error: "unauthorized" });
+  const wrong = await handleFetch(
+    new Request("https://botu-data.test/mcp", {
+      method: "POST",
+      headers: { authorization: "Bearer wrong-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "poll_events", arguments: { subscription_id: "sub_abcdefghijkl" } },
+      }),
+    }),
+    closed,
+  );
+  assert.equal(wrong.status, 401);
+  assert.equal(touched, false);
+});
+
+test("dedupe keeps one pending row until ack, then inserts a new id", async () => {
+  const { db, env } = sqliteEnv();
+  const sub = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["*"] }));
+  const key = "reminder.medication:med:2026-09-30T00:00:00.000Z";
+  const first = unwrap(
+    await mcp(env, "emit_event", { type: "reminder.medication", dedupe_key: key, payload: { name: "药" } }),
+  );
+  assert.equal(first.created, true);
+  assert.match(first.id, /^evt_[a-z0-9]{12}$/);
+  const second = unwrap(
+    await mcp(env, "emit_event", { type: "reminder.medication", dedupe_key: key, payload: { name: "changed" } }),
+  );
+  assert.deepEqual(second, { id: first.id, created: false });
+  assert.equal(countOf(db, "events"), 1);
+  assert.equal(JSON.parse(db.prepare("SELECT payload FROM events").get().payload).name, "药");
+  const page = unwrap(await mcp(env, "poll_events", { subscription_id: sub.id }));
+  assert.equal(page.events.length, 1);
+  unwrap(await mcp(env, "ack_event", { id: first.id, lease_token: page.events[0].lease_token }));
+  const third = unwrap(await mcp(env, "emit_event", { type: "reminder.medication", dedupe_key: key }));
+  assert.equal(third.created, true);
+  assert.notEqual(third.id, first.id);
+  assert.equal(countOf(db, "events"), 2);
+});
+
+test("poll leases the oldest row, hides it, and bumps poll_count after the lease expires", async () => {
+  const { env } = sqliteEnv();
+  const sub = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["*"] }));
+  const a = unwrap(
+    await mcp(
+      env,
+      "emit_event",
+      { type: "reminder.medication", dedupe_key: "reminder.medication:a:2026-09-30T00:00:00.000Z" },
+      { nowMs: NOW },
+    ),
+  );
+  const b = unwrap(
+    await mcp(
+      env,
+      "emit_event",
+      { type: "reminder.followup", dedupe_key: "reminder.followup:b:2026-09-30T01:00:00.000Z" },
+      { nowMs: NOW + 1000 },
+    ),
+  );
+  const t = NOW + 1000;
+  const first = unwrap(await mcp(env, "poll_events", { subscription_id: sub.id, limit: 1 }, { nowMs: t }));
+  assert.equal(first.events[0].id, a.id);
+  assert.equal(first.events[0].poll_count, 1);
+  assert.equal(first.has_more, true);
+  const second = unwrap(await mcp(env, "poll_events", { subscription_id: sub.id, limit: 1 }, { nowMs: t }));
+  assert.equal(second.events[0].id, b.id);
+  unwrap(await mcp(env, "ack_event", { id: b.id, lease_token: second.events[0].lease_token }, { nowMs: t }));
+  const hidden = unwrap(await mcp(env, "poll_events", { subscription_id: sub.id }, { nowMs: t }));
+  assert.deepEqual(hidden.events, []);
+  assert.equal(hidden.has_more, false);
+  assert.ok(hidden.retry_after_seconds >= 1);
+  const again = unwrap(
+    await mcp(env, "poll_events", { subscription_id: sub.id, limit: 1 }, { nowMs: t + 121000 }),
+  );
+  assert.equal(again.events[0].id, a.id);
+  assert.equal(again.events[0].poll_count, 2);
+  const gone = unwrap(await mcp(env, "poll_events", { subscription_id: sub.id }, { nowMs: t + 121000 }));
+  assert.deepEqual(
+    gone.events.map((row) => row.id),
+    [],
+  );
+});
+
+test("a cursor that moved forward still returns an older unacked row once its lease expires", async () => {
+  const { env } = sqliteEnv();
+  const sub = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["*"] }));
+  const a = unwrap(
+    await mcp(
+      env,
+      "emit_event",
+      { type: "reminder.medication", dedupe_key: "reminder.medication:a:2026-09-30T00:00:00.000Z" },
+      { nowMs: NOW },
+    ),
+  );
+  unwrap(
+    await mcp(
+      env,
+      "emit_event",
+      { type: "reminder.followup", dedupe_key: "reminder.followup:b:2026-09-30T01:00:00.000Z" },
+      { nowMs: NOW + 1000 },
+    ),
+  );
+  const t = NOW + 1000;
+  const first = unwrap(
+    await mcp(env, "poll_events", { subscription_id: sub.id, limit: 1, visibility_seconds: 30 }, { nowMs: t }),
+  );
+  assert.equal(first.events[0].id, a.id);
+  const second = unwrap(
+    await mcp(
+      env,
+      "poll_events",
+      { subscription_id: sub.id, limit: 1, visibility_seconds: 30, cursor: first.next_cursor },
+      { nowMs: t },
+    ),
+  );
+  const soon = unwrap(
+    await mcp(
+      env,
+      "poll_events",
+      { subscription_id: sub.id, cursor: second.next_cursor, visibility_seconds: 30 },
+      { nowMs: t },
+    ),
+  );
+  assert.deepEqual(soon.events, []);
+  assert.ok(soon.retry_after_seconds >= 1);
+  const back = unwrap(
+    await mcp(
+      env,
+      "poll_events",
+      { subscription_id: sub.id, limit: 1, cursor: second.next_cursor, visibility_seconds: 30 },
+      { nowMs: t + 31000 },
+    ),
+  );
+  assert.equal(back.events[0].id, a.id);
+  assert.equal(back.events[0].poll_count, 2);
+});
+
+test("repeat ack is idempotent and a wrong token is lease mismatch while pending", async () => {
+  const { db, env } = sqliteEnv();
+  const sub = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["*"] }));
+  const ev = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: "reminder.medication:a:2026-09-30T00:00:00.000Z",
+    }),
+  );
+  const page = unwrap(await mcp(env, "poll_events", { subscription_id: sub.id }));
+  const bad = rpcError(
+    await mcp(env, "ack_event", { id: ev.id, lease_token: "0123456789abcdef0123456789abcdef" }),
+  );
+  assert.equal(bad.code, -32602);
+  assert.equal(bad.message, "lease mismatch");
+  assert.equal(db.prepare("SELECT status FROM events WHERE id = ?").get(ev.id).status, "pending");
+  const ok = unwrap(await mcp(env, "ack_event", { id: ev.id, lease_token: page.events[0].lease_token }));
+  assert.equal(ok.idempotent, false);
+  assert.equal(ok.status, "acked");
+  assert.match(ok.ack_cursor, /^v1\./);
+  const again = unwrap(
+    await mcp(env, "ack_event", { id: ev.id, lease_token: "ffffffffffffffffffffffffffffffff" }),
+  );
+  assert.deepEqual(again, { id: ev.id, status: "acked", idempotent: true, ack_cursor: ok.ack_cursor });
+});
+
+test("emit_event rejects watchdog types and calendar.due without writing", async () => {
+  const { db, env } = sqliteEnv();
+  const watchdog = rpcError(
+    await mcp(env, "emit_event", { type: "watchdog.heartbeat_stale", dedupe_key: "custom-key" }),
+  );
+  assert.equal(watchdog.code, -32602);
+  const due = rpcError(await mcp(env, "emit_event", { type: "calendar.due", dedupe_key: "custom-key" }));
+  assert.equal(due.code, -32602);
+  const keyA = rpcError(
+    await mcp(env, "emit_event", { type: "reminder.medication", dedupe_key: "watchdog.nope" }),
+  );
+  assert.equal(keyA.code, -32602);
+  const keyB = rpcError(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: "calendar.due:cal_abcdefghijkl:2026-09-30T04:00:00.000Z",
+    }),
+  );
+  assert.equal(keyB.code, -32602);
+  assert.equal(countOf(db, "events"), 0);
+});
+
+test("payload with a secret key or whsec_ substring is not stored", async () => {
+  const { db, env } = sqliteEnv();
+  const key = "reminder.medication:a:2026-09-30T00:00:00.000Z";
+  const token = rpcError(
+    await mcp(env, "emit_event", { type: "reminder.medication", dedupe_key: key, payload: { token: "x" } }),
+  );
+  assert.equal(token.message, "payload contains a secret");
+  const nested = rpcError(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: key,
+      payload: { meta: { Password: "x" } },
+    }),
+  );
+  assert.equal(nested.message, "payload contains a secret");
+  const embedded = rpcError(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: key,
+      payload: { note: "see whsec_abc" },
+    }),
+  );
+  assert.equal(embedded.message, "payload contains a secret");
+  assert.equal(countOf(db, "events"), 0);
+});
+
+test("the default subscription filter does not claim reminder events", async () => {
+  const { db, env } = sqliteEnv();
+  const sub = unwrap(await mcp(env, "create_subscription", { mode: "poll" }));
+  unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: "reminder.medication:a:2026-09-30T00:00:00.000Z",
+    }),
+  );
+  const page = unwrap(await mcp(env, "poll_events", { subscription_id: sub.id }));
+  assert.deepEqual(page.events, []);
+  assert.equal(db.prepare("SELECT poll_count FROM events").get().poll_count, 0);
+  const paused = unwrap(await mcp(env, "update_subscription", { id: sub.id, status: "paused" }));
+  assert.equal(paused.status, "paused");
+  const blocked = rpcError(await mcp(env, "poll_events", { subscription_id: sub.id }));
+  assert.equal(blocked.message, "subscription paused");
+});
+
+test("calendar detector skips cancelled and out-of-window rows and dedupes until ack", async () => {
+  const { db, env } = sqliteEnv();
+  const due = unwrap(
+    await mcp(env, "create_event", {
+      title: "复诊",
+      start_utc: "2026-09-29T03:00:00.000Z",
+      end_utc: "2026-09-29T04:00:00.000Z",
+      location: "clinic",
+      notes: "do not copy whsec_secret",
+    }),
+  );
+  unwrap(
+    await mcp(env, "create_event", {
+      title: "old",
+      start_utc: "2026-09-20T03:00:00.000Z",
+      end_utc: "2026-09-20T04:00:00.000Z",
+    }),
+  );
+  unwrap(
+    await mcp(env, "create_event", {
+      title: "later",
+      start_utc: "2026-09-29T06:00:00.000Z",
+      end_utc: "2026-09-29T07:00:00.000Z",
+    }),
+  );
+  const cancelled = unwrap(
+    await mcp(env, "create_event", {
+      title: "nope",
+      start_utc: "2026-09-29T02:00:00.000Z",
+      end_utc: "2026-09-29T02:30:00.000Z",
+    }),
+  );
+  unwrap(await mcp(env, "delete_event", { id: cancelled.id }));
+  await handleScheduled({}, env, { nowMs: NOW });
+  const rows = db.prepare("SELECT type, dedupe_key, payload, source FROM events").all();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].type, "calendar.due");
+  assert.equal(rows[0].source, "detector");
+  const payload = JSON.parse(rows[0].payload);
+  assert.equal(payload.calendar_event_id, due.id);
+  assert.equal(payload.path, `/cal/${due.id}`);
+  assert.equal(payload.title, "复诊");
+  assert.equal(payload.location, "clinic");
+  assert.equal(payload.notes, undefined);
+  assert.equal(rows[0].dedupe_key, `calendar.due:${due.id}:${payload.start_utc}`);
+  await handleScheduled({}, env, { nowMs: NOW });
+  assert.equal(countOf(db, "events"), 1);
+  unwrap(await mcp(env, "delete_event", { id: due.id }));
+  await handleScheduled({}, env, { nowMs: NOW });
+  assert.equal(countOf(db, "events"), 1);
+});
+
+test("heartbeat staleness starts only after the first report and does not duplicate", async () => {
+  const { db, env } = sqliteEnv();
+  unwrap(await mcp(env, "create_subscription", { mode: "poll", watch_heartbeat: false, agent_id: "bot:quiet" }));
+  unwrap(await mcp(env, "heartbeat", { agent_id: "bot:quiet", ttl_seconds: 120 }, { nowMs: NOW - 1_000_000 }));
+  await handleScheduled({}, env, { nowMs: NOW });
+  assert.equal(countOf(db, "events"), 0);
+  unwrap(await mcp(env, "create_subscription", { mode: "poll" }));
+  await handleScheduled({}, env, { nowMs: NOW });
+  assert.equal(countOf(db, "events"), 0);
+  const beat = unwrap(await mcp(env, "heartbeat", { ttl_seconds: 600 }, { nowMs: NOW }));
+  assert.deepEqual(beat, { agent_id: "bot:main", seen_at: NOW_ISO, ttl_seconds: 600 });
+  await handleScheduled({}, env, { nowMs: NOW + 600 * 1000 });
+  assert.equal(countOf(db, "events"), 0);
+  await handleScheduled({}, env, { nowMs: NOW + 630 * 1000 });
+  const row = db.prepare("SELECT type, dedupe_key, payload FROM events").get();
+  assert.equal(row.type, "watchdog.heartbeat_stale");
+  assert.equal(row.dedupe_key, "watchdog.heartbeat_stale:bot:main");
+  assert.equal(JSON.parse(row.payload).stale_for_seconds, 30);
+  await handleScheduled({}, env, { nowMs: NOW + 800 * 1000 });
+  assert.equal(countOf(db, "events"), 1);
+});
+
+test("webhook signature matches a fixed HMAC and rejects a bad signature", async () => {
+  const secret = "whsec_test_signature_key";
+  const event = {
+    id: "evt_0123456789ab",
+    type: "calendar.due",
+    dedupe_key: "calendar.due:cal_0123456789ab:2026-09-30T04:00:00.000Z",
+    created_at: "2026-09-30T04:00:00.000Z",
+    not_before: "2026-09-30T04:00:00.000Z",
+    payload: { title: "复诊", all_day: false },
+  };
+  const body = buildWebhookBody(event);
+  assert.equal(
+    body,
+    '{"created_at":"2026-09-30T04:00:00.000Z","dedupe_key":"calendar.due:cal_0123456789ab:2026-09-30T04:00:00.000Z","id":"evt_0123456789ab","not_before":"2026-09-30T04:00:00.000Z","payload":{"all_day":false,"title":"复诊"},"type":"calendar.due"}',
+  );
+  assert.equal(stableStringify(event.payload), '{"all_day":false,"title":"复诊"}');
+  assert.equal(body.includes("whsec_"), false);
+  assert.equal(body.includes("lease_token"), false);
+  assert.equal(Object.hasOwn(JSON.parse(body), "secret"), false);
+  const timestamp = "1759190400";
+  const hex = createHmac("sha256", secret).update(`${timestamp}.${body}`).digest("hex");
+  assert.equal(await signWebhook(secret, timestamp, body), hex);
+  assert.match(hex, /^[0-9a-f]{64}$/);
+  const nowMs = 1759190400 * 1000;
+  assert.equal(
+    await verifyWebhookRequest({ secret, timestamp, body, signature: `v1=${hex}`, nowMs }),
+    true,
+  );
+  assert.equal(
+    await verifyWebhookRequest({ secret, timestamp, body, signature: `v1=${"0".repeat(64)}`, nowMs }),
+    false,
+  );
+  assert.equal(
+    await verifyWebhookRequest({ secret, timestamp, body, signature: `v1=${hex}`, nowMs: nowMs + 301000 }),
+    false,
+  );
+});
+
+test("timeouts and 500s back off 60/120/240 and the fourth failure dies with the event still pending", async () => {
+  const { db, env } = sqliteEnv();
+  const sub = unwrap(
+    await mcp(env, "create_subscription", {
+      mode: "webhook",
+      url: "https://example.com/hook",
+      event_types: ["*"],
+    }),
+  );
+  assert.match(sub.secret, /^whsec_[A-Za-z0-9+/]+=*$/);
+  assert.equal(Object.hasOwn(unwrap(await mcp(env, "get_subscription", { id: sub.id })), "secret"), false);
+  const ev = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: "reminder.medication:a:2026-09-30T00:00:00.000Z",
+      payload: { name: "药" },
+    }),
+  );
+  const delivery = db.prepare("SELECT id FROM deliveries WHERE event_id = ?").get(ev.id);
+  const delays = [];
+  let calls = 0;
+  for (let i = 0; i < 4; i++) {
+    const decision = await consumeDelivery({ body: { delivery_id: delivery.id } }, env, {
+      nowMs: NOW + i * 1000,
+      fetch: async () => {
+        calls += 1;
+        return new Response("no", { status: 500 });
+      },
+    });
+    if (i < 3) {
+      assert.equal(decision.action, "retry");
+      delays.push(decision.delaySeconds);
+    } else {
+      assert.equal(decision.action, "ack");
+    }
+  }
+  assert.deepEqual(delays, [60, 120, 240]);
+  assert.equal(calls, 4);
+  const dead = db.prepare("SELECT state, dead_reason, attempts FROM deliveries WHERE id = ?").get(delivery.id);
+  assert.equal(dead.state, "dead");
+  assert.equal(dead.dead_reason, "retries_exhausted");
+  assert.equal(dead.attempts, 4);
+  assert.equal(db.prepare("SELECT status FROM events WHERE id = ?").get(ev.id).status, "pending");
+
+  const follow = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.followup",
+      dedupe_key: "reminder.followup:cal_abcdefghijkl:2026-09-30T00:00:00.000Z",
+    }),
+  );
+  const second = db.prepare("SELECT id FROM deliveries WHERE event_id = ?").get(follow.id);
+  let posts = 0;
+  const missing = await consumeDelivery({ body: { delivery_id: second.id } }, env, {
+    nowMs: NOW,
+    fetch: async (url, init) => {
+      posts += 1;
+      assert.equal(url, "https://example.com/hook");
+      assert.equal(init.redirect, "manual");
+      assert.equal(init.headers["user-agent"], "botu-data-webhook/1");
+      assert.equal(init.headers.authorization, undefined);
+      assert.equal(init.body.includes(sub.secret), false);
+      assert.equal(init.body.includes("lease_token"), false);
+      assert.equal(
+        await verifyWebhookRequest({
+          secret: sub.secret,
+          timestamp: init.headers["x-botu-timestamp"],
+          body: init.body,
+          signature: init.headers["x-botu-signature"],
+          nowMs: NOW,
+        }),
+        true,
+      );
+      return new Response("missing", { status: 404 });
+    },
+  });
+  assert.equal(missing.action, "ack");
+  assert.equal(posts, 1);
+  const row = db.prepare("SELECT state, dead_reason, last_error, attempts FROM deliveries WHERE id = ?").get(second.id);
+  assert.equal(row.state, "dead");
+  assert.equal(row.dead_reason, "http_status");
+  assert.equal(row.last_error, "http_404");
+  assert.equal(row.attempts, 1);
+  assert.equal(db.prepare("SELECT status FROM events WHERE id = ?").get(follow.id).status, "pending");
+
+  const third = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: "reminder.medication:b:2026-09-30T02:00:00.000Z",
+    }),
+  );
+  const thirdDelivery = db.prepare("SELECT id FROM deliveries WHERE event_id = ?").get(third.id);
+  const timed = await consumeDelivery({ body: { delivery_id: thirdDelivery.id } }, env, {
+    nowMs: NOW,
+    fetch: async () => {
+      const err = new Error("timed out");
+      err.name = "TimeoutError";
+      throw err;
+    },
+  });
+  assert.equal(timed.action, "retry");
+  assert.equal(timed.delaySeconds, 60);
+  assert.equal(db.prepare("SELECT last_error, attempts FROM deliveries WHERE id = ?").get(thirdDelivery.id).last_error, "timeout");
+  const nextAt = db.prepare("SELECT next_attempt_at FROM deliveries WHERE id = ?").get(thirdDelivery.id).next_attempt_at;
+  assert.equal(nextAt, new Date(NOW + 60 * 1000).toISOString());
+});
+
+test("subscription_deleted does not raise queue_dlq; other dead letters do once and do not fan out", async () => {
+  const { db, env } = sqliteEnv();
+  const kept = unwrap(
+    await mcp(env, "create_subscription", { mode: "webhook", url: "https://example.com/a", event_types: ["*"] }),
+  );
+  const dropped = unwrap(
+    await mcp(env, "create_subscription", { mode: "webhook", url: "https://example.com/b", event_types: ["*"] }),
+  );
+  const ev = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: "reminder.medication:a:2026-09-30T00:00:00.000Z",
+    }),
+  );
+  assert.equal(countOf(db, "deliveries"), 2);
+  unwrap(await mcp(env, "delete_subscription", { id: dropped.id }));
+  assert.equal(
+    db.prepare("SELECT dead_reason FROM deliveries WHERE subscription_id = ?").get(dropped.id).dead_reason,
+    "subscription_deleted",
+  );
+  const keptDelivery = db.prepare("SELECT id FROM deliveries WHERE subscription_id = ?").get(kept.id);
+  await consumeDelivery({ body: { delivery_id: keptDelivery.id } }, env, {
+    nowMs: NOW,
+    fetch: async () => new Response("", { status: 404 }),
+  });
+  await handleScheduled({}, env, { nowMs: NOW + 1000 });
+  const watch = db.prepare("SELECT id, dedupe_key, payload FROM events WHERE type = 'watchdog.queue_dlq'").all();
+  assert.equal(watch.length, 1);
+  assert.equal(watch[0].dedupe_key, `watchdog.queue_dlq:${keptDelivery.id}`);
+  assert.equal(JSON.parse(watch[0].payload).dead_reason, "http_status");
+  assert.equal(JSON.parse(watch[0].payload).queue, "botu-deliver-dlq");
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE event_id = ?").get(watch[0].id).n, 0);
+  await handleScheduled({}, env, { nowMs: NOW + 2000 });
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'watchdog.queue_dlq'").get().n, 1);
+  assert.equal(db.prepare("SELECT status FROM events WHERE id = ?").get(ev.id).status, "pending");
+});
+
+test("the dead-letter consumer records the row and does not POST", async () => {
+  const { db, env } = sqliteEnv();
+  unwrap(
+    await mcp(env, "create_subscription", { mode: "webhook", url: "https://example.com/hook", event_types: ["*"] }),
+  );
+  unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: "reminder.medication:a:2026-09-30T00:00:00.000Z",
+    }),
+  );
+  const delivery = db.prepare("SELECT id FROM deliveries").get();
+  let posts = 0;
+  let acked = 0;
+  let retried = 0;
+  await handleQueue(
+    {
+      queue: "botu-deliver-dlq",
+      messages: [
+        {
+          body: { delivery_id: delivery.id },
+          ack() {
+            acked += 1;
+          },
+          retry() {
+            retried += 1;
+          },
+        },
+      ],
+    },
+    env,
+    {
+      nowMs: NOW,
+      fetch: async () => {
+        posts += 1;
+        return new Response("no");
+      },
+    },
+  );
+  assert.equal(posts, 0);
+  assert.equal(acked, 1);
+  assert.equal(retried, 0);
+  const row = db.prepare("SELECT state, dead_reason, last_error FROM deliveries").get();
+  assert.equal(row.state, "dead");
+  assert.equal(row.dead_reason, "retries_exhausted");
+  assert.equal(row.last_error, "handler_crash");
+});
+
+test("cron requeues a due delivery and returns a stuck inflight row to due", async () => {
+  const { db, env, sent } = sqliteEnv();
+  unwrap(
+    await mcp(env, "create_subscription", { mode: "webhook", url: "https://example.com/hook", event_types: ["*"] }),
+  );
+  const later = new Date(NOW + 3_600_000).toISOString();
+  unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: "reminder.medication:a:2026-09-30T00:00:00.000Z",
+      not_before: later,
+    }),
+  );
+  assert.equal(sent.length, 0);
+  const delivery = db.prepare("SELECT id, state, queued_at, next_attempt_at FROM deliveries").get();
+  assert.equal(delivery.state, "due");
+  assert.equal(delivery.queued_at, null);
+  assert.equal(delivery.next_attempt_at, later);
+  await handleScheduled({}, env, { nowMs: NOW });
+  assert.equal(sent.length, 0);
+  await handleScheduled({}, env, { nowMs: NOW + 3_600_000 });
+  assert.deepEqual(sent, [{ delivery_id: delivery.id }]);
+  db.prepare(
+    "UPDATE deliveries SET state = 'inflight', inflight_at = ?, queued_at = ?, next_attempt_at = NULL WHERE id = ?",
+  ).run(new Date(NOW).toISOString(), new Date(NOW).toISOString(), delivery.id);
+  sent.length = 0;
+  await handleScheduled({}, env, { nowMs: NOW + 181_000 });
+  const reclaimed = db.prepare("SELECT state, queued_at FROM deliveries WHERE id = ?").get(delivery.id);
+  assert.equal(reclaimed.state, "due");
+  assert.equal(reclaimed.queued_at, null);
+  assert.equal(sent.length, 0);
+  await handleScheduled({}, env, { nowMs: NOW + 181_000 });
+  assert.deepEqual(sent, [{ delivery_id: delivery.id }]);
+});
+
+test("health and create_contact keep their phase 1 shapes", async () => {
+  const { env } = sqliteEnv();
+  const health = await worker.fetch(new Request("https://botu-data.test/health"), env);
+  assert.equal(health.status, 200);
+  const body = await health.json();
+  assert.deepEqual(body, { ok: true });
+  assert.deepEqual(Object.keys(body), ["ok"]);
+  const created = unwrap(await mcp(env, "create_contact", { name: "Ada" }));
+  assert.deepEqual(Object.keys(created).sort(), ["id", "url"]);
+  const init = await handleMcpRpc({ jsonrpc: "2.0", id: 1, method: "initialize" }, {});
+  assert.equal(init.result.protocolVersion, "2025-06-18");
+  assert.equal(init.result.serverInfo.version, "1.0.0");
+  assert.deepEqual(
+    TOOLS.map((tool) => tool.name).slice(0, 15),
+    PHASE1_TOOL_NAMES,
+  );
+  assert.deepEqual(TOOLS.map((tool) => tool.name).slice(15), PHASE2_TOOL_NAMES);
 });

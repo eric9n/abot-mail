@@ -17,3 +17,23 @@ name = "botu-data"
 binding = "DB"
 database_name = "botu-data"
 database_id = "00000000-0000-4000-8000-000000000001"
+
+[env.staging.triggers]
+crons = ["*/5 * * * *"]
+
+[[env.staging.queues.producers]]
+binding = "DELIVER_QUEUE"
+queue = "botu-deliver"
+
+[[env.staging.queues.consumers]]
+queue = "botu-deliver"
+max_batch_size = 5
+max_batch_timeout = 1
+max_retries = 3
+dead_letter_queue = "botu-deliver-dlq"
+
+[[env.staging.queues.consumers]]
+queue = "botu-deliver-dlq"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 3
