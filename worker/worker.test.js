@@ -8,28 +8,45 @@ import worker, {
   CACHE_TTL,
   INGEST_MAX_RETRIES,
   INGEST_RETRY_BASE_SEC,
+  LLAMA_8B_NEURONS_PER_MILLION_INPUT,
+  LLAMA_8B_NEURONS_PER_MILLION_OUTPUT,
+  METRIC_DOUBLES,
   READ_REVISION_SQL,
   RpcError,
   STATS_CACHE_URL,
+  ALERT_CRON,
+  ALERT_FROM,
+  ALERT_TO,
+  AI_STATUS_MIN_SAMPLE,
+  alertWindow,
   archiveEvent,
   assembleStats,
   assertAllowedDownloadUrl,
   buildAttachmentKey,
   buildFailureInsert,
+  buildAiStatusRatioQuery,
+  buildAlertEmail,
   buildGetQuery,
   buildHealthQuery,
+  buildIngestFailureCountQuery,
+  buildInvocationLog,
+  buildMetricPoint,
   buildInsertQuery,
   buildListQuery,
   buildSearchQuery,
   buildStatsQueries,
   canonicalBound,
   canonicalCacheRecord,
+  collectAlertSignals,
+  estimateNeurons,
+  eventLagMs,
   decodeWebhookSecret,
   emailCacheDecision,
   getEmailCacheUrl,
   handleFetch,
   handleMcpRpc,
   handleQueue,
+  handleScheduled,
   buildSummaryMessages,
   EMAIL_DELIM_END,
   EMAIL_DELIM_START,
@@ -940,6 +957,15 @@ test("wrangler keeps production and staging queues apart", () => {
   assert.equal(retryDelaySeconds(1), 60);
   assert.equal(retryDelaySeconds(2), 120);
   assert.equal(retryDelaySeconds(3), 240);
+  assert.equal(ALERT_CRON, "20 1 * * *");
+  assert.match(prod, /\[observability\]\nenabled = true\nhead_sampling_rate = 1/);
+  assert.match(prod, /binding = "METRICS"\ndataset = "mail_metrics"/);
+  assert.match(prod, /\[triggers\]\ncrons = \["20 1 \* \* \*"\]/);
+  assert.equal(prod.includes("mail_metrics_staging"), false);
+  assert.match(staging, /\[env\.staging\.observability\]\nenabled = true\nhead_sampling_rate = 1/);
+  assert.match(staging, /dataset = "mail_metrics_staging"/);
+  assert.match(staging, /\[env\.staging\.triggers\]\ncrons = \["20 1 \* \* \*"\]/);
+  assert.equal(staging.includes('dataset = "mail_metrics"\n'), false);
 });
 
 function receivedEmailResponse(status = 200) {
@@ -1241,6 +1267,7 @@ test("overlapping archive attempts still leave one email row", async () => {
 test("worker queue handler is exported", async () => {
   assert.equal(typeof worker.fetch, "function");
   assert.equal(typeof worker.queue, "function");
+  assert.equal(typeof worker.scheduled, "function");
   const { env } = sqliteEnv();
   await worker.queue({ queue: "mail-ingest", messages: [] }, env);
 });
@@ -2503,4 +2530,437 @@ test("a database created before summary gains the column on read", async () => {
   const again = toolValue(await mcpCall(env, toolMessage(2, "get_email", { resend_id: EMAIL_ID }), { nowMs: NOW_MS }));
   assert.equal(again.summary, null);
   assert.equal(again.text_body, "body");
+});
+
+async function captureLogs(fn) {
+  const lines = [];
+  const origLog = console.log;
+  const origErr = console.error;
+  console.log = (...args) => lines.push(["log", args.map(String).join(" ")]);
+  console.error = (...args) => lines.push(["error", args.map(String).join(" ")]);
+  try {
+    return { value: await fn(), lines };
+  } finally {
+    console.log = origLog;
+    console.error = origErr;
+  }
+}
+
+function invokeLogs(lines) {
+  assert.equal(lines.some((entry) => entry[0] === "error"), false);
+  assert.equal(lines.every((entry) => entry[0] === "log"), true);
+  return lines.map((entry) => JSON.parse(entry[1]));
+}
+
+function assertSafeLog(log, needles) {
+  const allowed = new Set([
+    "msg",
+    "stage",
+    "outcome",
+    "wall_ms",
+    "resend_id",
+    "tool",
+    "lag_ms",
+    "cache",
+    "summary_status",
+    "validator_discards",
+    "neurons",
+    "d1",
+    "r2_puts",
+    "enqueued",
+    "error",
+    "alert_sent",
+    "skipped",
+  ]);
+  for (const key of Object.keys(log)) assert.equal(allowed.has(key), true, key);
+  assert.equal(log.msg, "invoke");
+  const text = JSON.stringify(log);
+  for (const needle of needles) assert.equal(text.includes(needle), false, needle);
+}
+
+test("metric points keep stage and outcome low cardinality", () => {
+  assert.equal(LLAMA_8B_NEURONS_PER_MILLION_INPUT, 13778);
+  assert.equal(LLAMA_8B_NEURONS_PER_MILLION_OUTPUT, 26128);
+  assert.equal(estimateNeurons(null), 0);
+  assert.equal(estimateNeurons({}), 0);
+  const neurons = estimateNeurons({ prompt_tokens: 1000, completion_tokens: 50 });
+  assert.equal(neurons, (1000 / 1e6) * LLAMA_8B_NEURONS_PER_MILLION_INPUT + (50 / 1e6) * LLAMA_8B_NEURONS_PER_MILLION_OUTPUT);
+
+  const point = buildMetricPoint({
+    stage: "ingest",
+    outcome: "ok",
+    tool: "get_email\nSUBJECT-NEEDLE",
+    lag_ms: 20676000,
+    wall_ms: 4,
+    neurons,
+    validator_discards: 1,
+    resend_id: EMAIL_ID,
+    subject: "SUBJECT-NEEDLE",
+  });
+  assert.deepEqual(point.indexes, ["ingest"]);
+  assert.deepEqual(point.blobs.slice(0, 3), ["ingest", "ok", ""]);
+  assert.equal(point.blobs[3], METRIC_DOUBLES.join(","));
+  assert.deepEqual(point.doubles, [20676000, 4, -1, neurons, 1]);
+  assert.equal(JSON.stringify(point).includes(EMAIL_ID), false);
+  assert.equal(JSON.stringify(point).includes("SUBJECT-NEEDLE"), false);
+
+  const webhook = buildMetricPoint({ stage: "webhook", outcome: "ok", wall_ms: 1 });
+  assert.equal(webhook.doubles[0], -1);
+  assert.equal(webhook.doubles[2], -1);
+
+  const log = buildInvocationLog({
+    stage: "webhook",
+    outcome: "unauthorized",
+    wall_ms: 2,
+    subject: "SUBJECT-NEEDLE",
+    text_body: "BODY-NEEDLE",
+    html_body: "<p>BODY-NEEDLE</p>",
+    token: "test-mcp-token",
+    signature: "v1,signature-needle",
+    from: "sender-needle@example.com",
+    summary: { points: ["needle-point-one"] },
+    error: "bad_signature",
+    resend_id: "../secret",
+  });
+  assertSafeLog(log, ["SUBJECT-NEEDLE", "BODY-NEEDLE", "test-mcp-token", "signature-needle", "sender-needle", "needle-point-one"]);
+  assert.equal(log.error, "bad_signature");
+  assert.equal("resend_id" in log, false);
+  assert.equal("lag_ms" in log, false);
+  assert.equal(eventLagMs("not-a-date", NOW_MS), null);
+});
+
+test("observability covers webhook, ingest, storage, and summary discards", async () => {
+  const { db, bucket, env, sent } = sqliteEnv();
+  const points = [];
+  env.METRICS = { writeDataPoint(point) { points.push(point); } };
+  let aiCalls = 0;
+  env.AI = {
+    async run() {
+      aiCalls += 1;
+      return { response: "not-json-needle", usage: { prompt_tokens: 1000, completion_tokens: 50 } };
+    },
+  };
+  const subject = "SUBJECT-NEEDLE";
+  const text = "BODY-NEEDLE";
+  const from = "sender-needle@example.com";
+  const eventAt = "2026-09-28T06:15:24.000Z";
+  const headerAt = "2026-09-28T06:15:05.000Z";
+  const fetchImpl = async (url) => {
+    const href = String(url);
+    if (href === `https://api.resend.com/emails/receiving/${EMAIL_ID}`) {
+      return jsonResponse({
+        id: EMAIL_ID,
+        from,
+        to: ["eric@abot.run"],
+        subject,
+        text,
+        html: "<p>BODY-NEEDLE</p>",
+        created_at: eventAt,
+        headers: { date: headerAt },
+        raw: { download_url: "https://cdn.resend.app/raw" },
+      });
+    }
+    if (href === "https://cdn.resend.app/raw") return new Response("raw-needle", { status: 200 });
+    if (href.startsWith(`https://api.resend.com/emails/receiving/${EMAIL_ID}/attachments`)) {
+      return jsonResponse({ has_more: false, data: [] });
+    }
+    throw new Error(`unexpected fetch ${href}`);
+  };
+  const event = { type: "email.received", created_at: eventAt, data: { email_id: EMAIL_ID, subject, from } };
+  const raw = JSON.stringify(event);
+  const ts = freshTimestamp();
+  const signature = sign("msg_obs", ts, raw);
+  const needles = [subject, text, from, "not-json-needle", "raw-needle", signature, WEBHOOK_SECRET, "test-resend-key", "test-mcp-token"];
+
+  const webhook = await captureLogs(() =>
+    handleFetch(
+      new Request("https://example.test/", {
+        method: "POST",
+        headers: { "svix-id": "msg_obs", "svix-timestamp": ts, "svix-signature": signature },
+        body: raw,
+      }),
+      env,
+      { fetch: fetchImpl, nowMs: NOW_MS },
+    ),
+  );
+  assert.equal(webhook.value.status, 200);
+  assert.deepEqual(await webhook.value.json(), { ok: true, queued: true });
+  const webhookLogs = invokeLogs(webhook.lines);
+  assert.equal(webhookLogs.length, 1);
+  assert.equal(points.length, 1);
+  assertSafeLog(webhookLogs[0], needles);
+  assert.equal(webhookLogs[0].stage, "webhook");
+  assert.equal(webhookLogs[0].outcome, "ok");
+  assert.equal(webhookLogs[0].enqueued, true);
+  assert.equal(webhookLogs[0].resend_id, EMAIL_ID);
+  assert.equal("lag_ms" in webhookLogs[0], false);
+  assert.equal(points[0].indexes[0], "webhook");
+  assert.equal(points[0].blobs[1], "ok");
+  assert.equal(points[0].doubles[0], -1);
+  assert.deepEqual(sent[0], {
+    resend_id: EMAIL_ID,
+    event_type: "email.received",
+    received_at: eventAt,
+    svix_id: "msg_obs",
+  });
+
+  const message = queueMessage(sent[0], 1);
+  const ingested = await captureLogs(() =>
+    handleQueue({ queue: "mail-ingest", messages: [message] }, env, { fetch: fetchImpl, nowMs: NOW_MS }),
+  );
+  assert.deepEqual(message.ops, [{ op: "ack" }]);
+  const ingestLogs = invokeLogs(ingested.lines);
+  assert.equal(ingestLogs.length, 1);
+  assert.equal(points.length, 2);
+  assertSafeLog(ingestLogs[0], needles);
+  assert.equal(ingestLogs[0].stage, "ingest");
+  assert.equal(ingestLogs[0].outcome, "ok");
+  assert.equal(ingestLogs[0].resend_id, EMAIL_ID);
+  assert.equal(ingestLogs[0].d1, "inserted");
+  assert.equal(ingestLogs[0].r2_puts, 1);
+  assert.equal(ingestLogs[0].summary_status, "discarded");
+  assert.equal(ingestLogs[0].validator_discards, 1);
+  assert.equal(ingestLogs[0].neurons, estimateNeurons({ prompt_tokens: 1000, completion_tokens: 50 }));
+  assert.equal(ingestLogs[0].lag_ms, eventLagMs(eventAt, NOW_MS));
+  assert.notEqual(ingestLogs[0].lag_ms, eventLagMs(headerAt, NOW_MS));
+  assert.equal(points[1].blobs[0], "ingest");
+  assert.equal(points[1].blobs[1], "ok");
+  assert.equal(points[1].doubles[0], ingestLogs[0].lag_ms);
+  assert.equal(points[1].doubles[4], 1);
+  assert.equal(aiCalls, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 1);
+  assert.equal(db.prepare("SELECT summary FROM emails").get().summary, null);
+  assert.equal(db.prepare("SELECT text_body FROM emails").get().text_body, text);
+  assert.ok(bucket.has(`raw/${EMAIL_ID}.eml`));
+
+  const replay = queueMessage(sent[0], 1);
+  const duplicate = await captureLogs(() =>
+    handleQueue({ queue: "mail-ingest", messages: [replay] }, env, { fetch: fetchImpl, nowMs: NOW_MS }),
+  );
+  const duplicateLogs = invokeLogs(duplicate.lines);
+  assert.equal(duplicateLogs.length, 1);
+  assert.equal(duplicateLogs[0].outcome, "duplicate");
+  assert.equal(duplicateLogs[0].d1, "duplicate");
+  assert.equal(duplicateLogs[0].r2_puts, 0);
+  assert.equal("summary_status" in duplicateLogs[0], false);
+  assert.equal(aiCalls, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 1);
+
+  const health = await captureLogs(() => handleFetch(new Request("https://example.test/health"), env, { nowMs: NOW_MS }));
+  const healthBody = await health.value.json();
+  assert.equal(health.value.status, 200);
+  assert.deepEqual(Object.keys(healthBody).sort(), ["count_24h", "last_received_at", "ok"]);
+  const healthLogs = invokeLogs(health.lines);
+  assert.equal(healthLogs.length, 1);
+  assert.equal(healthLogs[0].stage, "health");
+  assert.equal(healthLogs[0].outcome, "ok");
+  assertSafeLog(healthLogs[0], needles);
+});
+
+test("mcp reads record cache, fresh, and a filled summary without logging it", async () => {
+  const { db, env } = sqliteEnv();
+  const points = [];
+  env.METRICS = { writeDataPoint(point) { points.push(point); } };
+  db.prepare(
+    "INSERT INTO emails (resend_id, direction, subject, text_body, msg_from, msg_to, cc, attachments, date) VALUES (?, 'in', 'SUBJECT-NEEDLE', 'BODY-NEEDLE', 'sender-needle@example.com', '[]', '[]', '[]', '2026-09-28T00:00:00.000Z')",
+  ).run(EMAIL_ID);
+  env.AI = {
+    async run() {
+      return {
+        response: JSON.stringify({ points: ["needle-point-one", "needle-point-two"], todos: [] }),
+        usage: { prompt_tokens: 10, completion_tokens: 4 },
+      };
+    },
+  };
+  const cache = memoryCache();
+  const needles = ["SUBJECT-NEEDLE", "BODY-NEEDLE", "sender-needle@example.com", "needle-point-one", "test-mcp-token"];
+  const deps = { nowMs: NOW_MS, cache };
+
+  const denied = await captureLogs(() =>
+    handleFetch(
+      new Request("https://example.test/mcp", {
+        method: "POST",
+        headers: { authorization: "Bearer test-mcp-token-nope", "content-type": "application/json" },
+        body: "{}",
+      }),
+      env,
+      deps,
+    ),
+  );
+  assert.equal(denied.value.status, 401);
+  const deniedLogs = invokeLogs(denied.lines);
+  assert.equal(deniedLogs[0].stage, "mcp");
+  assert.equal(deniedLogs[0].outcome, "unauthorized");
+  assert.equal("cache" in deniedLogs[0], false);
+  assert.equal("tool" in deniedLogs[0], false);
+  assertSafeLog(deniedLogs[0], needles);
+  assert.equal(cache.puts.length, 0);
+
+  const first = await captureLogs(() => mcpCall(env, toolMessage(1, "get_email", { resend_id: EMAIL_ID }), deps));
+  const detail = toolValue(first.value);
+  assert.deepEqual(detail.summary.points, ["needle-point-one", "needle-point-two"]);
+  assert.equal(detail.text_body, "BODY-NEEDLE");
+  const firstLogs = invokeLogs(first.lines);
+  assert.equal(firstLogs.length, 1);
+  assertSafeLog(firstLogs[0], needles);
+  assert.equal(firstLogs[0].tool, "get_email");
+  assert.equal(firstLogs[0].outcome, "ok");
+  assert.equal(firstLogs[0].cache, 0);
+  assert.equal(firstLogs[0].summary_status, "ok");
+  assert.equal(firstLogs[0].validator_discards, 0);
+  assert.equal(firstLogs[0].resend_id, EMAIL_ID);
+  assert.equal(points.at(-1).blobs[2], "get_email");
+  assert.equal(points.at(-1).doubles[2], 0);
+
+  const second = await captureLogs(() => mcpCall(env, toolMessage(2, "get_email", { resend_id: EMAIL_ID }), deps));
+  assert.equal(toolValue(second.value).summary.points[0], "needle-point-one");
+  const secondLogs = invokeLogs(second.lines);
+  assert.equal(secondLogs[0].cache, 1);
+  assert.equal("summary_status" in secondLogs[0], false);
+  assert.equal(points.at(-1).doubles[2], 1);
+
+  const fresh = await captureLogs(() =>
+    mcpCall(env, toolMessage(3, "get_email", { resend_id: EMAIL_ID, fresh: true }), deps),
+  );
+  assert.equal(toolValue(fresh.value).found, true);
+  const freshLogs = invokeLogs(fresh.lines);
+  assert.equal(freshLogs[0].outcome, "fresh");
+  assert.equal("cache" in freshLogs[0], false);
+  assert.equal(points.at(-1).blobs[1], "fresh");
+  assert.equal(points.at(-1).doubles[2], -1);
+});
+
+test("alert cron stays quiet under the threshold and emails when D1 checks trip", async () => {
+  const { db, env } = sqliteEnv();
+  const points = [];
+  env.METRICS = { writeDataPoint(point) { points.push(point); } };
+  env.ALERT_TO = "alerts@example.test";
+  env.ALERT_FROM = "abot-mail <alerts@example.test>";
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url: String(url), init });
+    return jsonResponse({ id: "email_1" });
+  };
+  const quietSql = instrumentDb(env);
+  const quiet = await captureLogs(() => handleScheduled({ scheduledTime: NOW_MS }, env, { nowMs: NOW_MS, fetch: fetchImpl }));
+  assert.deepEqual(quiet.value, { sent: false, breaches: [] });
+  assert.equal(calls.length, 0);
+  const quietLogs = invokeLogs(quiet.lines);
+  assert.equal(quietLogs.length, 1);
+  assert.equal(quietLogs[0].stage, "alert");
+  assert.equal(quietLogs[0].outcome, "ok");
+  assert.equal(quietLogs[0].alert_sent, false);
+  assert.equal(quietLogs[0].skipped.includes("ai_status"), true);
+  assert.equal(quietLogs[0].skipped.includes("stats_daily"), true);
+  assert.equal(quietLogs[0].skipped.includes("ingest_failures"), false);
+  assert.equal(quietSql.sqls.some((sql) => sql.includes("ai_status IN")), false);
+  assert.equal(quietSql.sqls.some((sql) => sql.includes("FROM stats_daily")), false);
+  assert.equal(quietSql.sqls.some((sql) => sql.includes("FROM ingest_failures")), true);
+  assert.equal(points.at(-1).indexes[0], "alert");
+
+  db.prepare("INSERT INTO ingest_failures (resend_id, event_type, error, attempts, failed_at) VALUES (?, ?, ?, ?, ?)").run(
+    EMAIL_ID,
+    "email.received",
+    "leak-this-body secret@hidden.example",
+    4,
+    new Date(NOW_MS - 60 * 1000).toISOString(),
+  );
+  db.prepare("INSERT INTO ingest_failures (resend_id, event_type, error, attempts, failed_at) VALUES (?, ?, ?, ?, ?)").run(
+    "old-failure",
+    "email.received",
+    "stale",
+    1,
+    new Date(NOW_MS - 25 * 60 * 60 * 1000).toISOString(),
+  );
+  const alerted = await captureLogs(() => handleScheduled({ scheduledTime: NOW_MS }, env, { nowMs: NOW_MS, fetch: fetchImpl }));
+  assert.deepEqual(alerted.value, { sent: true, breaches: ["ingest_failures"] });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://api.resend.com/emails");
+  const payload = JSON.parse(calls[0].init.body);
+  assert.equal(payload.from, env.ALERT_FROM);
+  assert.deepEqual(payload.to, [env.ALERT_TO]);
+  assert.equal(payload.subject, "abot-mail alert");
+  assert.equal(payload.text, "threshold crossed\ningest_failures 1\n");
+  assert.equal(payload.text.includes("leak-this-body"), false);
+  assert.equal(payload.text.includes("secret@hidden.example"), false);
+  assert.equal(payload.text.includes(EMAIL_ID), false);
+  const alertLogs = invokeLogs(alerted.lines);
+  assert.equal(alertLogs[0].alert_sent, true);
+  assertSafeLog(alertLogs[0], ["leak-this-body", "secret@hidden.example", "test-resend-key", EMAIL_ID]);
+  assert.equal(calls[0].init.headers.Authorization, "Bearer test-resend-key");
+
+  db.exec("ALTER TABLE emails ADD COLUMN ai_status TEXT");
+  assert.equal(AI_STATUS_MIN_SAMPLE, 5);
+  const recent = new Date(NOW_MS - 60 * 1000).toISOString();
+  const outside = new Date(NOW_MS - 25 * 60 * 60 * 1000).toISOString();
+  for (let i = 0; i < AI_STATUS_MIN_SAMPLE - 1; i += 1) {
+    db.prepare("INSERT INTO emails (resend_id, direction, created_at, ai_status) VALUES (?, 'in', ?, ?)").run(
+      `small-${i}`,
+      recent,
+      i === 0 ? "deferred" : "failed",
+    );
+  }
+  const small = await collectAlertSignals(env, NOW_MS);
+  const smallAi = small.signals.find((signal) => signal.name === "ai_status");
+  assert.equal(smallAi.value, 1);
+  assert.equal(smallAi.breached, false);
+
+  for (let i = 0; i < 5; i += 1) {
+    db.prepare("INSERT INTO emails (resend_id, direction, created_at, ai_status) VALUES (?, 'in', ?, 'failed')").run(
+      `old-bad-${i}`,
+      outside,
+    );
+  }
+  const stale = await collectAlertSignals(env, NOW_MS);
+  const staleAi = stale.signals.find((signal) => signal.name === "ai_status");
+  assert.equal(staleAi.value, 1);
+  assert.equal(staleAi.breached, false);
+
+  db.prepare("INSERT INTO emails (resend_id, direction, created_at, ai_status) VALUES ('ok-enough', 'in', ?, 'ok')").run(recent);
+  db.prepare("INSERT INTO emails (resend_id, direction, created_at, ai_status) VALUES ('not-attempted', 'in', ?, NULL)").run(recent);
+  db.exec("CREATE TABLE stats_daily (day TEXT PRIMARY KEY, inbound INTEGER NOT NULL, outbound INTEGER NOT NULL)");
+  db.prepare("INSERT INTO stats_daily (day, inbound, outbound) VALUES ('2026-09-27', 3, 1)").run();
+  calls.length = 0;
+  const both = await captureLogs(() => handleScheduled({ scheduledTime: NOW_MS }, env, { nowMs: NOW_MS, fetch: fetchImpl }));
+  assert.deepEqual(both.value.breaches, ["ingest_failures", "ai_status"]);
+  assert.equal(JSON.parse(calls[0].init.body).text, `threshold crossed\ningest_failures 1\nai_status ${4 / 5}\n`);
+  const window = alertWindow(NOW_MS);
+  const ratio = buildAiStatusRatioQuery(window.start, window.end);
+  assert.equal(ratio.sql.includes("ai_status"), true);
+  assert.equal(ratio.sql.includes("created_at < ?"), true);
+  assert.deepEqual(ratio.params, [window.start, window.end]);
+  const failureQuery = buildIngestFailureCountQuery("a", "b");
+  assert.deepEqual(failureQuery.params, ["a", "b"]);
+  const report = await collectAlertSignals(env, NOW_MS);
+  assert.equal(report.signals.some((signal) => signal.name === "stats_daily" && signal.breached === false && signal.value === 4), true);
+  assert.equal(buildAlertEmail({ breaches: [] }, env).text, "threshold crossed\n\n");
+  assert.equal(ALERT_TO, "eric@abot.run");
+  assert.match(ALERT_FROM, /alerts@abot\.run/);
+});
+
+test("one alert query failure does not drop breaches from the others", async () => {
+  const { db, env } = sqliteEnv();
+  db.prepare("INSERT INTO ingest_failures (resend_id, event_type, error, attempts, failed_at) VALUES (?, ?, ?, ?, ?)").run(
+    "fail-row",
+    "email.received",
+    "x",
+    1,
+    new Date(NOW_MS - 60 * 1000).toISOString(),
+  );
+  db.exec("ALTER TABLE emails ADD COLUMN ai_status TEXT");
+  db.exec("CREATE TABLE stats_daily (day TEXT PRIMARY KEY, inbound INTEGER NOT NULL, outbound INTEGER NOT NULL)");
+  db.prepare("INSERT INTO stats_daily (day, inbound, outbound) VALUES ('2026-09-27', 2, 2)").run();
+  const orig = env.DB.prepare.bind(env.DB);
+  env.DB.prepare = (sql) => {
+    if (String(sql).includes("ai_status IN")) throw new Error("ai_status query failed");
+    return orig(sql);
+  };
+  const report = await collectAlertSignals(env, NOW_MS);
+  assert.deepEqual(
+    report.breaches.map((signal) => signal.name),
+    ["ingest_failures"],
+  );
+  assert.equal(report.skipped.includes("ai_status"), true);
+  assert.equal(report.signals.some((signal) => signal.name === "count_24h"), true);
+  assert.equal(report.signals.some((signal) => signal.name === "stats_daily" && signal.value === 4), true);
 });
