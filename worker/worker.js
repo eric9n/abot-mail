@@ -1823,6 +1823,7 @@ export function buildInvocationLog(fields) {
   if (fields && SAFE_LOG_ERRORS.has(fields.error)) log.error = fields.error;
   if (fields && typeof fields.alert_sent === "boolean") log.alert_sent = fields.alert_sent;
   if (fields && typeof fields.skipped === "string" && /^[a-z0-9_,]+$/.test(fields.skipped)) log.skipped = fields.skipped;
+  if (fields && typeof fields.breaches === "string" && /^[a-z0-9_,]+$/.test(fields.breaches)) log.breaches = fields.breaches;
   return log;
 }
 
@@ -1988,10 +1989,15 @@ export async function handleScheduled(event, env, deps = {}) {
   try {
     const report = await collectAlertSignals(env, nowMs);
     if (report.skipped.length) trace.skipped = report.skipped.join(",");
-    if (report.breaches.length === 0) return { sent: false, breaches: [] };
+    const breachNames = report.breaches.map((signal) => signal.name);
+    if (breachNames.length === 0) return { sent: false, breaches: [] };
+    if (env && env.ALERT_ENABLED === "false") {
+      trace.breaches = breachNames.join(",");
+      return { sent: false, breaches: breachNames };
+    }
     await sendAlertEmail(env, buildAlertEmail(report, env), deps.fetch);
     trace.alert_sent = true;
-    return { sent: true, breaches: report.breaches.map((signal) => signal.name) };
+    return { sent: true, breaches: breachNames };
   } catch (err) {
     trace.outcome = "error";
     trace.error = "alert_failed";

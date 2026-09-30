@@ -2571,6 +2571,7 @@ function assertSafeLog(log, needles) {
     "error",
     "alert_sent",
     "skipped",
+    "breaches",
   ]);
   for (const key of Object.keys(log)) assert.equal(allowed.has(key), true, key);
   assert.equal(log.msg, "invoke");
@@ -2936,6 +2937,66 @@ test("alert cron stays quiet under the threshold and emails when D1 checks trip"
   assert.equal(buildAlertEmail({ breaches: [] }, env).text, "threshold crossed\n\n");
   assert.equal(ALERT_TO, "eric@abot.run");
   assert.match(ALERT_FROM, /alerts@abot\.run/);
+});
+
+function insertRecentIngestFailure(db) {
+  db.prepare("INSERT INTO ingest_failures (resend_id, event_type, error, attempts, failed_at) VALUES (?, ?, ?, ?, ?)").run(
+    EMAIL_ID,
+    "email.received",
+    "leak-this-body secret@hidden.example",
+    4,
+    new Date(NOW_MS - 60 * 1000).toISOString(),
+  );
+}
+
+test("alert cron records the breach and skips email when ALERT_ENABLED is false", async () => {
+  const { db, env } = sqliteEnv();
+  const points = [];
+  env.METRICS = { writeDataPoint(point) { points.push(point); } };
+  env.ALERT_ENABLED = "false";
+  env.ALERT_TO = "alerts@example.test";
+  env.ALERT_FROM = "abot-mail <alerts@example.test>";
+  insertRecentIngestFailure(db);
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url: String(url), init });
+    return jsonResponse({ id: "email_1" });
+  };
+  const silenced = await captureLogs(() => handleScheduled({ scheduledTime: NOW_MS }, env, { nowMs: NOW_MS, fetch: fetchImpl }));
+  assert.deepEqual(silenced.value, { sent: false, breaches: ["ingest_failures"] });
+  assert.equal(calls.length, 0);
+  const logs = invokeLogs(silenced.lines);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].stage, "alert");
+  assert.equal(logs[0].outcome, "ok");
+  assert.equal(logs[0].alert_sent, false);
+  assert.equal(logs[0].breaches, "ingest_failures");
+  assertSafeLog(logs[0], ["leak-this-body", "secret@hidden.example", "test-resend-key", EMAIL_ID]);
+  assert.equal(points.length, 1);
+  assert.equal(points[0].indexes[0], "alert");
+  assert.equal(points[0].blobs[1], "ok");
+});
+
+test("alert cron emails a breach when ALERT_ENABLED is unset", async () => {
+  const { db, env } = sqliteEnv();
+  assert.equal(env.ALERT_ENABLED, undefined);
+  insertRecentIngestFailure(db);
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url: String(url), init });
+    return jsonResponse({ id: "email_1" });
+  };
+  const alerted = await captureLogs(() => handleScheduled({ scheduledTime: NOW_MS }, env, { nowMs: NOW_MS, fetch: fetchImpl }));
+  assert.deepEqual(alerted.value, { sent: true, breaches: ["ingest_failures"] });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://api.resend.com/emails");
+  const payload = JSON.parse(calls[0].init.body);
+  assert.equal(payload.subject, "abot-mail alert");
+  assert.equal(payload.text, "threshold crossed\ningest_failures 1\n");
+  const logs = invokeLogs(alerted.lines);
+  assert.equal(logs[0].alert_sent, true);
+  assert.equal("breaches" in logs[0], false);
+  assertSafeLog(logs[0], ["leak-this-body", "secret@hidden.example", "test-resend-key", EMAIL_ID]);
 });
 
 test("one alert query failure does not drop breaches from the others", async () => {
