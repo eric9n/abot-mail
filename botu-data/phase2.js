@@ -396,6 +396,41 @@ export function createPhase2(api) {
     return value;
   }
 
+  function requireAudience(value) {
+    if (value !== "bot" && value !== "user") throw new RpcError(-32602, "audience is invalid");
+    return value;
+  }
+
+  function readEmitAudience(args) {
+    if (!has(args, "audience")) return "bot";
+    return requireAudience(args.audience);
+  }
+
+  function readPollAudience(args) {
+    if (!has(args, "audience")) return null;
+    return requireAudience(args.audience);
+  }
+
+  async function ensureAudienceColumn(deps) {
+    const rows = await queryAll(
+      deps,
+      "SELECT name FROM pragma_table_info('events') WHERE name = 'audience'",
+      [],
+    );
+    if (rows.length > 0) return;
+    try {
+      await queryRun(
+        deps,
+        "ALTER TABLE events ADD COLUMN audience TEXT NOT NULL DEFAULT 'bot' CHECK(audience IN ('bot','user'))",
+        [],
+      );
+    } catch (err) {
+      const message = err && err.message ? String(err.message) : String(err);
+      if (/duplicate column/i.test(message)) return;
+      throw err;
+    }
+  }
+
   function readNotBefore(value, nowMs) {
     if (value == null) return new Date(nowMs).toISOString();
     const iso = canonicalUtc(value, "not_before");
@@ -512,16 +547,18 @@ export function createPhase2(api) {
   async function insertBusEvent(deps, spec) {
     const now = nowIso(deps);
     const notBefore = spec.notBefore || now;
+    const audience = spec.audience == null ? "bot" : spec.audience;
+    await ensureAudienceColumn(deps);
     for (let attempt = 0; attempt < 5; attempt++) {
       const id = newId("evt_");
       try {
         const result = await queryRun(
           deps,
           `INSERT INTO events (
-            id, type, payload, status, dedupe_key, created_at, not_before, source, updated_at
-          ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+            id, type, payload, status, dedupe_key, created_at, not_before, source, updated_at, audience
+          ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
           ON CONFLICT(dedupe_key) WHERE status = 'pending' DO NOTHING`,
-          [id, spec.type, spec.payloadText, spec.dedupeKey, now, notBefore, spec.source, now],
+          [id, spec.type, spec.payloadText, spec.dedupeKey, now, notBefore, spec.source, now, audience],
         );
         if (changesOf(result) === 0) {
           const existing = await queryFirst(
@@ -544,13 +581,17 @@ export function createPhase2(api) {
     throw new Error("id entropy exhausted");
   }
 
-  async function listVisible(deps, now, { after, beforeOrEqual, expiredLeaseOnly, limit }) {
+  async function listVisible(deps, now, { after, beforeOrEqual, expiredLeaseOnly, limit, audience }) {
     const where = [
       "status = 'pending'",
       "not_before <= ?",
       "(leased_until IS NULL OR leased_until <= ?)",
     ];
     const params = [now, now];
+    if (audience) {
+      where.push("audience = ?");
+      params.push(audience);
+    }
     if (expiredLeaseOnly) where.push("leased_until IS NOT NULL");
     if (beforeOrEqual) {
       where.push("(created_at < ? OR (created_at = ? AND id <= ?))");
@@ -572,35 +613,36 @@ LIMIT ?`,
     );
   }
 
-  async function scanVisible(deps, now, cursor) {
+  async function scanVisible(deps, now, cursor, audience) {
     if (!cursor) {
-      const fetched = await listVisible(deps, now, { limit: SCAN_LIMIT + 1 });
+      const fetched = await listVisible(deps, now, { limit: SCAN_LIMIT + 1, audience });
       return { scanned: fetched.slice(0, SCAN_LIMIT), moreUnseen: fetched.length > SCAN_LIMIT };
     }
     const before = await listVisible(deps, now, {
       beforeOrEqual: cursor,
       expiredLeaseOnly: true,
       limit: SCAN_LIMIT + 1,
+      audience,
     });
     if (before.length > SCAN_LIMIT) {
       return { scanned: before.slice(0, SCAN_LIMIT), moreUnseen: true };
     }
     if (before.length === SCAN_LIMIT) {
-      const peek = await listVisible(deps, now, { after: cursor, limit: 1 });
+      const peek = await listVisible(deps, now, { after: cursor, limit: 1, audience });
       return { scanned: before, moreUnseen: peek.length > 0 };
     }
     const room = SCAN_LIMIT - before.length;
-    const after = await listVisible(deps, now, { after: cursor, limit: room + 1 });
+    const after = await listVisible(deps, now, { after: cursor, limit: room + 1, audience });
     return {
       scanned: before.concat(after.slice(0, room)),
       moreUnseen: after.length > room,
     };
   }
 
-  async function existsMatchingAfter(deps, now, filters, tuple) {
+  async function existsMatchingAfter(deps, now, filters, tuple, audience) {
     let after = tuple;
     for (let hop = 0; hop < 20; hop++) {
-      const rows = await listVisible(deps, now, { after, limit: SCAN_LIMIT });
+      const rows = await listVisible(deps, now, { after, limit: SCAN_LIMIT, audience });
       if (!rows.length) return false;
       for (const row of rows) {
         if (eventTypeMatches(row.type, filters)) return true;
@@ -612,12 +654,14 @@ LIMIT ?`,
     return true;
   }
 
-  async function retryAfterSeconds(deps, now, filters) {
+  async function retryAfterSeconds(deps, now, filters, audience) {
+    const audienceSql = audience ? " AND audience = ?" : "";
+    const params = audience ? [now, now, audience] : [now, now];
     const rows = await queryAll(
       deps,
       `SELECT type, leased_until FROM events
-WHERE status = 'pending' AND not_before <= ? AND leased_until IS NOT NULL AND leased_until > ?`,
-      [now, now],
+WHERE status = 'pending' AND not_before <= ? AND leased_until IS NOT NULL AND leased_until > ?${audienceSql}`,
+      params,
     );
     let best = null;
     for (const row of rows) {
@@ -659,12 +703,13 @@ FROM subscriptions`;
 
   async function pollEvents(args, deps) {
     requireArgs(args);
-    assertOnlyKeys(args, new Set(["subscription_id", "cursor", "limit", "visibility_seconds"]));
+    assertOnlyKeys(args, new Set(["subscription_id", "cursor", "limit", "visibility_seconds", "audience"]));
     if (typeof args.subscription_id !== "string" || !/^sub_[a-z0-9]{12}$/.test(args.subscription_id)) {
       throw new RpcError(-32602, "subscription_id is required");
     }
     const limit = clampLimit(args.limit, 20, 100);
     const visibility = readVisibility(args.visibility_seconds);
+    const audience = readPollAudience(args);
     const cursor = decodeCursor(has(args, "cursor") ? args.cursor : null);
     const sub = await queryFirst(deps, `${SUB_VIEW_SQL} WHERE id = ?`, [args.subscription_id]);
     if (!sub) throw notFound();
@@ -672,7 +717,8 @@ FROM subscriptions`;
     if (sub.mode !== "poll" && sub.mode !== "webhook") throw notFound();
     const filters = parseFilters(sub.event_types);
     const now = nowIso(deps);
-    const scanned = await scanVisible(deps, now, cursor.value);
+    if (audience) await ensureAudienceColumn(deps);
+    const scanned = await scanVisible(deps, now, cursor.value, audience);
     const matches = [];
     let lastScanned = null;
     for (const row of scanned.scanned) {
@@ -714,13 +760,13 @@ WHERE id = ? AND status = 'pending' AND not_before <= ? AND (leased_until IS NUL
     if (hitScanCap) hasMore = true;
     else if (events.length === limit) {
       const last = events[events.length - 1];
-      hasMore = await existsMatchingAfter(deps, now, filters, { created_at: last.created_at, id: last.id });
+      hasMore = await existsMatchingAfter(deps, now, filters, { created_at: last.created_at, id: last.id }, audience);
     }
     let nextCursor = null;
     if (hitScanCap) nextCursor = encodeCursor(lastScanned.created_at, lastScanned.id);
     else if (events.length) nextCursor = encodeCursor(events[events.length - 1].created_at, events[events.length - 1].id);
     else nextCursor = cursor.raw;
-    const retry = events.length === 0 && !hasMore ? await retryAfterSeconds(deps, now, filters) : 0;
+    const retry = events.length === 0 && !hasMore ? await retryAfterSeconds(deps, now, filters, audience) : 0;
     return { events, next_cursor: nextCursor, has_more: hasMore, retry_after_seconds: retry };
   }
 
@@ -777,12 +823,13 @@ ON CONFLICT(agent_id) DO UPDATE SET
 
   async function emitEvent(args, deps) {
     requireArgs(args);
-    assertOnlyKeys(args, new Set(["type", "dedupe_key", "payload", "not_before"]));
+    assertOnlyKeys(args, new Set(["type", "dedupe_key", "payload", "not_before", "audience"]));
     const type = assertEmitType(args.type);
     const dedupeKey = assertEmitDedupe(args.dedupe_key);
     const payloadText = serialize(has(args, "payload") ? args.payload : {});
     const notBefore = readNotBefore(has(args, "not_before") ? args.not_before : null, nowMsOf(deps));
-    return insertBusEvent(deps, { type, dedupeKey, payloadText, notBefore, source: "emit" });
+    const audience = readEmitAudience(args);
+    return insertBusEvent(deps, { type, dedupeKey, payloadText, notBefore, source: "emit", audience });
   }
 
   async function createSubscription(args, deps) {
@@ -1323,7 +1370,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     {
       name: "poll_events",
       description:
-        "按订阅认领可见的 pending 事件。cursor 只翻页，不表示完成。返回 events、next_cursor、has_more、retry_after_seconds。",
+        "按订阅认领可见的 pending 事件。cursor 只翻页，不表示完成。返回 events、next_cursor、has_more、retry_after_seconds。传入 audience 时只返回该受众，不传则返回全部。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1331,6 +1378,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
           cursor: { type: "string" },
           limit: { type: "integer", minimum: 1, maximum: 100, default: 20 },
           visibility_seconds: { type: "integer", minimum: 30, maximum: 900, default: 120 },
+          audience: { type: "string", enum: ["bot", "user"] },
         },
         required: ["subscription_id"],
         additionalProperties: false,
@@ -1363,7 +1411,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
     },
     {
       name: "emit_event",
-      description: "写入一条总线事件。拒绝 watchdog.* 和 calendar.due。新插入成功才扇出 webhook。",
+      description: "写入一条总线事件。拒绝 watchdog.* 和 calendar.due。新插入成功才扇出 webhook。audience 可选，只能是 bot 或 user，默认 bot。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1371,6 +1419,7 @@ WHERE id = ? AND state NOT IN ('succeeded', 'dead')`,
           dedupe_key: { type: "string" },
           payload: { type: "object" },
           not_before: { type: "string" },
+          audience: { type: "string", enum: ["bot", "user"], default: "bot" },
         },
         required: ["type", "dedupe_key"],
         additionalProperties: false,
