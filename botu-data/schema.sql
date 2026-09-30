@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS events (
   lease_token TEXT,
   poll_count INTEGER NOT NULL DEFAULT 0,
   source TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  audience TEXT NOT NULL DEFAULT 'bot' CHECK(audience IN ('bot','user'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe_open
   ON events(dedupe_key) WHERE status = 'pending';

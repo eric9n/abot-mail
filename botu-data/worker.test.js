@@ -954,6 +954,118 @@ test("emit_event rejects watchdog types and calendar.due without writing", async
   assert.equal(countOf(db, "events"), 0);
 });
 
+test("audience defaults to bot, accepts user, rejects invalid values, and filters poll", async () => {
+  const { db, env } = sqliteEnv();
+  const sub = unwrap(await mcp(env, "create_subscription", { mode: "poll", event_types: ["*"] }));
+  const implicit = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: "reminder.medication:implicit",
+    }),
+  );
+  assert.equal(db.prepare("SELECT audience FROM events WHERE id = ?").get(implicit.id).audience, "bot");
+  const explicit = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: "reminder.medication:explicit-bot",
+      audience: "bot",
+    }),
+  );
+  assert.equal(explicit.created, true);
+  assert.equal(db.prepare("SELECT audience FROM events WHERE id = ?").get(explicit.id).audience, "bot");
+  const user = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.followup",
+      dedupe_key: "reminder.followup:user",
+      audience: "user",
+    }),
+  );
+  assert.equal(user.created, true);
+  assert.equal(db.prepare("SELECT audience FROM events WHERE id = ?").get(user.id).audience, "user");
+  const bad = rpcError(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: "reminder.medication:bad",
+      audience: "human",
+    }),
+  );
+  assert.equal(bad.code, -32602);
+  assert.equal(countOf(db, "events"), 3);
+  const badPoll = rpcError(await mcp(env, "poll_events", { subscription_id: sub.id, audience: "all" }));
+  assert.equal(badPoll.code, -32602);
+
+  const all = unwrap(
+    await mcp(env, "poll_events", { subscription_id: sub.id, visibility_seconds: 30 }),
+  );
+  assert.deepEqual(
+    all.events.map((row) => row.id).sort(),
+    [implicit.id, explicit.id, user.id].sort(),
+  );
+  const later = NOW + 31_000;
+  const onlyUser = unwrap(
+    await mcp(
+      env,
+      "poll_events",
+      { subscription_id: sub.id, audience: "user", visibility_seconds: 30 },
+      { nowMs: later },
+    ),
+  );
+  assert.deepEqual(
+    onlyUser.events.map((row) => row.id),
+    [user.id],
+  );
+  const onlyBot = unwrap(
+    await mcp(
+      env,
+      "poll_events",
+      { subscription_id: sub.id, audience: "bot", visibility_seconds: 30 },
+      { nowMs: later },
+    ),
+  );
+  assert.deepEqual(onlyBot.events.map((row) => row.id).sort(), [implicit.id, explicit.id].sort());
+
+  unwrap(
+    await mcp(env, "create_event", {
+      title: "复诊",
+      start_utc: "2026-09-29T03:00:00.000Z",
+      end_utc: "2026-09-29T04:00:00.000Z",
+    }),
+  );
+  unwrap(await mcp(env, "heartbeat", { ttl_seconds: 120 }, { nowMs: NOW - 200_000 }));
+  await handleScheduled({}, env, { nowMs: NOW });
+  const detected = db.prepare("SELECT type, audience, source FROM events WHERE source = 'detector'").all();
+  assert.equal(detected.length, 2);
+  for (const row of detected) {
+    assert.equal(row.audience, "bot");
+    assert.equal(row.source, "detector");
+  }
+  assert.deepEqual(detected.map((row) => row.type).sort(), ["calendar.due", "watchdog.heartbeat_stale"]);
+
+  db.exec("ALTER TABLE events DROP COLUMN audience");
+  db.prepare(
+    `INSERT INTO events (
+      id, type, payload, status, dedupe_key, created_at, not_before, source, updated_at
+    ) VALUES ('evt_legacyaudien', 'reminder.medication', '{}', 'pending', 'reminder.medication:legacy', ?, ?, 'emit', ?)`,
+  ).run(NOW_ISO, NOW_ISO, NOW_ISO);
+  const migrated = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.followup",
+      dedupe_key: "reminder.followup:after-migrate",
+    }),
+  );
+  assert.equal(db.prepare("SELECT audience FROM events WHERE id = 'evt_legacyaudien'").get().audience, "bot");
+  assert.equal(db.prepare("SELECT audience FROM events WHERE id = ?").get(migrated.id).audience, "bot");
+  const again = unwrap(
+    await mcp(env, "emit_event", {
+      type: "reminder.medication",
+      dedupe_key: "reminder.medication:after-migrate",
+      audience: "user",
+    }),
+  );
+  assert.equal(again.created, true);
+  assert.equal(db.prepare("SELECT audience FROM events WHERE id = ?").get(again.id).audience, "user");
+});
+
 test("payload with a secret key or whsec_ substring is not stored", async () => {
   const { db, env } = sqliteEnv();
   const key = "reminder.medication:a:2026-09-30T00:00:00.000Z";
