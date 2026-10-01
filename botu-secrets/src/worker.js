@@ -348,7 +348,8 @@ function isUniqueError(err) {
 
 function uniqueTarget(err) {
   const match = /UNIQUE constraint failed: ([^\s]+)/i.exec(String(err && err.message));
-  return match ? match[1] : "";
+  // D1 appends ": SQLITE_CONSTRAINT (extended: ...)" so the capture includes a trailing colon.
+  return match ? match[1].replace(/[:;,]+$/, "") : "";
 }
 
 async function queryAll(ctx, sql, params) {

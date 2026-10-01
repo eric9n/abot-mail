@@ -866,3 +866,50 @@ test("generate_secret draws a server-side value once and stores it like put_secr
   }
   assert.equal(countOf(raw, "secrets"), 2);
 });
+
+test("D1 unique-constraint text maps a duplicate name to -32602", async () => {
+  const secretsMessage = "UNIQUE constraint failed: secrets.name: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_UNIQUE)";
+  const botsMessage = "UNIQUE constraint failed: bots.name: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_UNIQUE)";
+
+  function constraintDb(message, insertSql) {
+    let runs = 0;
+    return {
+      runs: () => runs,
+      db: {
+        async queryAll() {
+          return [];
+        },
+        async queryFirst(sql) {
+          if (String(sql).includes("token_hash")) {
+            return { id: "bot_ops000000000", name: "ops", is_ops: 1, revoked: 0 };
+          }
+          return null;
+        },
+        async queryRun(sql) {
+          runs += 1;
+          if (String(sql).startsWith(insertSql)) throw new Error(message);
+          return { success: true, meta: { changes: 1 } };
+        },
+      },
+    };
+  }
+
+  const env = { KEK_B64: KEK };
+  const secrets = constraintDb(secretsMessage, "INSERT INTO secrets");
+  const put = rpcError(await mcp(env, "put_secret", { name: NAME, scope: "payments", value: VALUE }, { db: secrets.db }));
+  assert.equal(put.code, -32602);
+  assert.equal(put.message, "secret already exists");
+  assert.equal(secrets.runs(), 1);
+
+  const generated = constraintDb(secretsMessage, "INSERT INTO secrets");
+  const gen = rpcError(await mcp(env, "generate_secret", { name: NAME, scope: "payments" }, { db: generated.db }));
+  assert.equal(gen.code, -32602);
+  assert.equal(gen.message, "secret already exists");
+  assert.equal(generated.runs(), 1);
+
+  const bots = constraintDb(botsMessage, "INSERT INTO bots");
+  const created = rpcError(await mcp(env, "create_bot", { name: "helper" }, { db: bots.db }));
+  assert.equal(created.code, -32602);
+  assert.equal(created.message, "bot already exists");
+  assert.equal(bots.runs(), 1);
+});
