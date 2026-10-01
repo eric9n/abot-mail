@@ -1,0 +1,8 @@
+{
+  "name": "botu-secrets",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --disable-warning=ExperimentalWarning --test"
+  }
+}
