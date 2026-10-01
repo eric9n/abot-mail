@@ -3,7 +3,7 @@
 - 命令：`cd botu-secrets && npm test`
 - 运行器：Node.js `node:test`（`node --disable-warning=ExperimentalWarning --test`）
 - 日期：2026-10-01
-- 结果：**19 通过 / 19 用例，0 失败，0 跳过**
+- 结果：**20 通过 / 20 用例，0 失败，0 跳过**
 
 D1 用 `node:sqlite` 内存库，包成与生产相同的 `prepare` / `bind` / `all` / `first` / `run` 接口，再经 `d1Deps` 注入。另有一条用例不给 `env.DB`，只注入 `deps.db`。时钟用 `nowMs` 注入。KEK 用测试用的 32 字节固定值，不是部署密钥。
 
@@ -30,6 +30,7 @@ D1 用 `node:sqlite` 内存库，包成与生产相同的 `prepare` / `bind` / `
 | 17 | `revoke_lease`：指定行 `revoked=1`，过期判定为无效；错误 id `-32602` | 通过 |
 | 18 | `audit_log` 按 bot / secret 名（服务端哈希）/ action 过滤；`secret_name_hash` 等于 SHA-256(name)；审计转储里没有明文名和 value | 通过 |
 | 19 | `generate_secret`：默认长度 32 且字符属于默认字符集；自定义 length/alphabet；新 DEK、version=1；明文只在本次响应；库、list、审计都不含明文；无 grant 的 get 与普通 bot 调用均为 `-32003`；有 grant 的 get 能解密；重名 `-32602` | 通过 |
+| 20 | D1 唯一约束原文（`secrets.name:` / `bots.name:` 后接 `SQLITE_CONSTRAINT`）重名时 `put_secret`、`generate_secret` 为 `-32602` secret already exists，`create_bot` 为 `-32602` bot already exists | 通过 |
 
 ## 覆盖的功能点
 
@@ -41,4 +42,5 @@ D1 用 `node:sqlite` 内存库，包成与生产相同的 `prepare` / `bind` / `
 - `revoke_secret` 之后密文行不在，get 返回 `-32602` not found
 - 审计：`put_secret`、`generate_secret`、`get_secret`、`rotate_secret`、`revoke_secret`、`create_bot`、`grant_access`、`revoke_bot`、`revoke_lease` 都有审计行；secret 相关行的 `secret_name_hash` 为 SHA-256 hex；审计中无明文 secret 名、无 value、无 token
 - KEK fail-closed：缺失、非法 base64、长度不是 32 字节都抛错
-- HTTP：域名 `secrets.abot.run`，根路径。未认证 `POST /mcp` 为 401；`GET /health` 为 200 且不鉴权。`/secrets/*` 不再提供服务 |
+- HTTP：域名 `secrets.abot.run`，根路径。未认证 `POST /mcp` 为 401；`GET /health` 为 200 且不鉴权。`/secrets/*` 不再提供服务
+- D1 唯一冲突：`UNIQUE constraint failed: secrets.name: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_UNIQUE)` 与 `bots.name` 同样格式映射为 `-32602`，不重试成 `-32603`
