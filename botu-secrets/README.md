@@ -2,6 +2,8 @@
 
 给 bot 用的个人密钥柜。一条 secret 一份随机数据密钥，按 scope 授权，轮换时换密钥并吊销未过期 lease，每次读取都留下审计。
 
+secret 的值只有两个来源：人用 `put_secret` 填，或者 ops 用 `generate_secret` 让服务端生成。bot 和 agent 不要自己编造随机密钥；需要随机值时一律调 `generate_secret`。
+
 这是一个 Cloudflare Worker。入口是单文件 `src/worker.js`，不需要构建。D1 表在 `schema.sql`。部署时要注入的 secret 和 binding 在 `deploy/ENV.md`。
 
 本地逻辑不依赖 Cloudflare。WebCrypto 用全局 `crypto`，数据库通过可注入的 `queryAll` / `queryFirst` / `queryRun`。生产从 `env.DB` 走 D1，测试用内存 mock。
@@ -96,6 +98,16 @@ curl -s https://mcp.abot.run/secrets/mcp \
 新 DEK，`version=1`，`last_rotated_at=now`。`name` 已存在返回 `-32602`（`secret already exists`），改值用 `rotate_secret`。`rotate_every_days` 省略或 `null` 表示不设轮换周期；给出时是 1 到 3650 的整数。
 
 响应：`{name, scope, version, last_rotated_at}`。没有 value。
+
+### generate_secret（ops）
+
+`{name, scope, length?, alphabet?}`
+
+服务端用 `crypto.getRandomValues` 生成密码学安全的随机值，再按 `put_secret` 的信封入库：新 DEK，`version=1`，`last_rotated_at=now`。`name` 已存在同样是 `-32602`（`secret already exists`），不能靠再调一次把明文取回来。
+
+`length` 是字符个数，默认 32，范围 1 到 512。`alphabet` 省略时是 `ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789`。自定义字符集里的码点必须唯一、不能有控制字符、长度 2 到 256。抽样会丢掉会造成取模偏差的字节。
+
+响应：`{name, scope, version, last_rotated_at, value}`。`value` 只在这次响应里出现。不写日志。审计动作是 `generate_secret`，只有 `secret_name_hash` 和 `{version, length}`，没有明文。之后的 ACL 与 `put_secret` 相同：`list_secrets` 不带值；没有 scope grant 的 `get_secret` 是 `-32003`；有 grant 才能再解密。普通 bot 调用这个工具是 `-32003`。
 
 ### get_secret（需要 ACL）
 

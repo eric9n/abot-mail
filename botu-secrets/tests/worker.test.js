@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import worker, {
+  DEFAULT_SECRET_ALPHABET,
   TOOLS,
   KekError,
   d1Deps,
@@ -12,6 +13,7 @@ import worker, {
   isLeaseActive,
   loadKek,
   openValue,
+  randomFromAlphabet,
   rotationDue,
   sealValue,
   sha256Hex,
@@ -28,6 +30,7 @@ const NAME = "stripe-live-key";
 const VALUE = "sk_live_PLAINTEXT_9f3c1a";
 const TOOL_NAMES = [
   "put_secret",
+  "generate_secret",
   "get_secret",
   "rotate_secret",
   "revoke_secret",
@@ -40,6 +43,7 @@ const TOOL_NAMES = [
 ];
 const OPS_TOOL_NAMES = [
   "put_secret",
+  "generate_secret",
   "rotate_secret",
   "revoke_secret",
   "create_bot",
@@ -769,4 +773,91 @@ test("audit_log filters by bot, secret name hash, and action without plaintext",
   assert.equal(created.entries.length, 1);
   assert.equal(created.entries[0].secret_name_hash, null);
   assert.equal(created.entries[0].detail.includes("token"), false);
+});
+
+test("generate_secret draws a server-side value once and stores it like put_secret", async () => {
+  assert.equal(DEFAULT_SECRET_ALPHABET.length, 62);
+  assert.equal(new Set(DEFAULT_SECRET_ALPHABET).size, 62);
+  const drawn = randomFromAlphabet(64, "abc");
+  assert.equal(drawn.length, 64);
+  assert.match(drawn, /^[abc]+$/);
+  assert.equal(drawn.includes("a") && drawn.includes("b") && drawn.includes("c"), true);
+
+  const { raw, env } = await fresh();
+  const secretName = "generated-api-key";
+  const made = unwrap(await mcp(env, "generate_secret", { name: secretName, scope: "payments" }));
+  assert.equal(made.name, secretName);
+  assert.equal(made.scope, "payments");
+  assert.equal(made.version, 1);
+  assert.equal(made.last_rotated_at, NOW_ISO);
+  assert.equal(made.value.length, 32);
+  assert.match(made.value, /^[A-Za-z0-9]+$/);
+  assert.deepEqual(Object.keys(made).sort(), ["last_rotated_at", "name", "scope", "value", "version"]);
+
+  const custom = unwrap(
+    await mcp(env, "generate_secret", { name: "generated-pin", scope: "payments", length: 24, alphabet: "xyz" }),
+  );
+  assert.equal(custom.value.length, 24);
+  assert.match(custom.value, /^[xyz]+$/);
+  assert.notEqual(custom.value, made.value);
+
+  const row = raw.prepare("SELECT * FROM secrets WHERE name = ?").get(secretName);
+  assert.equal(row.version, 1);
+  assert.equal(row.rotate_every_days, null);
+  assert.equal(await openValue(loadKek({ KEK_B64: KEK }), row.id, row), made.value);
+  const stored = JSON.stringify(raw.prepare("SELECT * FROM secrets").all());
+  assert.equal(stored.includes(made.value), false);
+  assert.equal(stored.includes(custom.value), false);
+
+  const listed = unwrap(await mcp(env, "list_secrets", {}));
+  assert.equal(JSON.stringify(listed).includes(made.value), false);
+  assert.deepEqual(
+    listed.map((item) => item.name),
+    ["generated-api-key", "generated-pin"],
+  );
+
+  const denied = rpcError(await mcp(env, "get_secret", { name: secretName }));
+  assert.equal(denied.code, -32003);
+  assert.equal(JSON.stringify(denied).includes(made.value), false);
+  const readerDenied = rpcError(await mcp(env, "generate_secret", { name: "other", scope: "payments" }, { token: READER }));
+  assert.equal(readerDenied.code, -32003);
+
+  unwrap(await mcp(env, "grant_access", { bot_name: "reader", scope: "payments" }));
+  const got = unwrap(await mcp(env, "get_secret", { name: secretName }, { token: READER }));
+  assert.equal(got.value, made.value);
+
+  const again = rpcError(await mcp(env, "generate_secret", { name: secretName, scope: "payments" }));
+  assert.equal(again.code, -32602);
+  assert.equal(again.message, "secret already exists");
+  assert.equal(JSON.stringify(again).includes(made.value), false);
+  const collided = rpcError(await mcp(env, "put_secret", { name: secretName, scope: "payments", value: "user-supplied" }));
+  assert.equal(collided.code, -32602);
+
+  const hash = await sha256Hex(secretName);
+  const audits = raw.prepare("SELECT * FROM audit WHERE action = 'generate_secret'").all();
+  assert.equal(audits.length, 2);
+  const firstAudit = audits.find((item) => item.secret_name_hash === hash);
+  assert.ok(firstAudit);
+  assert.equal(firstAudit.detail, JSON.stringify({ version: 1, length: 32 }));
+  assert.equal(auditBlob(raw).includes(made.value), false);
+  assert.equal(auditBlob(raw).includes(custom.value), false);
+  assert.equal(auditBlob(raw).includes(secretName), false);
+  const logged = unwrap(await mcp(env, "audit_log", { action: "generate_secret", secret_name: secretName }));
+  assert.equal(logged.entries.length, 1);
+  assert.equal(logged.entries[0].secret_name_hash, hash);
+  assert.equal(JSON.stringify(logged).includes(made.value), false);
+
+  for (const args of [
+    { name: "n", scope: "s", length: 0 },
+    { name: "n", scope: "s", length: 1.5 },
+    { name: "n", scope: "s", length: 513 },
+    { name: "n", scope: "s", alphabet: "a" },
+    { name: "n", scope: "s", alphabet: "aba" },
+    { name: "n", scope: "s", alphabet: "ab\n" },
+    { scope: "s" },
+  ]) {
+    const err = rpcError(await mcp(env, "generate_secret", args));
+    assert.equal(err.code, -32602, JSON.stringify(args));
+  }
+  assert.equal(countOf(raw, "secrets"), 2);
 });

@@ -14,6 +14,8 @@
  *   ciphertext_b64  = base64( AES-GCM(DEK, utf8(value)) )
  *     AAD = utf8("botu-secrets.val.v1\n" + secretId). Tag is included.
  *   Audit stores sha256(secret name) only. Never the name, the value, the token, or a key.
+ *   generate_secret draws the value with crypto.getRandomValues. The plaintext is
+ *   returned once and is not written to logs or to the audit row.
  *
  * Leases are an accountability window, not a second credential. get_secret returns
  * the plaintext in that same response. Revoke / rotate flip related leases to revoked=1.
@@ -29,12 +31,17 @@ const VALUE_MAX = 65_536;
 const TTL_DEFAULT = 900;
 const TTL_MAX = 86_400;
 const ROTATE_DAYS_MAX = 3_650;
+const GENERATE_LENGTH_DEFAULT = 32;
+const GENERATE_LENGTH_MAX = 512;
+/** Unambiguous paste-safe default. Callers can pass another unique alphabet. */
+export const DEFAULT_SECRET_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 const AUDIT_LIMIT = 500;
 const DAY_MS = 86_400_000;
 const DEK_AAD = "botu-secrets.dek.v1";
 
 const OPS_TOOLS = new Set([
   "put_secret",
+  "generate_secret",
   "rotate_secret",
   "revoke_secret",
   "create_bot",
@@ -253,6 +260,15 @@ function readRotateDays(args) {
   return readInt(args.rotate_every_days, "rotate_every_days", 1, ROTATE_DAYS_MAX);
 }
 
+function readAlphabet(value) {
+  if (typeof value !== "string") throw new RpcError(-32602, "alphabet must be a string");
+  if (/[\u0000-\u001f\u007f]/.test(value)) throw new RpcError(-32602, "alphabet is invalid");
+  const chars = Array.from(value);
+  if (chars.length < 2 || chars.length > 256) throw new RpcError(-32602, "alphabet is out of range");
+  if (new Set(chars).size !== chars.length) throw new RpcError(-32602, "alphabet must not repeat characters");
+  return value;
+}
+
 function nowMsOf(ctx) {
   if (ctx && typeof ctx.nowMs === "number" && Number.isFinite(ctx.nowMs)) return ctx.nowMs;
   return Date.now();
@@ -299,6 +315,30 @@ export function newId(prefix) {
 export function randomToken() {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   return encodeB64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+/**
+ * `length` characters, each chosen uniformly from `alphabet` (unique code points).
+ * Bytes at or above the largest multiple of the alphabet size are discarded so
+ * `byte % n` is not biased. Uses crypto.getRandomValues only.
+ */
+export function randomFromAlphabet(length, alphabet) {
+  const chars = Array.from(alphabet);
+  const n = chars.length;
+  if (!Number.isInteger(length) || length < 1) throw new Error("length");
+  if (n < 2 || n > 256) throw new Error("alphabet size");
+  const limit = 256 - (256 % n);
+  const out = [];
+  let spins = 0;
+  while (out.length < length) {
+    if (++spins > 10000) throw new Error("entropy exhausted");
+    const buf = crypto.getRandomValues(new Uint8Array(Math.max((length - out.length) * 2, 32)));
+    for (let i = 0; i < buf.length && out.length < length; i++) {
+      if (buf[i] >= limit) continue;
+      out.push(chars[buf[i] % n]);
+    }
+  }
+  return out.join("");
 }
 
 function isUniqueError(err) {
@@ -349,18 +389,9 @@ function secretMeta(row, nowMs) {
   };
 }
 
-async function putSecret(args, ctx) {
-  requireOps(ctx.bot);
-  requireArgs(args);
-  assertOnlyKeys(args, new Set(["name", "scope", "value", "rotate_every_days"]));
-  const name = readLabel(args.name, "name");
-  const scope = readLabel(args.scope, "scope");
-  if (!has(args, "value")) throw new RpcError(-32602, "value is required");
-  const value = readSecretValue(args.value, "value");
-  const rotateEveryDays = readRotateDays(args);
+async function insertFreshSecret(ctx, { name, scope, value, rotateEveryDays }) {
   const kek = loadKek(ctx.env);
   const now = nowIso(ctx);
-  let stored = null;
   let lastErr;
   for (let attempt = 0; attempt < 5; attempt++) {
     const id = newId("sec_");
@@ -374,8 +405,7 @@ async function putSecret(args, ctx) {
         ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
         [id, name, scope, sealed.dek_wrapped_b64, sealed.nonce_b64, sealed.ciphertext_b64, rotateEveryDays, now, now, now],
       );
-      stored = { id };
-      break;
+      return { name, scope, version: 1, last_rotated_at: now };
     } catch (err) {
       lastErr = err;
       if (!isUniqueError(err)) throw err;
@@ -385,9 +415,35 @@ async function putSecret(args, ctx) {
       }
     }
   }
-  if (!stored) throw lastErr;
+  throw lastErr;
+}
+
+async function putSecret(args, ctx) {
+  requireOps(ctx.bot);
+  requireArgs(args);
+  assertOnlyKeys(args, new Set(["name", "scope", "value", "rotate_every_days"]));
+  const name = readLabel(args.name, "name");
+  const scope = readLabel(args.scope, "scope");
+  if (!has(args, "value")) throw new RpcError(-32602, "value is required");
+  const value = readSecretValue(args.value, "value");
+  const rotateEveryDays = readRotateDays(args);
+  const stored = await insertFreshSecret(ctx, { name, scope, value, rotateEveryDays });
   await writeAudit(ctx, { action: "put_secret", secretName: name, detail: { version: 1 } });
-  return { name, scope, version: 1, last_rotated_at: now };
+  return stored;
+}
+
+async function generateSecret(args, ctx) {
+  requireOps(ctx.bot);
+  requireArgs(args);
+  assertOnlyKeys(args, new Set(["name", "scope", "length", "alphabet"]));
+  const name = readLabel(args.name, "name");
+  const scope = readLabel(args.scope, "scope");
+  const length = has(args, "length") ? readInt(args.length, "length", 1, GENERATE_LENGTH_MAX) : GENERATE_LENGTH_DEFAULT;
+  const alphabet = has(args, "alphabet") ? readAlphabet(args.alphabet) : DEFAULT_SECRET_ALPHABET;
+  const value = randomFromAlphabet(length, alphabet);
+  const stored = await insertFreshSecret(ctx, { name, scope, value, rotateEveryDays: null });
+  await writeAudit(ctx, { action: "generate_secret", secretName: name, detail: { version: 1, length } });
+  return { ...stored, value };
 }
 
 async function getSecret(args, ctx) {
@@ -612,6 +668,7 @@ async function auditLog(args, ctx) {
 
 const HANDLERS = {
   put_secret: putSecret,
+  generate_secret: generateSecret,
   get_secret: getSecret,
   rotate_secret: rotateSecret,
   revoke_secret: revokeSecret,
@@ -636,6 +693,22 @@ export const TOOLS = [
         rotate_every_days: { type: "integer", minimum: 1, maximum: ROTATE_DAYS_MAX },
       },
       required: ["name", "scope", "value"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "generate_secret",
+    description:
+      "运维让服务端用 WebCrypto getRandomValues 生成随机 secret 并按 put_secret 的信封入库（新 DEK，version=1）。length 默认 32，最大 512。alphabet 省略时为 A-Z a-z 0-9，字符必须唯一。明文 value 只在这次响应里返回一次，不写日志，审计里也没有明文。bot 不要自己编造随机密钥。name 已存在时拒绝。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        scope: { type: "string" },
+        length: { type: "integer", minimum: 1, maximum: GENERATE_LENGTH_MAX, default: GENERATE_LENGTH_DEFAULT },
+        alphabet: { type: "string" },
+      },
+      required: ["name", "scope"],
       additionalProperties: false,
     },
   },
