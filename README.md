@@ -108,6 +108,17 @@ python3 skill/mail_archive.py get 435eb30a-d52d-4f7c-a400-ccac381b7cc4 --include
 
 成功时把 JSON 打到 stdout。失败时把错误打到 stderr，退出码非 0。`--include-raw-eml` 会在 JSON 里说明原始邮件在 R2 的键；读 `.eml` 字节用 MCP 的 `get_email`。
 
+## Skill 布局
+
+给 agent 用的邮件归档 skill 都在 `skill/`。从零把整套服务装到新 Cloudflare 账号，看 `docs/install.md`。把安装任务交给另一个 agent 时，用仓库根的 `PROMPT.md`。
+
+| 路径 | 作用 |
+| --- | --- |
+| `skill/SKILL.md` | 何时使用、MCP 端点、Bearer 鉴权、只读规则 |
+| `skill/mcp_cli.py` | 调 Worker `POST /mcp`。子命令 `search` / `get` / `list` / `stats` 对应四个工具，另有 `tools` 和免鉴权的 `health` |
+| `skill/references/tools.md` | 四个工具的参数表，与 Worker 的 `TOOLS` 一致 |
+| `skill/mail_archive.py` | 不经过 Worker，直接查 D1。读不到 R2 上的 `.eml` 字节 |
+
 ## 测试与部署后核对
 
 `npm test` 用 `node --test` 覆盖三块纯逻辑，并用内存 SQLite 执行 `schema.sql` 和同一套 SQL：
