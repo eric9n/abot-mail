@@ -1,6 +1,6 @@
 # botu-secrets 部署环境
 
-Worker 入口是 `src/worker.js`（单文件，无构建步骤）。生产路径前缀是 `/secrets`，route 为 `mcp.abot.run/secrets/*`。
+Worker 入口是 `src/worker.js`（单文件，无构建步骤）。独立域名 `secrets.abot.run`，路由在根路径：`POST /mcp`、`GET /health`。没有 `/secrets` 前缀。
 
 代码只从下面这些绑定读配置。KEK 由部署方生成后注入，仓库和镜像里不放密钥。
 
@@ -8,12 +8,12 @@ Worker 入口是 `src/worker.js`（单文件，无构建步骤）。生产路径
 
 | 名称 | 类型 | 必须 | 说明 |
 | --- | --- | --- | --- |
-| `KEK_B64` | secret | 是 | 32 字节 AES-256 密钥的标准 base64（带 `+` `/` `=`，不要用 base64url，不要换行）。缺失、非法 base64、或解码后不是 32 字节时，已带 Bearer 的 `/secrets/mcp` 直接抛 `KekError`，拒绝服务。 |
+| `KEK_B64` | secret | 是 | 32 字节 AES-256 密钥的标准 base64（带 `+` `/` `=`，不要用 base64url，不要换行）。缺失、非法 base64、或解码后不是 32 字节时，已带 Bearer 的 `POST /mcp` 直接抛 `KekError`，拒绝服务。 |
 | `DB` | D1 binding | 是 | 绑定名必须是 `DB`。库名建议 `botu-secrets`。表结构用仓库里的 `schema.sql`（可重复执行）。 |
 
 没有其他 env 依赖。不读取 `DATA_MCP_TOKEN`、邮件归档或其他 Worker 的 secret。
 
-`GET /secrets/health` 不读 KEK，也不读 D1。未带 `Authorization` 的 `/secrets/mcp` 在查 KEK 和 D1 之前就返回 HTTP 401。
+`GET /health` 不读 KEK，也不读 D1。未带 `Authorization` 的 `POST /mcp` 在查 KEK 和 D1 之前就返回 HTTP 401。
 
 ## 生成 KEK
 
@@ -68,7 +68,7 @@ ops 可以 `list_secrets` 看全部元数据。`get_secret` 仍要有对应 scop
 npx wrangler deploy --env staging
 ```
 
-把 `mcp.abot.run/secrets/*` 指到这个 Worker。确认：
+把 `secrets.abot.run/*` 指到这个 Worker。确认：
 
-- `GET https://mcp.abot.run/secrets/health` → `{"ok":true,"service":"botu-secrets"}`
-- 不带 token 的 `POST https://mcp.abot.run/secrets/mcp` → HTTP 401
+- `GET https://secrets.abot.run/health` → `{"ok":true,"service":"botu-secrets"}`
+- 不带 token 的 `POST https://secrets.abot.run/mcp` → HTTP 401

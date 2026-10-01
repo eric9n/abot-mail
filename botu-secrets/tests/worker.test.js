@@ -103,7 +103,7 @@ async function mcp(env, name, args, opts = {}) {
   if (method === "tools/call") body.params = { name, arguments: args ?? {} };
   else if (opts.params !== undefined) body.params = opts.params;
   const res = await handleFetch(
-    new Request(opts.url ?? "https://mcp.abot.run/secrets/mcp", {
+    new Request(opts.url ?? "https://secrets.abot.run/mcp", {
       method: "POST",
       headers,
       body: opts.rawBody ?? JSON.stringify(body),
@@ -200,23 +200,28 @@ test("readme and env docs describe the ten tools, -32003, and the KEK", () => {
   assert.equal(src.includes("DATA_MCP_TOKEN"), false);
 });
 
-test("health is public and only /secrets/mcp and /secrets/health exist", async () => {
+test("health is public at /health and MCP is only POST /mcp", async () => {
   const { env } = await fresh();
-  const health = await worker.fetch(new Request("https://mcp.abot.run/secrets/health"), env);
+  const health = await worker.fetch(new Request("https://secrets.abot.run/health"), env);
   assert.equal(health.status, 200);
   assert.deepEqual(await health.json(), { ok: true, service: "botu-secrets" });
 
-  const slashed = await handleFetch(new Request("https://mcp.abot.run/secrets/health/"), {});
+  const slashed = await handleFetch(new Request("https://secrets.abot.run/health/"), {});
   assert.equal(slashed.status, 200);
   assert.deepEqual(await slashed.json(), { ok: true, service: "botu-secrets" });
 
-  const posted = await handleFetch(new Request("https://mcp.abot.run/secrets/health", { method: "POST" }), env);
+  const posted = await handleFetch(new Request("https://secrets.abot.run/health", { method: "POST" }), env);
   assert.equal(posted.status, 405);
 
-  const getMcp = await handleFetch(new Request("https://mcp.abot.run/secrets/mcp"), env);
+  const getMcp = await handleFetch(new Request("https://secrets.abot.run/mcp"), env);
   assert.equal(getMcp.status, 405);
 
-  for (const url of ["https://mcp.abot.run/secrets", "https://mcp.abot.run/mcp", "https://mcp.abot.run/secrets/nope"]) {
+  for (const url of [
+    "https://secrets.abot.run/secrets",
+    "https://secrets.abot.run/secrets/mcp",
+    "https://secrets.abot.run/secrets/health",
+    "https://secrets.abot.run/nope",
+  ]) {
     const res = await handleFetch(new Request(url), env);
     assert.equal(res.status, 404, url);
     assert.deepEqual(await res.json(), { ok: false, error: "not found" });
@@ -235,7 +240,7 @@ test("unauthenticated MCP is 401 before the database, and a revoked bot is 401",
     },
   };
   const missing = await handleFetch(
-    new Request("https://mcp.abot.run/secrets/mcp", {
+    new Request("https://secrets.abot.run/mcp", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: "{",
@@ -246,7 +251,7 @@ test("unauthenticated MCP is 401 before the database, and a revoked bot is 401",
   assert.deepEqual(await missing.json(), { ok: false, error: "unauthorized" });
 
   const malformed = await handleFetch(
-    new Request("https://mcp.abot.run/secrets/mcp", {
+    new Request("https://secrets.abot.run/mcp", {
       method: "POST",
       headers: { authorization: "Token nope", "content-type": "application/json" },
       body: "{}",
@@ -269,7 +274,7 @@ test("unauthenticated MCP is 401 before the database, and a revoked bot is 401",
     revoked: 1,
   });
   const revoked = await handleFetch(
-    new Request("https://mcp.abot.run/secrets/mcp", {
+    new Request("https://secrets.abot.run/mcp", {
       method: "POST",
       headers: {
         authorization: "Bearer revoked-token-0123456789abcdef0123",
@@ -310,7 +315,7 @@ test("a missing, illegal, or non-32-byte KEK throws before any database call", a
   await assert.rejects(
     () =>
       handleFetch(
-        new Request("https://mcp.abot.run/secrets/mcp", {
+        new Request("https://secrets.abot.run/mcp", {
           method: "POST",
           headers: { authorization: `Bearer ${OPS}`, "content-type": "application/json" },
           body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
@@ -322,7 +327,7 @@ test("a missing, illegal, or non-32-byte KEK throws before any database call", a
   await assert.rejects(
     () =>
       handleFetch(
-        new Request("https://mcp.abot.run/secrets/mcp", {
+        new Request("https://secrets.abot.run/mcp", {
           method: "POST",
           headers: { authorization: `Bearer ${OPS}`, "content-type": "application/json" },
           body: "{}",
@@ -333,7 +338,7 @@ test("a missing, illegal, or non-32-byte KEK throws before any database call", a
   );
   assert.equal(touched, false);
 
-  const health = await handleFetch(new Request("https://mcp.abot.run/secrets/health"), {});
+  const health = await handleFetch(new Request("https://secrets.abot.run/health"), {});
   assert.equal(health.status, 200);
 });
 
@@ -361,7 +366,7 @@ test("initialize, tools/list, unknown tools, and bad params follow JSON-RPC", as
   assert.equal(init.body.result.serverInfo.version, "1.0.0");
 
   const note = await handleFetch(
-    new Request("https://mcp.abot.run/secrets/mcp", {
+    new Request("https://secrets.abot.run/mcp", {
       method: "POST",
       headers: { authorization: `Bearer ${OPS}`, "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
@@ -385,7 +390,7 @@ test("initialize, tools/list, unknown tools, and bad params follow JSON-RPC", as
   assert.equal(extra.code, -32602);
 
   const badType = await handleFetch(
-    new Request("https://mcp.abot.run/secrets/mcp", {
+    new Request("https://secrets.abot.run/mcp", {
       method: "POST",
       headers: { authorization: `Bearer ${OPS}`, "content-type": "text/plain" },
       body: "{}",
@@ -395,7 +400,7 @@ test("initialize, tools/list, unknown tools, and bad params follow JSON-RPC", as
   assert.equal(badType.status, 415);
 
   const badJson = await handleFetch(
-    new Request("https://mcp.abot.run/secrets/mcp", {
+    new Request("https://secrets.abot.run/mcp", {
       method: "POST",
       headers: { authorization: `Bearer ${OPS}`, "content-type": "application/json" },
       body: "{",

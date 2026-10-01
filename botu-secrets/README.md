@@ -10,12 +10,12 @@ secret 的值只有两个来源：人用 `put_secret` 填，或者 ops 用 `gene
 
 ## 路径
 
-生产 route 是 `mcp.abot.run/secrets/*`。Worker 只认这三个结果：
+独立域名 `secrets.abot.run`，Worker 挂在根路径，没有 `/secrets` 前缀。只认这三个结果：
 
 | 请求 | 结果 |
 | --- | --- |
-| `POST /secrets/mcp` | JSON-RPC 2.0。要 Bearer token。 |
-| `GET /secrets/health` | `{"ok":true,"service":"botu-secrets"}`。不鉴权，不读库，不读 KEK。 |
+| `POST /mcp` | JSON-RPC 2.0。要 Bearer token。 |
+| `GET /health` | `{"ok":true,"service":"botu-secrets"}`。不鉴权，不读库，不读 KEK。 |
 | 其他路径，或方法不对 | 404 或 405。 |
 
 ## 鉴权
@@ -83,7 +83,7 @@ JSON-RPC 业务错误的 HTTP 状态是 200，和 botu-data 一样。未认证�
 调用形态：
 
 ```bash
-curl -s https://mcp.abot.run/secrets/mcp \
+curl -s https://secrets.abot.run/mcp \
   -H "authorization: Bearer $TOKEN" \
   -H "content-type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_secrets","arguments":{}}}'

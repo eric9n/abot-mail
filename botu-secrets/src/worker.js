@@ -1,7 +1,8 @@
 /**
  * botu-secrets: a personal vault for bot credentials.
- * POST /secrets/mcp    JSON-RPC 2.0 MCP. Bearer token, SHA-256 hex looked up in bots.
- * GET  /secrets/health {ok:true, service:"botu-secrets"} — no auth.
+ * POST /mcp    JSON-RPC 2.0 MCP. Bearer token, SHA-256 hex looked up in bots.
+ * GET  /health {ok:true, service:"botu-secrets"} — no auth.
+ * Served at the zone root on secrets.abot.run. There is no /secrets prefix.
  *
  * Crypto (AES-256-GCM via global WebCrypto). Fail closed: a missing or illegal
  * KEK throws KekError before any authenticated MCP work.
@@ -942,12 +943,12 @@ function jsonContentType(header) {
 export async function handleFetch(request, env, deps = {}) {
   const path = pathOf(request);
 
-  if (path === "/secrets/health") {
+  if (path === "/health") {
     if (request.method !== "GET") return json({ ok: false, error: "method not allowed" }, 405);
     return json({ ok: true, service: "botu-secrets" });
   }
 
-  if (path === "/secrets/mcp") {
+  if (path === "/mcp") {
     if (request.method !== "POST") return json({ ok: false, error: "method not allowed" }, 405);
     const token = bearerToken(request.headers.get("authorization"));
     if (token == null) return json({ ok: false, error: "unauthorized" }, 401);

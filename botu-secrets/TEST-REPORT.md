@@ -13,8 +13,8 @@ D1 用 `node:sqlite` 内存库，包成与生产相同的 `prepare` / `bind` / `
 | --- | --- | --- |
 | 1 | schema.sql 可重复执行，五张表的列与规格一致，没有 DROP / ALTER | 通过 |
 | 2 | README 与 deploy/ENV.md 写明 10 个工具、-32003、KEK 包裹格式 | 通过 |
-| 3 | `GET /secrets/health` 公开 200；其他路径 404；方法不对 405 | 通过 |
-| 4 | 未带 Authorization 的 `/secrets/mcp` 在碰数据库之前返回 401；错误 token 401；`revoked=1` 401 | 通过 |
+| 3 | `GET /health` 公开 200；`/secrets/*` 等其他路径 404；方法不对 405 | 通过 |
+| 4 | 未带 Authorization 的 `POST /mcp` 在碰数据库之前返回 401；错误 token 401；`revoked=1` 401 | 通过 |
 | 5 | KEK 缺失、非法 base64、非 32 字节抛 `KekError`，且不访问 D1 | 通过 |
 | 6 | initialize、tools/list（恰好 10 个工具）、未知 tool `-32601`、参数非法 `-32602`、415、400 | 通过 |
 | 7 | AES-GCM 往返、AAD 绑定、`rotation_due` 严格大于、`isLeaseActive` 过期与吊销 | 通过 |
@@ -41,4 +41,4 @@ D1 用 `node:sqlite` 内存库，包成与生产相同的 `prepare` / `bind` / `
 - `revoke_secret` 之后密文行不在，get 返回 `-32602` not found
 - 审计：`put_secret`、`generate_secret`、`get_secret`、`rotate_secret`、`revoke_secret`、`create_bot`、`grant_access`、`revoke_bot`、`revoke_lease` 都有审计行；secret 相关行的 `secret_name_hash` 为 SHA-256 hex；审计中无明文 secret 名、无 value、无 token
 - KEK fail-closed：缺失、非法 base64、长度不是 32 字节都抛错
-- HTTP：未认证 `POST /secrets/mcp` 为 401；`GET /secrets/health` 为 200 且不鉴权
+- HTTP：域名 `secrets.abot.run`，根路径。未认证 `POST /mcp` 为 401；`GET /health` 为 200 且不鉴权。`/secrets/*` 不再提供服务 |

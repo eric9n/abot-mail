@@ -1,6 +1,6 @@
 # Not the deployed worker. `wrangler deploy` without `--env staging` must not
 # publish this service. KEK_B64 is a secret, never a var in this file.
-# Production route (configured with the deploy): mcp.abot.run/secrets/*
+# Production route (configured with the deploy): secrets.abot.run/*
 name = "botu-secrets-unconfigured"
 main = "src/worker.js"
 compatibility_date = "2026-09-01"
