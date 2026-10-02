@@ -809,7 +809,8 @@ export function emailCacheDecision(columnPresent, aiStatus) {
   return { cache: false };
 }
 
-export function getEmailCacheUrl(resendId, includeHtml, includeRaw, ai, rev) {
+export function getEmailCacheUrl(resendId, includeHtml, includeRaw, ai, rev, ownerEmail) {
+  // 安全：缓存 key 必须绑定 ownerEmail，防止跨账户读到对方缓存的邮件正文
   return (
     "https://cache.internal/mcp/get?id=" +
     encodeURIComponent(resendId) +
@@ -820,20 +821,37 @@ export function getEmailCacheUrl(resendId, includeHtml, includeRaw, ai, rev) {
     "&ai=" +
     encodeURIComponent(ai) +
     "&rev=" +
-    encodeURIComponent(String(rev))
+    encodeURIComponent(String(rev)) +
+    "&owner=" +
+    encodeURIComponent(ownerEmail || "")
   );
 }
 
-export function statsCacheUrl(rev) {
-  return `${STATS_CACHE_URL}?rev=${encodeURIComponent(String(rev))}`;
+/** 缓存命中的邮件详情是否属于当前 ownerEmail。双保险：即使 key 被绕过也不返回他人正文。 */
+export function cachedEmailBelongsToOwner(cached, ownerEmail) {
+  if (!ownerEmail) return true; // 系统级调用，无隔离
+  if (!cached || cached.found === false) return true;
+  if (cached.from === ownerEmail) return true;
+  try {
+    if (JSON.stringify(cached.to || []).includes('"' + ownerEmail + '"')) return true;
+  } catch {
+    // damaged payload -> treat as miss
+  }
+  return false;
+}
+
+export function statsCacheUrl(rev, ownerEmail) {
+  // 安全：统计缓存按 owner 隔离
+  return `${STATS_CACHE_URL}?rev=${encodeURIComponent(String(rev))}&owner=${encodeURIComponent(ownerEmail || "")}`;
 }
 
 export function r2CacheUrl(r2Key) {
   return `https://cache.internal/r2/${r2Key}`;
 }
 
-export function searchCacheFields(args) {
+export function searchCacheFields(args, ownerEmail) {
   const fields = {
+    owner: ownerEmail ?? null, // 安全：搜索缓存按 owner 隔离
     direction: args.direction ?? null,
     from: args.from ? args.from : null,
     limit: clampLimit(args.limit),
@@ -846,8 +864,9 @@ export function searchCacheFields(args) {
   return fields;
 }
 
-export function listCacheFields(args) {
+export function listCacheFields(args, ownerEmail) {
   const fields = {
+    owner: ownerEmail ?? null, // 安全：列表缓存按 owner 隔离
     direction: args.direction ?? null,
     limit: clampLimit(args.limit),
     since: args.since == null ? null : canonicalBound(args.since, "start"),
@@ -1223,11 +1242,12 @@ function aiConfigured(deps) {
 async function deleteEmailCacheEntries(deps, resendId, rev) {
   const cache = deps && deps.cache;
   if (!cache || typeof cache.delete !== "function") return;
+  const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
   const urls = [];
   for (const includeHtml of [false, true]) {
     for (const includeRaw of [false, true]) {
       for (const ai of GET_AI_VARIANTS) {
-        urls.push(getEmailCacheUrl(resendId, includeHtml, includeRaw, ai, rev));
+        urls.push(getEmailCacheUrl(resendId, includeHtml, includeRaw, ai, rev, ownerEmail));
       }
     }
   }
@@ -1297,7 +1317,7 @@ async function callTool(name, args, deps) {
   if (name === "search_emails") {
     const query = buildSearchQuery(args, ownerEmail);
     const [hash, rev] = await Promise.all([
-      hashCacheFields(searchCacheFields(args)),
+      hashCacheFields(searchCacheFields(args, ownerEmail)),
       readRevision(deps),
     ]);
     return readThrough(deps, {
@@ -1311,7 +1331,7 @@ async function callTool(name, args, deps) {
   if (name === "list_emails") {
     const query = buildListQuery(args, ownerEmail);
     const [hash, rev] = await Promise.all([
-      hashCacheFields(listCacheFields(args)),
+      hashCacheFields(listCacheFields(args, ownerEmail)),
       readRevision(deps),
     ]);
     return readThrough(deps, {
@@ -1332,13 +1352,15 @@ async function callTool(name, args, deps) {
       for (const ai of GET_AI_VARIANTS) {
         const hit = await matchCache(
           deps.cache,
-          new Request(getEmailCacheUrl(id, parsed.includeHtml, parsed.includeRaw, ai, rev)),
+          new Request(getEmailCacheUrl(id, parsed.includeHtml, parsed.includeRaw, ai, rev, ownerEmail)),
         );
         if (!hit) continue;
         try {
           const cached = JSON.parse(await hit.text());
           // A cached null summary is incomplete once AI can fill it. UPDATE does not bump rev.
           if (cached && cached.found !== false && cached.summary == null && aiConfigured(deps)) continue;
+          // 安全：缓存命中后必须校验归属，防止跨账户读到他人邮件正文
+          if (!cachedEmailBelongsToOwner(cached, ownerEmail)) continue;
           noteCache(deps && deps.trace, true);
           return cached;
         } catch {
@@ -1378,7 +1400,7 @@ async function callTool(name, args, deps) {
       await scheduleCachePut(
         deps.cache,
         deps.ctx,
-        new Request(getEmailCacheUrl(id, query.includeHtml, query.includeRaw, decision.ai, rev)),
+        new Request(getEmailCacheUrl(id, query.includeHtml, query.includeRaw, decision.ai, rev, ownerEmail)),
         cacheResponse(JSON.stringify(value), CACHE_TTL.getEmail, "application/json; charset=utf-8"),
       );
     }
@@ -1390,7 +1412,7 @@ async function callTool(name, args, deps) {
     const rev = await readRevision(deps);
     return readThrough(deps, {
       fresh: args.fresh === true,
-      url: statsCacheUrl(rev),
+      url: statsCacheUrl(rev, ownerEmail),
       ttl: CACHE_TTL.stats,
       load: async () => {
         const queries = buildStatsQueries(deps && deps.nowMs, ownerEmail);

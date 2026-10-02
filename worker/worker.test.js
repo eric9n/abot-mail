@@ -1408,10 +1408,20 @@ test("cache keys follow the phase-2 table and fresh is optional", async () => {
 
   assert.equal(
     getEmailCacheUrl(EMAIL_ID, true, false, "none", 0),
-    `https://cache.internal/mcp/get?id=${EMAIL_ID}&html=1&raw=0&ai=none&rev=0`,
+    `https://cache.internal/mcp/get?id=${EMAIL_ID}&html=1&raw=0&ai=none&rev=0&owner=`,
   );
-  assert.equal(statsCacheUrl(0), "https://cache.internal/mcp/stats?rev=0");
-  assert.equal(statsCacheUrl(3), "https://cache.internal/mcp/stats?rev=3");
+  // 安全：缓存 key 必须绑定 ownerEmail，不同账户不能共享缓存
+  assert.equal(
+    getEmailCacheUrl(EMAIL_ID, true, false, "none", 0, "a@abot.run"),
+    `https://cache.internal/mcp/get?id=${EMAIL_ID}&html=1&raw=0&ai=none&rev=0&owner=${encodeURIComponent("a@abot.run")}`,
+  );
+  assert.notEqual(
+    getEmailCacheUrl(EMAIL_ID, true, false, "none", 0, "a@abot.run"),
+    getEmailCacheUrl(EMAIL_ID, true, false, "none", 0, "b@abot.run"),
+  );
+  assert.equal(statsCacheUrl(0), "https://cache.internal/mcp/stats?rev=0&owner=");
+  assert.equal(statsCacheUrl(3), "https://cache.internal/mcp/stats?rev=3&owner=");
+  assert.notEqual(statsCacheUrl(0, "a@abot.run"), statsCacheUrl(0, "b@abot.run"));
   assert.equal(r2CacheUrl(`raw/${EMAIL_ID}.eml`), `https://cache.internal/r2/raw/${EMAIL_ID}.eml`);
   assert.equal(
     r2CacheUrl(`attachments/${EMAIL_ID}/a.png`),
@@ -1437,12 +1447,13 @@ test("cache keys follow the phase-2 table and fresh is optional", async () => {
   const entries = JSON.parse(record);
   assert.deepEqual(
     entries.map(([key]) => key),
-    ["direction", "from", "limit", "query", "since", "to", "until"],
+    ["direction", "from", "limit", "owner", "query", "since", "to", "until"],
   );
   assert.deepEqual(Object.fromEntries(entries), {
     direction: "in",
     from: "a@b.c",
     limit: 100,
+    owner: null,
     query: "invoice",
     since: "2026-09-01T00:00:00.000Z",
     to: "eric@abot.run",
@@ -1459,6 +1470,7 @@ test("cache keys follow the phase-2 table and fresh is optional", async () => {
   assert.deepEqual(JSON.parse(listRecord), [
     ["direction", "out"],
     ["limit", 20],
+    ["owner", null],
     ["since", "2026-09-15T00:00:00.000Z"],
   ]);
   assert.equal(listRecord.includes("cursor"), false);
