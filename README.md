@@ -13,7 +13,7 @@ Resend 的 `email.received` / `email.sent` webhook 进入 Cloudflare Worker `res
 | R2 | `abot-mail-archive` | binding `ARCHIVE_BUCKET` |
 | Queue | `mail-ingest` | binding `INGEST_QUEUE`；死信 `mail-ingest-dlq` |
 
-D1 binding 名是 `DB`。密钥只放在 Worker secrets 里：`WEBHOOK_SECRET`、`RESEND_API_KEY`、`MCP_TOKEN`。
+D1 binding 名是 `DB`。密钥只放在 Worker secrets 里：`WEBHOOK_SECRET`、`RESEND_API_KEY`、`MCP_TOKEN`，以及可选的 `INTERNAL_TOKEN`（`POST /mcp` 的 `X-Internal-Token`）。四个都用 `wrangler secret put`，不要写进 `[vars]` 或仓库。
 
 ## 部署
 
@@ -28,6 +28,7 @@ npx wrangler d1 execute abot-mail-archive --remote --file=schema.sql
 npx wrangler secret put WEBHOOK_SECRET
 npx wrangler secret put RESEND_API_KEY
 npx wrangler secret put MCP_TOKEN
+npx wrangler secret put INTERNAL_TOKEN
 npx wrangler deploy
 ```
 
@@ -35,11 +36,12 @@ Staging 使用另一套名字，不能和生产队列混用：`mail-ingest-stagi
 
 `schema.sql` 使用 `IF NOT EXISTS`，重复执行不会清掉已有邮件。Worker 名称与现有脚本相同，部署后地址保持 `https://resend-agent-mail-relay.eric9n-cf.workers.dev`。
 
-三个 secret：
+四个 secret（`INTERNAL_TOKEN` 可以不设，不设就只有 Bearer 能进 `/mcp`）：
 
 - `WEBHOOK_SECRET`：Resend webhook 的 signing secret，形如 `whsec_` + base64。Worker 去掉前缀再 base64 解码，用原始字节做 HMAC-SHA256。
 - `RESEND_API_KEY`：用来 `GET /emails/receiving/{id}`、`GET /emails/{id}`，以及两边的 attachments 列表。下载原始邮件和附件时走返回里的短时 `download_url`，不把 API key 带到 CDN。
 - `MCP_TOKEN`：自行生成的长随机串，例如 `openssl rand -base64 32`。只用于 `POST /mcp`。
+- `INTERNAL_TOKEN`：同样用 `openssl rand -base64 32` 生成。设了之后，`POST /mcp` 也接受请求头 `X-Internal-Token`，和 `MCP_TOKEN` 一样用逐字符比较，前缀相同不算通过。这是 Worker secret，不是普通变量。
 
 在 Resend 里把 webhook 指到 `https://resend-agent-mail-relay.eric9n-cf.workers.dev/`，订阅 `email.received` 和 `email.sent`。其它事件类型验签通过后直接回 200，不入库。
 
@@ -50,14 +52,20 @@ Staging 使用另一套名字，不能和生产队列混用：`mail-ingest-stagi
 - 原始邮件：`raw/{resend_id}.eml`（收件 API 的 `raw.download_url`；发出邮件通常没有 raw）
 - 附件：`attachments/{resend_id}/{filename}`，文件名会去掉路径并替换不安全字符
 
-`date` 优先用邮件 `Date` 头，解析不到再用 API 的 `created_at`，再不行用事件时间。收件的 `auth` 保存 `{spf, dkim, dmarc}`。
+体积上限：
+
+- Resend 的 `download_url`（原文和附件）超过 25 MiB 直接拒绝，不写入 R2 或 D1。响应里有 `Content-Length` 时先看这个头；没有的话边读边计字节，超过就停。
+- 写入 D1 的 `text_body` 和 `html_body` 截到 20 万字符，截断的末尾是 `\n[truncated]`。没超限的 `.eml` 仍完整留在 R2。
+- `include_raw_eml` 只把不超过 256 KiB 的原文放进 JSON。更大时返回 `r2_key`、`raw_eml_bytes` 和一句说明，不内联正文。
+
+`date` 优先用邮件 `Date` 头，解析不到再用 API 的 `created_at`，再不行用事件时间。收件的 `auth` 保存 `{spf, dkim, dmarc}`，搜索、列表和 `get_email` 都会把它带在元数据里。
 
 ## 路由
 
 | 方法 | 路径 | 鉴权 | 作用 |
 | --- | --- | --- | --- |
 | `POST` | `/` | Svix 签名 | 验签后入队 `mail-ingest` |
-| `POST` | `/mcp` | `Authorization: Bearer <MCP_TOKEN>` | MCP |
+| `POST` | `/mcp` | `Authorization: Bearer <MCP_TOKEN>`，或 `X-Internal-Token: <INTERNAL_TOKEN>` | MCP。每个凭证每分钟 120 次（只计当前 isolate） |
 | `GET` | `/health` | 无 | `{"ok":true,"last_received_at":"...","count_24h":N}` |
 
 `/health` 只返回最近一封收件的入库时间和过去 24 小时的归档条数。响应字段只有 `ok`、`last_received_at`、`count_24h`。Svix 时间戳偏离超过 5 分钟、签名对不上、或 MCP token 不对，都回 401，并且发生在读取业务数据之前。
@@ -83,9 +91,9 @@ Cursor / Claude Code：
 
 | 工具 | 作用 |
 | --- | --- |
-| `search_emails` | `query` 对 subject / msg_from / text_body 做 `LIKE`。可选 `from`、`to`、`since`、`until`、`direction`（`in`\|`out`）、`limit`（默认 20，最大 100）。返回元数据，带 `has_text` / `has_html`，不带正文。 |
-| `get_email` | 按 `resend_id` 返回元数据和 `text_body`。`include_html=true` 才带 `html_body`。`include_raw_eml=true` 从 R2 读 `raw/{resend_id}.eml`，对象不存在时在结果里注明。 |
-| `list_emails` | 按 `date` 倒序的元数据。可选 `limit`、`direction`、`since`。 |
+| `search_emails` | `query` 对 subject / msg_from / text_body 做 `LIKE`。可选 `from`、`to`、`since`、`until`、`direction`（`in`\|`out`）、`limit`（默认 20，最大 100）。返回元数据，带 `has_text` / `has_html` 和 `auth`，不带正文。 |
+| `get_email` | 按 `resend_id` 返回元数据（含 `auth`）、`text_body` 和已经存好的 `summary`。不会在读取时生成或写回摘要。`include_html=true` 才带 `html_body`。`include_raw_eml=true` 从 R2 读 `raw/{resend_id}.eml`：不超过 256 KiB 才内联，更大则返回 `r2_key`；对象不存在时在结果里注明。 |
+| `list_emails` | 按 `date` 倒序的元数据，含 `auth`。可选 `limit`、`direction`、`since`。 |
 | `email_stats` | `{total, by_direction:{in,out}, by_day:[{day,count}], top_senders:[{from,count}]}`。`by_day` 是近 30 天有邮件的日期，`top_senders` 最多 10 条。 |
 
 `YYYY-MM-DD` 会扩成当天的 UTC 起止。`%` 和 `_` 按字面量匹配。
