@@ -38,7 +38,7 @@ export const AI_STATUS_MIN_SAMPLE = 5;
 export const METRIC_STAGES = ["webhook", "ingest", "enrich", "dlq", "mcp", "health", "alert"];
 export const METRIC_OUTCOMES = ["ok", "duplicate", "retry", "dlq", "unauthorized", "ignored", "fresh", "rejected", "error"];
 export const METRIC_DOUBLES = ["lag_ms", "wall_ms", "cache", "neurons", "validator_discards"];
-const MCP_TOOL_NAMES = new Set(["search_emails", "get_email", "list_emails", "email_stats", "send_email", "set_email_read_status", "delete_email"]);
+const MCP_TOOL_NAMES = new Set(["search_emails", "get_email", "list_emails", "email_stats", "send_email", "set_email_read_status", "delete_email", "set_email_archived_status", "list_attachments", "get_attachment"]);
 const SUMMARY_STATUSES = new Set(["ok", "failed", "discarded", "skipped"]);
 const SAFE_LOG_ERRORS = new Set([
   "missing_header",
@@ -400,7 +400,7 @@ export function buildInsertQuery(row) {
 
 export function buildSearchQuery(input, ownerEmail) {
   const args = input || {};
-  assertOnlyKeys(args, new Set(["query", "from", "to", "since", "until", "direction", "limit", "fresh", "include_summary"]));
+  assertOnlyKeys(args, new Set(["query", "from", "to", "since", "until", "direction", "limit", "fresh", "include_summary", "is_read", "is_archived", "include_archived"]));
   assertOptionalFresh(args);
   const includeSummary = assertOptionalIncludeSummary(args);
   if (typeof args.query !== "string" || args.query.trim() === "") {
@@ -413,6 +413,14 @@ export function buildSearchQuery(input, ownerEmail) {
   const limit = clampLimit(args.limit);
   const pattern = likeContains(args.query);
   const where = ["deleted_at IS NULL", "(subject LIKE ? ESCAPE '\\' OR msg_from LIKE ? ESCAPE '\\' OR text_body LIKE ? ESCAPE '\\')"];
+  // 默认过滤已归档
+  if (args.include_archived !== true) {
+    where.push("is_archived = 0");
+  }
+  if (args.is_read === true) where.push("is_read = 1");
+  if (args.is_read === false) where.push("is_read = 0");
+  if (args.is_archived === true) where.push("is_archived = 1");
+  if (args.is_archived === false) where.push("is_archived = 0");
   const params = [pattern, pattern, pattern];
   // mailbox 隔离：只能看自己收发的
   if (ownerEmail) {
@@ -454,13 +462,20 @@ LIMIT ?`,
 
 export function buildListQuery(input, ownerEmail) {
   const args = input || {};
-  assertOnlyKeys(args, new Set(["limit", "direction", "since", "fresh", "include_summary"]));
+  assertOnlyKeys(args, new Set(["limit", "direction", "since", "fresh", "include_summary", "is_read", "is_archived", "include_archived"]));
   assertOptionalFresh(args);
   const includeSummary = assertOptionalIncludeSummary(args);
   assertDirection(args.direction);
   const limit = clampLimit(args.limit);
   const where = ["deleted_at IS NULL"];
   const params = [];
+  if (args.include_archived !== true) {
+    where.push("is_archived = 0");
+  }
+  if (args.is_read === true) where.push("is_read = 1");
+  if (args.is_read === false) where.push("is_read = 0");
+  if (args.is_archived === true) where.push("is_archived = 1");
+  if (args.is_archived === false) where.push("is_archived = 0");
   // mailbox 隔离
   if (ownerEmail) {
     where.push("(msg_from = ? OR msg_to LIKE ? ESCAPE '\\')");
@@ -1100,6 +1115,44 @@ export const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "set_email_archived_status",
+    description: "Archive or unarchive an email. Archived emails are hidden from default queries.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        resend_id: { type: "string", description: "The Resend ID of the email." },
+        is_archived: { type: "boolean", description: "True to archive, false to unarchive." },
+      },
+      required: ["resend_id", "is_archived"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "list_attachments",
+    description: "List attachments of an email.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        resend_id: { type: "string", description: "The Resend ID of the email." },
+      },
+      required: ["resend_id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_attachment",
+    description: "Get attachment content (base64).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        resend_id: { type: "string", description: "The Resend ID of the email." },
+        filename: { type: "string", description: "Attachment filename." },
+      },
+      required: ["resend_id", "filename"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 function toolText(value) {
@@ -1422,6 +1475,59 @@ async function callTool(name, args, deps) {
     await deps.queryRun(sql, params);
     await bumpRevision(deps);
     return toolText({ resend_id: resendId, deleted: true });
+  }
+  if (name === "set_email_archived_status") {
+    const resendId = args.resend_id;
+    const isArchived = args.is_archived;
+    if (!resendId || typeof isArchived !== "boolean") {
+      throw new RpcError(-32602, "resend_id and is_archived (boolean) are required");
+    }
+    if (!isSafeResendId(resendId)) throw new RpcError(-32602, "invalid resend_id");
+    const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
+    let sql = "UPDATE emails SET is_archived = ? WHERE resend_id = ? AND deleted_at IS NULL";
+    const params = [isArchived ? 1 : 0, resendId];
+    if (ownerEmail) {
+      sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
+      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
+    }
+    await deps.queryRun(sql, params);
+    await bumpRevision(deps);
+    return toolText({ resend_id: resendId, is_archived: isArchived });
+  }
+  if (name === "list_attachments") {
+    const resendId = args.resend_id;
+    if (!resendId || !isSafeResendId(resendId)) throw new RpcError(-32602, "valid resend_id is required");
+    const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
+    let sql = "SELECT attachments FROM emails WHERE resend_id = ? AND deleted_at IS NULL";
+    const params = [resendId];
+    if (ownerEmail) {
+      sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
+      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
+    }
+    const row = await deps.queryFirst(sql, params);
+    if (!row) return toolText({ resend_id: resendId, attachments: [] });
+    let atts = [];
+    try { atts = JSON.parse(row.attachments || "[]"); } catch {}
+    return toolText({ resend_id: resendId, attachments: atts.map(a => ({ filename: a.filename, content_type: a.content_type, size: a.size })) });
+  }
+  if (name === "get_attachment") {
+    const resendId = args.resend_id;
+    const filename = args.filename;
+    if (!resendId || !isSafeResendId(resendId)) throw new RpcError(-32602, "valid resend_id is required");
+    if (!filename) throw new RpcError(-32602, "filename is required");
+    const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
+    let sql = "SELECT resend_id FROM emails WHERE resend_id = ? AND deleted_at IS NULL";
+    const params = [resendId];
+    if (ownerEmail) {
+      sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
+      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
+    }
+    const row = await deps.queryFirst(sql, params);
+    if (!row) throw new RpcError(-32602, "email not found or access denied");
+    const key = `attachments/${resendId}/${filename}`;
+    const data = await deps.getObjectText(key);
+    if (!data) throw new RpcError(-32602, "attachment not found");
+    return toolText({ resend_id: resendId, filename, content_base64: data });
   }
   throw new RpcError(-32601, `unknown tool: ${name}`);
 }
@@ -2269,6 +2375,7 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
       // 邮件状态列迁移
       try { await db.queryRun(`ALTER TABLE emails ADD COLUMN is_read INTEGER DEFAULT 0`, []); } catch {}
       try { await db.queryRun(`ALTER TABLE emails ADD COLUMN deleted_at INTEGER`, []); } catch {}
+      try { await db.queryRun(`ALTER TABLE emails ADD COLUMN is_archived INTEGER DEFAULT 0`, []); } catch {}
       let body;
       try { body = await request.json(); } catch { body = {}; }
       const inviteCode = (body.invite_code || "").trim();
