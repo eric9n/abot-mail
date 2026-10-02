@@ -1410,8 +1410,11 @@ async function callTool(name, args, deps) {
     const subject = args.subject;
     const body = args.body;
     const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
+    if (!ownerEmail) {
+      throw new RpcError(-32001, "agent email not bound");
+    }
     // 默认用 agent 绑定的邮箱
-    const from = args.from || ownerEmail || "noreply@abot.run";
+    const from = args.from || ownerEmail;
     if (!to || !subject || !body) {
       throw new RpcError(-32602, "to, subject, body are required");
     }
@@ -2451,8 +2454,11 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
         trace.outcome = "unauthorized";
         return json({ ok: false, error: "unauthorized" }, 401);
       }
-      // 网关透传的 agent 身份（仅当 fromGateway 时信任）
+      // 网关透传的 agent 身份（仅当 fromGateway 时信任）— 强校验必传
       const ownerEmail = fromGateway ? (request.headers.get("x-abot-owner-email") || "").trim().toLowerCase() || null : null;
+      if (fromGateway && !ownerEmail) {
+        return json({ ok: false, error: "x-abot-owner-email required" }, 401);
+      }
       // 限流：按身份每分钟 100 次
       const rateKey = ownerEmail ? "mcp:" + ownerEmail : "mcp:ip:" + (request.headers.get("CF-Connecting-IP") || "unknown");
       const minute = Math.floor(Date.now() / 60000);
