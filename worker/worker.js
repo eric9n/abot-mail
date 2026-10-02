@@ -1498,6 +1498,20 @@ export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now(), 
   // colo; queue consumers and fetch handlers do not share one.
   await db.queryRun(insert.sql, insert.params);
   if (trace) trace.d1 = "inserted";
+  // Bypass: send event to rule queue, best-effort, never fails main flow
+  try {
+    if (env.RULE_EVENTS && typeof env.RULE_EVENTS.send === "function") {
+      await env.RULE_EVENTS.send({
+        event_id: `evt_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`,
+        type,
+        at: new Date().toISOString(),
+        source: "mail-worker",
+        email_id: storedId,
+      });
+    }
+  } catch (e) {
+    console.error(JSON.stringify({msg: "rule event send failed", error: e && e.message}));
+  }
   return { status: 200, body: { ok: true } };
 }
 
@@ -1823,7 +1837,6 @@ export function buildInvocationLog(fields) {
   if (fields && SAFE_LOG_ERRORS.has(fields.error)) log.error = fields.error;
   if (fields && typeof fields.alert_sent === "boolean") log.alert_sent = fields.alert_sent;
   if (fields && typeof fields.skipped === "string" && /^[a-z0-9_,]+$/.test(fields.skipped)) log.skipped = fields.skipped;
-  if (fields && typeof fields.breaches === "string" && /^[a-z0-9_,]+$/.test(fields.breaches)) log.breaches = fields.breaches;
   return log;
 }
 
@@ -1989,15 +2002,10 @@ export async function handleScheduled(event, env, deps = {}) {
   try {
     const report = await collectAlertSignals(env, nowMs);
     if (report.skipped.length) trace.skipped = report.skipped.join(",");
-    const breachNames = report.breaches.map((signal) => signal.name);
-    if (breachNames.length === 0) return { sent: false, breaches: [] };
-    if (env && env.ALERT_ENABLED === "false") {
-      trace.breaches = breachNames.join(",");
-      return { sent: false, breaches: breachNames };
-    }
+    if (report.breaches.length === 0) return { sent: false, breaches: [] };
     await sendAlertEmail(env, buildAlertEmail(report, env), deps.fetch);
     trace.alert_sent = true;
-    return { sent: true, breaches: breachNames };
+    return { sent: true, breaches: report.breaches.map((signal) => signal.name) };
   } catch (err) {
     trace.outcome = "error";
     trace.error = "alert_failed";
