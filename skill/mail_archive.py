@@ -32,6 +32,7 @@ METADATA_SELECT = """
   subject,
   date,
   message_id,
+  auth,
   attachments,
   created_at,
   CASE WHEN text_body IS NOT NULL AND text_body != '' THEN 1 ELSE 0 END AS has_text,
@@ -139,6 +140,17 @@ def flag(value):
     return value in (True, 1, "1")
 
 
+def parse_auth(value):
+    parsed = parse_json_field(value, None)
+    if not isinstance(parsed, dict):
+        return None
+    return {
+        "spf": parsed.get("spf"),
+        "dkim": parsed.get("dkim"),
+        "dmarc": parsed.get("dmarc"),
+    }
+
+
 def to_metadata(row):
     return {
         "resend_id": row.get("resend_id"),
@@ -151,6 +163,7 @@ def to_metadata(row):
         "message_id": row.get("message_id"),
         "has_text": flag(row.get("has_text")),
         "has_html": flag(row.get("has_html")),
+        "auth": parse_auth(row.get("auth")),
         "attachments": parse_json_field(row.get("attachments"), []),
         "created_at": row.get("created_at"),
     }

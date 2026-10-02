@@ -6,15 +6,28 @@
  *             reads may use the Cache API after auth; HTTP responses stay no-store
  *             search/list/stats/get_email keys include a D1 revision bumped on insert
  * GET /health public counts only (never cached)
- * scheduled   01:20 UTC D1 alert cron (no new secret; Analytics Engine is for later)
+ * scheduled   01:20 UTC D1 alert cron (ALERT_ENABLED === "false" logs only)
  *
- * Secrets come from the Worker env: WEBHOOK_SECRET, RESEND_API_KEY, MCP_TOKEN.
+ * Secrets come from the Worker env: WEBHOOK_SECRET, RESEND_API_KEY, MCP_TOKEN,
+ * and optional INTERNAL_TOKEN (X-Internal-Token on POST /mcp). All four are
+ * Worker secrets (`wrangler secret put`), never plain vars.
  * Observability uses the METRICS binding. It does not change archive responses.
  */
 
 const TIMESTAMP_TOLERANCE_SEC = 5 * 60;
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const MAX_BODY_BYTES = 1_000_000;
+/** POST /mcp fixed window. Counted in this isolate, per presented credential or client IP. */
+export const MCP_RATE_LIMIT = 120;
+export const MCP_RATE_WINDOW_MS = 60_000;
+/** Resend download_url bodies (raw .eml and attachments) above this are refused. */
+export const MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024;
+/** text_body and html_body written to D1 are cut to this many characters. */
+export const MAX_STORED_BODY_CHARS = 200_000;
+/** include_raw_eml inlines the message only at or under this size. Larger results return r2_key. */
+export const MAX_RAW_EML_INLINE_BYTES = 256 * 1024;
+const STORED_BODY_MARKER = "\n[truncated]";
+const mcpRateStore = new Map();
 /** Deliveries after this many attempts are recorded and acknowledged. */
 export const INGEST_MAX_RETRIES = 3;
 /** First retry waits this long; each later retry doubles it. */
@@ -295,8 +308,8 @@ export function mapEmailForStorage(email, { direction, eventCreatedAt, attachmen
     cc: JSON.stringify(asArray(email.cc)),
     subject: email.subject ?? null,
     date: pickEmailDate(email, eventCreatedAt, nowMs),
-    text_body: email.text ?? null,
-    html_body: email.html ?? null,
+    text_body: capStoredBody(email.text ?? null),
+    html_body: capStoredBody(email.html ?? null),
     message_id: email.message_id || unwrapHeader(headerValue(email, "message-id")) || null,
     auth: auth ? JSON.stringify(auth) : null,
     attachments: JSON.stringify(attachments),
@@ -362,6 +375,7 @@ const METADATA_SELECT = `
   subject,
   date,
   message_id,
+  auth,
   attachments,
   created_at,
   CASE WHEN text_body IS NOT NULL AND text_body != '' THEN 1 ELSE 0 END AS has_text,
@@ -607,6 +621,25 @@ function flag(value) {
   return value === true || value === 1 || value === "1";
 }
 
+function parseAuth(value) {
+  const parsed = parseJsonField(value, null);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  return {
+    spf: parsed.spf ?? null,
+    dkim: parsed.dkim ?? null,
+    dmarc: parsed.dmarc ?? null,
+  };
+}
+
+/** Keep D1 rows bounded. The raw .eml in R2 is the full message when the download fit. */
+export function capStoredBody(value) {
+  if (value == null) return null;
+  const text = typeof value === "string" ? value : String(value);
+  if (text.length <= MAX_STORED_BODY_CHARS) return text;
+  const keep = MAX_STORED_BODY_CHARS - STORED_BODY_MARKER.length;
+  return text.slice(0, keep) + STORED_BODY_MARKER;
+}
+
 export function toMetadata(row, options = {}) {
   const meta = {
     resend_id: row.resend_id,
@@ -619,6 +652,7 @@ export function toMetadata(row, options = {}) {
     message_id: row.message_id ?? null,
     has_text: flag(row.has_text),
     has_html: flag(row.has_html),
+    auth: parseAuth(row.auth),
     attachments: parseJsonField(row.attachments, []),
     created_at: row.created_at ?? null,
   };
@@ -631,11 +665,17 @@ export function toEmailDetail(row, options = {}) {
   const detail = { ...toMetadata(row), text_body: row.text_body ?? null, summary: summary ?? null };
   if (options.includeHtml) detail.html_body = row.html_body ?? null;
   if (options.includeRaw) {
-    if (options.rawEml == null) {
+    const raw = options.rawEml;
+    if (raw && typeof raw === "object" && raw.inline === false) {
+      detail.raw_eml = null;
+      detail.r2_key = raw.r2_key;
+      detail.raw_eml_bytes = raw.size;
+      detail.raw_eml_note = `${raw.r2_key} is ${raw.size} bytes, over the ${MAX_RAW_EML_INLINE_BYTES} byte inline cap`;
+    } else if (raw == null) {
       detail.raw_eml = null;
       detail.raw_eml_note = `${rawObjectKey(row.resend_id)} not found in R2`;
     } else {
-      detail.raw_eml = options.rawEml;
+      detail.raw_eml = raw;
     }
   }
   return detail;
@@ -1007,6 +1047,7 @@ async function cachedObjectText(deps, key, fresh) {
   }
   if (!deps || typeof deps.getObjectText !== "function") throw new Error("object store is not configured");
   const text = await deps.getObjectText(key);
+  if (text && typeof text === "object") return text;
   if (cache && text != null) {
     await scheduleCachePut(
       cache,
@@ -1020,6 +1061,8 @@ async function cachedObjectText(deps, key, fresh) {
 
 async function rememberR2(cache, key, bytes) {
   if (!cache || bytes == null || typeof cache.put !== "function") return;
+  const size = bytes.byteLength != null ? bytes.byteLength : 0;
+  if (size > MAX_RAW_EML_INLINE_BYTES) return;
   try {
     await cache.put(
       new Request(r2CacheUrl(key)),
@@ -1055,7 +1098,7 @@ export const TOOLS = [
   {
     name: "get_email",
     description:
-      "Fetch one archived email by resend_id, including text_body and summary. summary is an object or null. html_body and the raw RFC822 message are included only when requested.",
+      "Fetch one archived email by resend_id. Returns metadata (including auth spf/dkim/dmarc), text_body, and the stored summary. Does not generate or write a summary. html_body is included only when requested. The raw RFC822 message is inlined only when requested and at or under the inline cap; larger objects return r2_key instead of the bytes.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1235,65 +1278,10 @@ export async function handleMcpRpc(message, deps) {
   }
 }
 
-function aiConfigured(deps) {
-  return !!(deps && deps.ai && typeof deps.ai.run === "function");
-}
-
-async function deleteEmailCacheEntries(deps, resendId, rev) {
-  const cache = deps && deps.cache;
-  if (!cache || typeof cache.delete !== "function") return;
-  const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
-  const urls = [];
-  for (const includeHtml of [false, true]) {
-    for (const includeRaw of [false, true]) {
-      for (const ai of GET_AI_VARIANTS) {
-        urls.push(getEmailCacheUrl(resendId, includeHtml, includeRaw, ai, rev, ownerEmail));
-      }
-    }
-  }
-  await Promise.all(
-    urls.map(async (url) => {
-      try {
-        await cache.delete(new Request(url));
-      } catch {
-        // A missed delete expires on its own. It does not fail the read.
-      }
-    }),
-  );
-}
-
-function summaryWriteChanges(result) {
+function resultChanges(result) {
   if (result && result.meta && result.meta.changes != null) return Number(result.meta.changes);
   if (result && result.changes != null) return Number(result.changes);
   return null;
-}
-
-/** Fill a NULL summary. UPDATE does not bump cache_revision, so the old cache entries are deleted. */
-async function fillNullSummary(deps, row, resendId, rev) {
-  if (row.summary != null && row.summary !== "") return storedSummary(row.summary);
-  if (!aiConfigured(deps)) return null;
-  const generated = await summarizeEmail({
-    subject: row.subject ?? null,
-    textBody: row.text_body ?? null,
-    ai: deps.ai,
-    timeoutMs: deps.summaryTimeoutMs,
-    trace: deps.trace,
-  });
-  if (!generated) return null;
-  let summary = generated;
-  if (typeof deps.queryRun === "function") {
-    const result = await deps.queryRun(
-      "UPDATE emails SET summary = ? WHERE resend_id = ? AND (summary IS NULL OR summary = '')",
-      [JSON.stringify(generated), resendId],
-    );
-    if (summaryWriteChanges(result) === 0 && typeof deps.queryAll === "function") {
-      const rows = await deps.queryAll("SELECT summary FROM emails WHERE resend_id = ?", [resendId]);
-      const stored = rows && rows[0] ? storedSummary(rows[0].summary) : null;
-      if (stored) summary = stored;
-    }
-  }
-  await deleteEmailCacheEntries(deps, resendId, rev);
-  return summary;
 }
 
 function noteTool(trace, name, args) {
@@ -1357,8 +1345,6 @@ async function callTool(name, args, deps) {
         if (!hit) continue;
         try {
           const cached = JSON.parse(await hit.text());
-          // A cached null summary is incomplete once AI can fill it. UPDATE does not bump rev.
-          if (cached && cached.found !== false && cached.summary == null && aiConfigured(deps)) continue;
           // 安全：缓存命中后必须校验归属，防止跨账户读到他人邮件正文
           if (!cachedEmailBelongsToOwner(cached, ownerEmail)) continue;
           noteCache(deps && deps.trace, true);
@@ -1383,20 +1369,16 @@ async function callTool(name, args, deps) {
     }
     let rawEml;
     if (query.includeRaw) rawEml = await cachedObjectText(deps, rawObjectKey(id), fresh);
-    const summary = await fillNullSummary(deps, rows[0], id, rev);
     const value = {
       found: true,
       ...toEmailDetail(rows[0], {
         includeHtml: query.includeHtml,
         includeRaw: query.includeRaw,
         rawEml,
-        summary,
       }),
     };
     const decision = emailCacheDecision(columnPresent, columnPresent ? rows[0].ai_status : undefined);
-    // Keep retrying a null summary while AI is configured. A finished summary is cached with the row.
-    const cacheable = decision.cache && !(summary == null && aiConfigured(deps));
-    if (deps && deps.cache && cacheable) {
+    if (deps && deps.cache && decision.cache) {
       await scheduleCachePut(
         deps.cache,
         deps.ctx,
@@ -1619,7 +1601,15 @@ function d1Deps(env) {
     async getObjectText(key) {
       const obj = await env.ARCHIVE_BUCKET.get(key);
       if (!obj) return null;
-      return obj.text();
+      const size = Number.isFinite(obj.size) ? obj.size : null;
+      if (size != null && size > MAX_RAW_EML_INLINE_BYTES) {
+        return { inline: false, size, r2_key: key };
+      }
+      const text = await obj.text();
+      if (size == null && typeof text === "string" && text.length > MAX_RAW_EML_INLINE_BYTES) {
+        return { inline: false, size: text.length, r2_key: key };
+      }
+      return text;
     },
   };
 }
@@ -1689,7 +1679,79 @@ async function fetchAllowedBytes(url, doFetch, redirectsLeft = 3) {
     err.source = "download";
     throw err;
   }
-  return res.arrayBuffer();
+  return readCappedBytes(res);
+}
+
+function contentLength(res) {
+  if (!res || !res.headers || typeof res.headers.get !== "function") return null;
+  const raw = res.headers.get("content-length");
+  if (raw == null) return null;
+  const trimmed = String(raw).trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  return Number(trimmed);
+}
+
+function oversizedDownloadError() {
+  const err = new Error("refusing oversized download");
+  err.status = 413;
+  err.source = "download";
+  return err;
+}
+
+/** Read a download body, refusing Content-Length or streamed bytes over maxBytes. */
+export async function readCappedBytes(res, maxBytes = MAX_DOWNLOAD_BYTES) {
+  const declared = contentLength(res);
+  if (declared != null && declared > maxBytes) {
+    const body = res && res.body;
+    if (body && typeof body.cancel === "function") {
+      try {
+        await body.cancel();
+      } catch {
+        // Refusing the download does not depend on a clean cancel.
+      }
+    }
+    throw oversizedDownloadError();
+  }
+  const body = res && res.body;
+  if (!body || typeof body.getReader !== "function") {
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > maxBytes) throw oversizedDownloadError();
+    return buf;
+  }
+  const reader = body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The refused body does not need a clean close.
+        }
+        throw oversizedDownloadError();
+      }
+      chunks.push(value);
+    }
+  } catch (err) {
+    if (err && err.source === "download") throw err;
+    try {
+      await reader.cancel();
+    } catch {
+      // Ignore a second failure while surfacing the read error.
+    }
+    throw err;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out.buffer;
 }
 
 export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now(), cache = null, summaryTimeoutMs, trace } = {}) {
@@ -1775,21 +1837,25 @@ export async function archiveEvent({ event, env, fetchImpl, nowMs = Date.now(), 
   // cache_revision advances in this commit via AFTER INSERT. Readers fold that
   // value into cache keys. A caches.default delete here would stay in this
   // colo; queue consumers and fetch handlers do not share one.
-  await db.queryRun(insert.sql, insert.params);
-  if (trace) trace.d1 = "inserted";
-  // Bypass: send event to rule queue, best-effort, never fails main flow
-  try {
-    if (env.RULE_EVENTS && typeof env.RULE_EVENTS.send === "function") {
-      await env.RULE_EVENTS.send({
-        event_id: `evt_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`,
-        type,
-        at: new Date().toISOString(),
-        source: "mail-worker",
-        email_id: storedId,
-      });
+  const inserted = await db.queryRun(insert.sql, insert.params);
+  const changes = resultChanges(inserted);
+  if (trace) trace.d1 = changes === 0 ? "duplicate" : "inserted";
+  // Side channel only. A stable id lets the consumer dedupe. Send only when
+  // this statement inserted a row (INSERT OR IGNORE reports changes === 0).
+  if (changes === 1) {
+    try {
+      if (env.RULE_EVENTS && typeof env.RULE_EVENTS.send === "function") {
+        await env.RULE_EVENTS.send({
+          event_id: `${storedId}:${type}`,
+          type,
+          at: new Date(nowMs).toISOString(),
+          source: "mail-worker",
+          email_id: storedId,
+        });
+      }
+    } catch (e) {
+      console.error(JSON.stringify({ msg: "rule event send failed", error: e && e.message }));
     }
-  } catch (e) {
-    console.error(JSON.stringify({msg: "rule event send failed", error: e && e.message}));
   }
   return { status: 200, body: { ok: true } };
 }
@@ -2116,6 +2182,7 @@ export function buildInvocationLog(fields) {
   if (fields && SAFE_LOG_ERRORS.has(fields.error)) log.error = fields.error;
   if (fields && typeof fields.alert_sent === "boolean") log.alert_sent = fields.alert_sent;
   if (fields && typeof fields.skipped === "string" && /^[a-z0-9_,]+$/.test(fields.skipped)) log.skipped = fields.skipped;
+  if (fields && typeof fields.breaches === "string" && /^[a-z0-9_,]+$/.test(fields.breaches)) log.breaches = fields.breaches;
   return log;
 }
 
@@ -2281,10 +2348,17 @@ export async function handleScheduled(event, env, deps = {}) {
   try {
     const report = await collectAlertSignals(env, nowMs);
     if (report.skipped.length) trace.skipped = report.skipped.join(",");
-    if (report.breaches.length === 0) return { sent: false, breaches: [] };
+    const names = report.breaches.map((signal) => signal.name);
+    if (names.length === 0) return { sent: false, breaches: [] };
+    // Plain var, not a secret. Only the exact string "false" suppresses mail.
+    if (env && env.ALERT_ENABLED === "false") {
+      trace.breaches = names.join(",");
+      trace.alert_sent = false;
+      return { sent: false, breaches: names };
+    }
     await sendAlertEmail(env, buildAlertEmail(report, env), deps.fetch);
     trace.alert_sent = true;
-    return { sent: true, breaches: report.breaches.map((signal) => signal.name) };
+    return { sent: true, breaches: names };
   } catch (err) {
     trace.outcome = "error";
     trace.error = "alert_failed";
@@ -2296,14 +2370,56 @@ export async function handleScheduled(event, env, deps = {}) {
   }
 }
 
-function json(body, status = 200) {
+function json(body, status = 200, extraHeaders) {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
+      ...(extraHeaders || {}),
     },
   });
+}
+
+function headerTokenOk(header, token) {
+  if (typeof header !== "string" || typeof token !== "string" || token.length === 0) return false;
+  return timingSafeEqual(header, token);
+}
+
+function mcpLimit(env) {
+  if (!env || env.MCP_RATE_LIMIT == null || env.MCP_RATE_LIMIT === "") return MCP_RATE_LIMIT;
+  const n = Number(env.MCP_RATE_LIMIT);
+  if (!Number.isInteger(n) || n < 1 || n > 100_000) return MCP_RATE_LIMIT;
+  return n;
+}
+
+/** Credential when one was presented, otherwise the client IP. Not logged. */
+export function mcpClientKey(request) {
+  const internal = request.headers.get("x-internal-token");
+  if (typeof internal === "string" && internal.length > 0) return `internal:${internal}`;
+  const authorization = request.headers.get("authorization");
+  if (typeof authorization === "string" && authorization.length > 0) return `auth:${authorization}`;
+  const ip = request.headers.get("cf-connecting-ip") || "unknown";
+  return `ip:${ip}`;
+}
+
+export function consumeMcpRate(key, nowMs, limit = MCP_RATE_LIMIT, store = mcpRateStore) {
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const cap = Number.isInteger(limit) && limit > 0 ? limit : MCP_RATE_LIMIT;
+  const windowMs = MCP_RATE_WINDOW_MS;
+  let bucket = store.get(key);
+  if (!bucket || now < bucket.start || now - bucket.start >= windowMs) {
+    bucket = { start: now, count: 0 };
+    store.set(key, bucket);
+  }
+  bucket.count += 1;
+  if (store.size > 2000) {
+    for (const [storedKey, stored] of store) {
+      if (now - stored.start >= windowMs) store.delete(storedKey);
+    }
+  }
+  const retryAfterSec = Math.max(1, Math.ceil((bucket.start + windowMs - now) / 1000));
+  return { allowed: bucket.count <= cap, retryAfterSec };
 }
 
 function pathOf(request) {
@@ -2465,13 +2581,17 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
     }
 
     if (path === "/mcp") {
+      const rate = consumeMcpRate(mcpClientKey(request), deps.nowMs ?? Date.now(), mcpLimit(env));
+      if (!rate.allowed) {
+        trace.outcome = "rejected";
+        return json({ ok: false, error: "rate limited" }, 429, { "retry-after": String(rate.retryAfterSec) });
+      }
       if (request.method !== "POST") {
         trace.outcome = "rejected";
         return json({ ok: false, error: "method not allowed" }, 405);
       }
-      // 内部鉴权：网关透传
-      const it = request.headers.get("x-internal-token") || "";
-      const fromGateway = env.INTERNAL_TOKEN && it === env.INTERNAL_TOKEN;
+      // Gateway header is a Worker secret. Compare the same way as MCP_TOKEN.
+      const fromGateway = headerTokenOk(request.headers.get("x-internal-token"), env && env.INTERNAL_TOKEN);
       if (!fromGateway && !bearerOk(request.headers.get("authorization"), env && env.MCP_TOKEN)) {
         trace.outcome = "unauthorized";
         return json({ ok: false, error: "unauthorized" }, 401);

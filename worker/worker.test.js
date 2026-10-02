@@ -18,6 +18,11 @@ import worker, {
   ALERT_FROM,
   ALERT_TO,
   AI_STATUS_MIN_SAMPLE,
+  MAX_DOWNLOAD_BYTES,
+  MAX_RAW_EML_INLINE_BYTES,
+  MAX_STORED_BODY_CHARS,
+  MCP_RATE_LIMIT,
+  MCP_RATE_WINDOW_MS,
   alertWindow,
   archiveEvent,
   assembleStats,
@@ -64,6 +69,7 @@ import worker, {
   listCacheUrl,
   mapEmailForStorage,
   parseEmailDate,
+  readCappedBytes,
   r2CacheUrl,
   retryDelaySeconds,
   searchCacheFields,
@@ -368,8 +374,10 @@ test("SQL builders run against the archive schema", () => {
   const detail = all(buildGetQuery({ resend_id: "in-1", include_html: true }))[0];
   assert.equal(detail.text_body, "please pay 100% done");
   assert.match(detail.html_body, /pay/);
+  assert.deepEqual(toMetadata(detail).auth, { spf: "pass", dkim: "pass", dmarc: "pass" });
   const plain = all(buildGetQuery({ resend_id: "in-1" }))[0];
   assert.equal(plain.html_body, undefined);
+  assert.equal(toMetadata(all(buildGetQuery({ resend_id: "out-1" }))[0]).auth, null);
 
   const statsQueries = buildStatsQueries(Date.parse("2026-09-28T00:00:00.000Z"));
   const stats = assembleStats(
@@ -421,7 +429,10 @@ function sqliteEnv() {
       async get(key) {
         const hit = bucket.get(key);
         if (!hit) return null;
-        return { async text() { return new TextDecoder().decode(hit.bytes); } };
+        return {
+          size: hit.bytes.byteLength,
+          async text() { return new TextDecoder().decode(hit.bytes); },
+        };
       },
     },
     INGEST_QUEUE: {
@@ -630,6 +641,7 @@ test("webhook archives inbound mail once, then MCP can read it", async () => {
   assert.equal(foundRows.length, 1);
   assert.equal(foundRows[0].resend_id, EMAIL_ID);
   assert.equal("text_body" in foundRows[0], false);
+  assert.deepEqual(foundRows[0].auth, { spf: "pass", dkim: "pass", dmarc: "pass" });
 
   const detail = await mcp({
     jsonrpc: "2.0",
@@ -642,6 +654,7 @@ test("webhook archives inbound mail once, then MCP can read it", async () => {
   assert.match(email.text_body, /please pay/);
   assert.match(email.html_body, /pay/);
   assert.match(email.raw_eml, /Subject: invoice/);
+  assert.deepEqual(email.auth, { spf: "pass", dkim: "pass", dmarc: "pass" });
 
   const stats = await mcp({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "email_stats", arguments: {} } });
   const statsBody = JSON.parse(stats.body.result.content[0].text);
@@ -931,6 +944,8 @@ test("wrangler keeps production and staging queues apart", () => {
   assert.equal(toml.includes("whsec_"), false);
   assert.equal(/RESEND_API_KEY\s*=/.test(toml), false);
   assert.equal(/MCP_TOKEN\s*=/.test(toml), false);
+  assert.match(toml, /INTERNAL_TOKEN/);
+  assert.equal(/INTERNAL_TOKEN\s*=/.test(toml), false);
   const parts = toml.split("\n[env.staging]\n");
   assert.equal(parts.length, 2);
   const [prod, staging] = parts;
@@ -1152,6 +1167,10 @@ test("consumer records permanent Resend 4xx and exhausted retries", async () => 
   assert.equal(isRetryableIngestError(Object.assign(new Error("download 503"), { status: 503, source: "download" })), true);
   assert.equal(isRetryableIngestError(new TypeError("network timeout")), true);
   assert.equal(isRetryableIngestError(new Error("refusing unexpected download host")), false);
+  assert.equal(
+    isRetryableIngestError(Object.assign(new Error("refusing oversized download"), { status: 413, source: "download" })),
+    false,
+  );
 
   const missing = queueMessage(
     { resend_id: EMAIL_ID, event_type: "email.received", received_at: "2026-09-28T00:00:01.000Z" },
@@ -2406,7 +2425,7 @@ test("ingest stores the summary before the row is visible and replay does not re
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 1);
 });
 
-test("get_email lazily fills a NULL summary and clears that email's cache without bumping revision", async () => {
+test("get_email returns the stored summary and does not write one", async () => {
   const { db, env } = sqliteEnv();
   const row = mapEmailForStorage(
     {
@@ -2425,14 +2444,10 @@ test("get_email lazily fills a NULL summary and clears that email's cache withou
   assert.equal(db.prepare("SELECT summary FROM emails").get().summary, null);
 
   let calls = 0;
-  const summary = { points: ["Please pay the invoice", "Sender is alice"], todos: [] };
   env.AI = {
-    async run(model, input) {
+    async run() {
       calls += 1;
-      assert.equal(model, SUMMARY_MODEL);
-      assert.equal(input.max_tokens, SUMMARY_MAX_TOKENS);
-      assert.match(input.messages[1].content, /please pay the invoice/);
-      return { response: summaryJson(summary) };
+      throw new Error("get_email must not call AI");
     },
   };
   const cache = memoryCache();
@@ -2441,6 +2456,7 @@ test("get_email lazily fills a NULL summary and clears that email's cache withou
   const searchPlain = toolValue(await mcpCall(env, toolMessage(1, "search_emails", { query: "invoice" }), deps));
   assert.equal("summary" in searchPlain[0], false);
   assert.equal("text_body" in searchPlain[0], false);
+  assert.equal(searchPlain[0].auth, null);
   const searchWith = toolValue(await mcpCall(env, toolMessage(2, "search_emails", { query: "invoice", include_summary: true }), deps));
   assert.equal(searchWith[0].summary, null);
   const listed = toolValue(await mcpCall(env, toolMessage(3, "list_emails", { include_summary: true }), deps));
@@ -2467,42 +2483,34 @@ test("get_email lazily fills a NULL summary and clears that email's cache withou
   const stats = await mcpCall(env, toolMessage(5, "email_stats", { include_summary: true }), deps);
   assert.equal(stats.body.error.code, -32602);
 
-  const staleUrl = getEmailCacheUrl(EMAIL_ID, false, false, "none", rev);
-  await cache.put(
-    new Request(staleUrl),
-    new Response(JSON.stringify({ found: true, resend_id: EMAIL_ID, text_body: "stale", summary: null }), {
-      status: 200,
-      headers: { "cache-control": "max-age=86400", "content-type": "application/json" },
-    }),
-  );
   const first = toolValue(await mcpCall(env, toolMessage(6, "get_email", { resend_id: EMAIL_ID }), deps));
-  assert.deepEqual(first.summary, summary);
+  assert.equal(first.summary, null);
   assert.equal(first.text_body, "please pay the invoice");
-  assert.equal(calls, 1);
+  assert.equal(calls, 0);
+  assert.equal(cache.deletes.length, 0);
   assert.equal(cacheRev(db), rev);
-  assert.deepEqual(JSON.parse(db.prepare("SELECT summary FROM emails").get().summary), summary);
-  assert.ok(cache.deletes.includes(staleUrl));
-  assert.ok(cache.deletes.includes(getEmailCacheUrl(EMAIL_ID, true, true, "failed", rev)));
-  assert.ok(cache.deletes.every((url) => url.includes(encodeURIComponent(EMAIL_ID)) || url.includes(EMAIL_ID)));
-  assert.equal(cache.deletes.length, 20);
+  assert.equal(db.prepare("SELECT summary FROM emails").get().summary, null);
 
   const second = toolValue(await mcpCall(env, toolMessage(7, "get_email", { resend_id: EMAIL_ID }), deps));
-  assert.deepEqual(second.summary, summary);
-  assert.equal(calls, 1);
+  assert.equal(second.summary, null);
+  assert.equal(calls, 0);
+  assert.equal(db.prepare("SELECT summary FROM emails").get().summary, null);
 
   cache.advance(CACHE_TTL.search * 1000);
   const found = toolValue(await mcpCall(env, toolMessage(8, "search_emails", { query: "invoice", include_summary: true }), deps));
-  assert.deepEqual(found[0].summary, summary);
-  assert.equal(calls, 1);
+  assert.equal(found[0].summary, null);
+  assert.equal(calls, 0);
 
   const tools = (await mcpCall(env, { jsonrpc: "2.0", id: 9, method: "tools/list" }, deps)).body.result.tools;
   const searchTool = tools.find((tool) => tool.name === "search_emails");
   const listTool = tools.find((tool) => tool.name === "list_emails");
+  const getTool = tools.find((tool) => tool.name === "get_email");
   const statsTool = tools.find((tool) => tool.name === "email_stats");
   assert.equal(searchTool.inputSchema.properties.include_summary.type, "boolean");
   assert.equal(listTool.inputSchema.properties.include_summary.type, "boolean");
   assert.equal((searchTool.inputSchema.required || []).includes("include_summary"), false);
   assert.equal(statsTool.inputSchema.properties.include_summary, undefined);
+  assert.match(getTool.description, /Does not generate or write a summary/);
 });
 
 test("a database created before summary gains the column on read", async () => {
@@ -2770,19 +2778,18 @@ test("observability covers webhook, ingest, storage, and summary discards", asyn
   assertSafeLog(healthLogs[0], needles);
 });
 
-test("mcp reads record cache, fresh, and a filled summary without logging it", async () => {
+test("mcp reads record cache and fresh without logging the stored summary", async () => {
   const { db, env } = sqliteEnv();
   const points = [];
   env.METRICS = { writeDataPoint(point) { points.push(point); } };
   db.prepare(
-    "INSERT INTO emails (resend_id, direction, subject, text_body, msg_from, msg_to, cc, attachments, date) VALUES (?, 'in', 'SUBJECT-NEEDLE', 'BODY-NEEDLE', 'sender-needle@example.com', '[]', '[]', '[]', '2026-09-28T00:00:00.000Z')",
-  ).run(EMAIL_ID);
+    "INSERT INTO emails (resend_id, direction, subject, text_body, msg_from, msg_to, cc, attachments, date, summary) VALUES (?, 'in', 'SUBJECT-NEEDLE', 'BODY-NEEDLE', 'sender-needle@example.com', '[]', '[]', '[]', '2026-09-28T00:00:00.000Z', ?)",
+  ).run(EMAIL_ID, JSON.stringify({ points: ["needle-point-one", "needle-point-two"], todos: [] }));
+  let aiCalls = 0;
   env.AI = {
     async run() {
-      return {
-        response: JSON.stringify({ points: ["needle-point-one", "needle-point-two"], todos: [] }),
-        usage: { prompt_tokens: 10, completion_tokens: 4 },
-      };
+      aiCalls += 1;
+      throw new Error("get_email must not call AI");
     },
   };
   const cache = memoryCache();
@@ -2819,8 +2826,9 @@ test("mcp reads record cache, fresh, and a filled summary without logging it", a
   assert.equal(firstLogs[0].tool, "get_email");
   assert.equal(firstLogs[0].outcome, "ok");
   assert.equal(firstLogs[0].cache, 0);
-  assert.equal(firstLogs[0].summary_status, "ok");
-  assert.equal(firstLogs[0].validator_discards, 0);
+  assert.equal("summary_status" in firstLogs[0], false);
+  assert.equal("validator_discards" in firstLogs[0], false);
+  assert.equal(aiCalls, 0);
   assert.equal(firstLogs[0].resend_id, EMAIL_ID);
   assert.equal(points.at(-1).blobs[2], "get_email");
   assert.equal(points.at(-1).doubles[2], 0);
@@ -3036,4 +3044,273 @@ test("one alert query failure does not drop breaches from the others", async () 
   assert.equal(report.skipped.includes("ai_status"), true);
   assert.equal(report.signals.some((signal) => signal.name === "count_24h"), true);
   assert.equal(report.signals.some((signal) => signal.name === "stats_daily" && signal.value === 4), true);
+});
+
+test("readCappedBytes rejects an oversized Content-Length before reading the body", async () => {
+  let read = false;
+  const res = {
+    headers: new Headers({ "content-length": String(MAX_DOWNLOAD_BYTES + 1) }),
+    body: {
+      getReader() {
+        read = true;
+        throw new Error("body should not be read");
+      },
+    },
+    async arrayBuffer() {
+      read = true;
+      throw new Error("body should not be read");
+    },
+  };
+  await assert.rejects(
+    () => readCappedBytes(res),
+    (err) => err.message === "refusing oversized download" && err.status === 413 && err.source === "download",
+  );
+  assert.equal(read, false);
+});
+
+test("readCappedBytes stops once streamed bytes pass the cap", async () => {
+  const chunk = new Uint8Array(6);
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(chunk);
+      controller.enqueue(chunk);
+      controller.close();
+    },
+  });
+  await assert.rejects(
+    () => readCappedBytes(new Response(body, { status: 200 }), 8),
+    (err) => err.message === "refusing oversized download",
+  );
+  const buf = await readCappedBytes(new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 }), 8);
+  assert.equal(buf.byteLength, 4);
+});
+
+test("mapEmailForStorage truncates text and html that would bloat D1", () => {
+  const big = "b".repeat(MAX_STORED_BODY_CHARS + 40);
+  const row = mapEmailForStorage(
+    {
+      id: "big-1",
+      from: "a@b.c",
+      to: ["eric@abot.run"],
+      subject: "s",
+      text: big,
+      html: big,
+      created_at: "2026-09-28T00:00:00.000Z",
+    },
+    { direction: "in", eventCreatedAt: "2026-09-28T00:00:00.000Z", attachments: [] },
+  );
+  assert.equal(row.text_body.length, MAX_STORED_BODY_CHARS);
+  assert.equal(row.html_body.length, MAX_STORED_BODY_CHARS);
+  assert.match(row.text_body, /\n\[truncated\]$/);
+  assert.equal(row.text_body.includes(big), false);
+});
+
+test("include_raw_eml returns r2_key instead of inlining an oversized object", async () => {
+  const { db, env } = sqliteEnv();
+  db.exec("ALTER TABLE emails ADD COLUMN deleted_at INTEGER");
+  const row = mapEmailForStorage(
+    {
+      id: EMAIL_ID,
+      from: "a@b.c",
+      to: ["eric@abot.run"],
+      subject: "s",
+      text: "hi",
+      created_at: "2026-09-28T00:00:00.000Z",
+    },
+    { direction: "in", eventCreatedAt: "2026-09-28T00:00:00.000Z", attachments: [] },
+  );
+  db.prepare(buildInsertQuery(row).sql).run(...buildInsertQuery(row).params);
+  const bytes = new Uint8Array(MAX_RAW_EML_INLINE_BYTES + 8);
+  bytes.fill(65);
+  await env.ARCHIVE_BUCKET.put(`raw/${EMAIL_ID}.eml`, bytes);
+  let textCalls = 0;
+  const orig = env.ARCHIVE_BUCKET.get.bind(env.ARCHIVE_BUCKET);
+  env.ARCHIVE_BUCKET.get = async (key) => {
+    const obj = await orig(key);
+    if (!obj) return null;
+    return {
+      size: obj.size,
+      async text() {
+        textCalls += 1;
+        return obj.text();
+      },
+    };
+  };
+  const email = toolValue(
+    await mcpCall(env, toolMessage(1, "get_email", { resend_id: EMAIL_ID, include_raw_eml: true }), { nowMs: NOW_MS }),
+  );
+  assert.equal(email.raw_eml, null);
+  assert.equal(email.r2_key, `raw/${EMAIL_ID}.eml`);
+  assert.equal(email.raw_eml_bytes, bytes.byteLength);
+  assert.match(email.raw_eml_note, /inline cap/);
+  assert.equal(textCalls, 0);
+});
+
+test("POST /mcp accepts X-Internal-Token only as a full timing-safe match", async () => {
+  const env = {
+    INTERNAL_TOKEN: "internal-token-value",
+    MCP_TOKEN: "bearer-token-value",
+    DB: { prepare() { throw new Error("db touched"); } },
+  };
+  const post = (headers) =>
+    handleFetch(
+      new Request("https://example.test/mcp", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      }),
+      env,
+      { nowMs: 50 },
+    );
+  assert.equal(
+    (await post({ "x-internal-token": "internal-token-value", "x-abot-owner-email": "owner@abot.run" })).status,
+    200,
+  );
+  assert.equal((await post({ "x-internal-token": "internal-token-valu" })).status, 401);
+  assert.equal((await post({ "x-internal-token": "internal-token-valueX" })).status, 401);
+  assert.equal((await post({ "x-internal-token": "nope", authorization: "Bearer bearer-token-value" })).status, 200);
+  assert.equal((await post({})).status, 401);
+  const unset = await handleFetch(
+    new Request("https://example.test/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-internal-token": "internal-token-value" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    }),
+    { MCP_TOKEN: "bearer-token-value", DB: env.DB },
+    { nowMs: 50 },
+  );
+  assert.equal(unset.status, 401);
+  const blank = await handleFetch(
+    new Request("https://example.test/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-internal-token": "" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    }),
+    { ...env, INTERNAL_TOKEN: "" },
+    { nowMs: 51 },
+  );
+  assert.equal(blank.status, 401);
+});
+
+test("POST /mcp rate limit is per presented credential", async () => {
+  assert.equal(MCP_RATE_LIMIT, 120);
+  assert.equal(MCP_RATE_WINDOW_MS, 60_000);
+  const env = {
+    MCP_TOKEN: "rate-limit-token",
+    MCP_RATE_LIMIT: "2",
+    DB: { prepare() { throw new Error("db touched"); } },
+  };
+  const post = (token, body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })) =>
+    handleFetch(
+      new Request("https://example.test/mcp", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body,
+      }),
+      token === "rate-limit-token" ? env : { ...env, MCP_TOKEN: token },
+      { nowMs: 80 },
+    );
+  assert.equal((await post("rate-limit-token")).status, 200);
+  assert.equal((await post("rate-limit-token")).status, 200);
+  const limited = await post("rate-limit-token", "{");
+  assert.equal(limited.status, 429);
+  assert.equal(limited.headers.get("cache-control"), "no-store");
+  assert.ok(Number(limited.headers.get("retry-after")) >= 1);
+  const body = await limited.json();
+  assert.deepEqual(body, { ok: false, error: "rate limited" });
+  const other = await post("other-token", "{");
+  assert.equal(other.status, 400);
+});
+
+test("rule events use a stable id and send only when the insert changes a row", async () => {
+  const { db, env } = sqliteEnv();
+  const sentEvents = [];
+  env.RULE_EVENTS = {
+    async send(body) {
+      sentEvents.push(body);
+    },
+  };
+  const event = { type: "email.received", created_at: "2026-09-28T00:00:01.000Z", data: { email_id: EMAIL_ID } };
+  const first = await archiveEvent({ event, env, fetchImpl: ingestFetch(), nowMs: NOW_MS });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.ok, true);
+  assert.deepEqual(sentEvents, [
+    {
+      event_id: `${EMAIL_ID}:email.received`,
+      type: "email.received",
+      at: new Date(NOW_MS).toISOString(),
+      source: "mail-worker",
+      email_id: EMAIL_ID,
+    },
+  ]);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 1);
+
+  const again = await archiveEvent({ event, env, fetchImpl: ingestFetch(), nowMs: NOW_MS });
+  assert.equal(again.body.duplicate, true);
+  assert.equal(sentEvents.length, 1);
+
+  const missed = sqliteEnv();
+  missed.env.RULE_EVENTS = {
+    async send(body) {
+      sentEvents.push(body);
+    },
+  };
+  const orig = missed.env.DB.prepare.bind(missed.env.DB);
+  missed.env.DB.prepare = (sql) => {
+    const stmt = orig(sql);
+    if (String(sql).startsWith("INSERT OR IGNORE INTO emails")) {
+      return {
+        bind(...params) {
+          const bound = stmt.bind(...params);
+          return {
+            all: (...args) => bound.all(...args),
+            first: (...args) => bound.first(...args),
+            run: async () => ({ success: true, meta: { changes: 0 } }),
+          };
+        },
+      };
+    }
+    return stmt;
+  };
+  const quiet = await archiveEvent({
+    event: { type: "email.received", created_at: "2026-09-28T00:00:01.000Z", data: { email_id: "other-id-1" } },
+    env: missed.env,
+    fetchImpl: plainEmailFetch("other-id-1"),
+    nowMs: NOW_MS,
+  });
+  assert.equal(quiet.status, 200);
+  assert.equal(sentEvents.length, 1);
+  assert.equal(missed.db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 0);
+
+  const broken = sqliteEnv();
+  broken.env.RULE_EVENTS = {
+    async send() {
+      throw new Error("queue down");
+    },
+  };
+  const kept = await archiveEvent({
+    event: { type: "email.sent", created_at: "2026-09-28T00:00:01.000Z", data: { email_id: "sent-1111-2222" } },
+    env: broken.env,
+    fetchImpl: async (url) => {
+      const href = String(url);
+      if (href === "https://api.resend.com/emails/sent-1111-2222") {
+        return jsonResponse({
+          id: "sent-1111-2222",
+          from: "a@b.c",
+          to: ["c@d.e"],
+          subject: "s",
+          text: "t",
+          created_at: "2026-09-28T00:00:00.000Z",
+        });
+      }
+      if (href.startsWith("https://api.resend.com/emails/sent-1111-2222/attachments")) {
+        return jsonResponse({ has_more: false, data: [] });
+      }
+      throw new Error(`unexpected fetch ${href}`);
+    },
+    nowMs: NOW_MS,
+  });
+  assert.equal(kept.status, 200);
+  assert.equal(kept.body.ok, true);
+  assert.equal(broken.db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 1);
 });

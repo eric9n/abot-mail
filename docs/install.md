@@ -15,10 +15,11 @@
 - 本仓库的 `worker/worker.js`（单个 ES module，没有别的本地 import）和 `worker/schema.sql`。
 - 能从外部邮箱往 `<MAIL_DOMAIN>` 发一封信，供最后的全链路验证。
 
-生成两个密钥，不要写进 git：
+生成密钥，不要写进 git：
 
 ```bash
 openssl rand -base64 32    # 用作 <MCP_TOKEN>
+openssl rand -base64 32    # 用作 <INTERNAL_TOKEN>
 ```
 
 `<WEBHOOK_SECRET>` 先空着。它是创建 Resend webhook 之后返回的 `signing_secret`（`whsec_` 开头），原样放进 Worker，不要自己去掉前缀。
@@ -47,7 +48,8 @@ Cloudflare 的成功响应是 `{"success":true,"result":...}`。`success` 不是
 | `<MAIL_INGEST_DLQ_ID>` | 队列 `mail-ingest-dlq` 的 `queue_id` |
 | `<RESEND_API_KEY>` | Resend API key |
 | `<WEBHOOK_SECRET>` | webhook 的 `signing_secret`，形如 `whsec_...` |
-| `<MCP_TOKEN>` | 自行生成的长随机串，只用于 `POST /mcp` |
+| `<MCP_TOKEN>` | 自行生成的长随机串，只用于 `POST /mcp` 的 Bearer |
+| `<INTERNAL_TOKEN>` | 自行生成的长随机串，Worker secret。设了之后 `POST /mcp` 接受 `X-Internal-Token` |
 | `<MAIL_DOMAIN>` | 收件域名，须开通 Resend receiving |
 | `<RESEND_DOMAIN_ID>` | Resend 域名 id |
 | `<ALERT_TO>` | 告警收件地址，安装者自己的邮箱。普通变量，不是 secret |
@@ -68,7 +70,7 @@ Worker 的公开 origin 是：
 | `AI` | Workers AI | 无外部 key |
 | `METRICS` | Analytics Engine | dataset `mail_metrics` |
 
-密钥只有三个，都是 Worker secret：`WEBHOOK_SECRET`、`RESEND_API_KEY`、`MCP_TOKEN`。
+密钥是 Worker secret，用 `secret_text` / `wrangler secret put` 写入，不要放进 `[vars]` 或 metadata 的 `plain_text`：`WEBHOOK_SECRET`、`RESEND_API_KEY`、`MCP_TOKEN`、`INTERNAL_TOKEN`。`INTERNAL_TOKEN` 可以后补；没设时只有 Bearer 能进 `/mcp`。设了之后，请求头 `X-Internal-Token` 必须和整个 secret 逐字符相同才算通过。
 
 ## 分步安装
 
@@ -322,7 +324,7 @@ npx wrangler queues create mail-ingest
 
 把 metadata 写到仓库外的 `/tmp/abot-mail-worker-metadata.json`。第一次上传**不要**放 `secret_text`。密钥在第 9 步单独写。之后再次上传时也继续省略 `secret_text`：省略不会删除已有 secret，已有 secret 会保留。不要把这份 JSON 提交进仓库。
 
-告警地址不是 secret。`worker/worker.js` 里的默认值是 `ALERT_TO=eric@abot.run`、`ALERT_FROM=abot-mail <alerts@abot.run>`，只能用普通变量覆盖（wrangler 的 `[vars]`，这条 API 里是 `type: "plain_text"`）。不改的话，告警会发到生产邮箱；新的 Resend 账号通常也不能用 `alerts@abot.run` 当发件人。新安装默认关掉告警：`ALERT_ENABLED` 设为字符串 `false`（代码认的是 `"false"` 这四个字符）。`ALERT_TO` 改成安装者自己的地址 `<ALERT_TO>`。`ALERT_FROM` 改成 `<MAIL_DOMAIN>` 上已经能发信的地址 `<ALERT_FROM>`，不要留生产默认值。以后若把 `ALERT_ENABLED` 改成别的值，cron 才会按这两个地址发信。再次上传时这三条 `plain_text` 要留在 `bindings` 里：省略 `secret_text` 不会删 secret，省略 `plain_text` 会丢掉变量，告警又回到代码里的默认地址。
+告警地址不是 secret。`worker/worker.js` 里的默认值是 `ALERT_TO=eric@abot.run`、`ALERT_FROM=abot-mail <alerts@abot.run>`，只能用普通变量覆盖（wrangler 的 `[vars]`，这条 API 里是 `type: "plain_text"`）。不改的话，告警会发到生产邮箱；新的 Resend 账号通常也不能用 `alerts@abot.run` 当发件人。新安装默认关掉告警：`ALERT_ENABLED` 设为字符串 `false`（代码认的是 `"false"` 这四个字符，别的写法包括 `False` 和 `0` 都会发信）。关掉时 cron 仍会跑并计算信号；有越限时 invoke 日志里写 `breaches`（逗号分隔的名字），`alert_sent` 为 false，返回 `{sent:false}`，不调用 Resend。`ALERT_TO` 改成安装者自己的地址 `<ALERT_TO>`。`ALERT_FROM` 改成 `<MAIL_DOMAIN>` 上已经能发信的地址 `<ALERT_FROM>`，不要留生产默认值。以后若把 `ALERT_ENABLED` 改成 `"false"` 以外的值，cron 才会按这两个地址发信。再次上传时这三条 `plain_text` 要留在 `bindings` 里：省略 `secret_text` 不会删 secret，省略 `plain_text` 会丢掉变量，告警又回到代码里的默认地址。
 
 ```json
 {
@@ -377,7 +379,7 @@ ALERT_FROM = "<ALERT_FROM>"
 
 **预期输出。** 部署成功，并打印 `https://<WORKER_NAME>.<WORKERS_SUBDOMAIN>.workers.dev`。
 
-**验证。** deploy 命令退出码为 0。`GET /health` 只查 D1，不读 `MCP_TOKEN`、`RESEND_API_KEY`、`WEBHOOK_SECRET`。secret 没设不影响 health。表和 `DB` 绑定正确时是 HTTP 200、`ok: true`。503 表示这次 D1 查询抛错（表没建完，或绑定的不是 `<D1_DATABASE_ID>`），不是缺 secret。字段核对放在文末「验证」A。
+**验证。** deploy 命令退出码为 0。`GET /health` 只查 D1，不读 `MCP_TOKEN`、`RESEND_API_KEY`、`WEBHOOK_SECRET`、`INTERNAL_TOKEN`。secret 没设不影响 health。表和 `DB` 绑定正确时是 HTTP 200、`ok: true`。503 表示这次 D1 查询抛错（表没建完，或绑定的不是 `<D1_DATABASE_ID>`），不是缺 secret。字段核对放在文末「验证」A。
 
 ### 7. 打开 workers.dev
 
@@ -415,7 +417,7 @@ body 就是 `{"enabled":true}`。
 
 **预期输出。** `success: true`，`result.enabled` 为 `true`。
 
-**验证。** 再 GET 同一个 `/workers/scripts/<WORKER_NAME>/subdomain`，`enabled` 仍是 `true`。浏览器或 curl 访问 `https://<WORKER_NAME>.<WORKERS_SUBDOMAIN>.workers.dev/health` 应得到 JSON，而不是 Cloudflare 的找不到主机。`/health` 不读 `MCP_TOKEN`、`RESEND_API_KEY`、`WEBHOOK_SECRET`，secret 没设也不影响结果。表和 `DB` 绑定正确时是 HTTP 200、`ok: true`。503、`ok: false` 表示 D1 查询抛错（建表或绑定问题），不是缺 secret。字段是否完整放在文末「验证」A。
+**验证。** 再 GET 同一个 `/workers/scripts/<WORKER_NAME>/subdomain`，`enabled` 仍是 `true`。浏览器或 curl 访问 `https://<WORKER_NAME>.<WORKERS_SUBDOMAIN>.workers.dev/health` 应得到 JSON，而不是 Cloudflare 的找不到主机。`/health` 不读 `MCP_TOKEN`、`RESEND_API_KEY`、`WEBHOOK_SECRET`、`INTERNAL_TOKEN`，secret 没设也不影响结果。表和 `DB` 绑定正确时是 HTTP 200、`ok: true`。503、`ok: false` 表示 D1 查询抛错（建表或绑定问题），不是缺 secret。字段是否完整放在文末「验证」A。
 
 用 wrangler 部署的跳过本步，只做这条 GET 核对。
 
@@ -479,9 +481,9 @@ curl -sS \
 
 ### 9. 写入 secrets
 
-**做什么。** 写入 `RESEND_API_KEY` 和 `MCP_TOKEN`。`WEBHOOK_SECRET` 等第 11 步拿到 `signing_secret` 再写。三个都是 `secret_text`。
+**做什么。** 写入 `RESEND_API_KEY`、`MCP_TOKEN` 和 `INTERNAL_TOKEN`。三个都是 `secret_text`，不是 `plain_text`。`WEBHOOK_SECRET` 等第 11 步拿到 `signing_secret` 再写。`INTERNAL_TOKEN` 和 `MCP_TOKEN` 一样是长随机串，只放在 Worker secret 里。网关调用 `POST /mcp` 时带 `X-Internal-Token: <INTERNAL_TOKEN>`；普通 MCP 客户端继续用 Bearer `MCP_TOKEN`。
 
-再次上传脚本时，metadata 里不要带这三项。省略 `secret_text` **不会**删掉已经写入的 secret。
+再次上传脚本时，metadata 里不要带这些 `secret_text`。省略 `secret_text` **不会**删掉已经写入的 secret。
 
 **命令。** 每个 secret 一次 PUT：
 
@@ -497,6 +499,12 @@ curl -sS -X PUT \
   -H "Authorization: Bearer <CLOUDFLARE_API_TOKEN>" \
   -H "Content-Type: application/json" \
   -d '{"name":"MCP_TOKEN","text":"<MCP_TOKEN>","type":"secret_text"}'
+
+curl -sS -X PUT \
+  "https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/workers/scripts/<WORKER_NAME>/secrets" \
+  -H "Authorization: Bearer <CLOUDFLARE_API_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"INTERNAL_TOKEN","text":"<INTERNAL_TOKEN>","type":"secret_text"}'
 ```
 
 wrangler 等价命令（在 `worker/` 目录，交互式粘贴，不要把值写进 shell 历史以外的文件）：
@@ -504,6 +512,7 @@ wrangler 等价命令（在 `worker/` 目录，交互式粘贴，不要把值写
 ```bash
 npx wrangler secret put RESEND_API_KEY
 npx wrangler secret put MCP_TOKEN
+npx wrangler secret put INTERNAL_TOKEN
 ```
 
 **预期输出。** `success: true`。`result.name` 是 secret 的名字，`result.type` 是 `secret_text`。响应里**没有** secret 的明文。
@@ -516,11 +525,11 @@ curl -sS \
   -H "Authorization: Bearer <CLOUDFLARE_API_TOKEN>"
 ```
 
-现在应有 `RESEND_API_KEY` 和 `MCP_TOKEN`。第 11 步之后再加上 `WEBHOOK_SECRET`。
+现在应有 `RESEND_API_KEY`、`MCP_TOKEN` 和 `INTERNAL_TOKEN`。第 11 步之后再加上 `WEBHOOK_SECRET`。列表里只有名字，没有值。
 
 ### 10. 配置 cron `20 1 * * *`
 
-**做什么。** 每天 01:20 UTC 跑一次 scheduled handler。这是告警 cron，不新增 secret。收件人、发件人和开关是第 6 步的普通变量：`ALERT_ENABLED=false` 时 cron 仍会跑，但不会发信。表达式是五段：`20 1 * * *`。
+**做什么。** 每天 01:20 UTC 跑一次 scheduled handler。这是告警 cron，不新增 secret。收件人、发件人和开关是第 6 步的普通变量：`ALERT_ENABLED` 为字符串 `false` 时 cron 仍会跑并记下越限的信号名，但不会调用 Resend 发信。表达式是五段：`20 1 * * *`。
 
 **命令。** body 是**裸数组**。不要包一层 `{"schedules":[...]}`。
 
@@ -600,7 +609,7 @@ curl -sS -X PUT \
 
 **预期输出。** Resend 返回 `object: "webhook"`、一个 id，以及 `signing_secret`。Cloudflare secret PUT 为 `success: true`，名字是 `WEBHOOK_SECRET`。
 
-**验证。** `GET https://api.resend.com/webhooks`（同一个 Bearer），有一条 endpoint 正好是 Worker 的 `/`，events 里同时有 `email.received` 和 `email.sent`。Cloudflare secret 列表里三个名字都在：`WEBHOOK_SECRET`、`RESEND_API_KEY`、`MCP_TOKEN`。
+**验证。** `GET https://api.resend.com/webhooks`（同一个 Bearer），有一条 endpoint 正好是 Worker 的 `/`，events 里同时有 `email.received` 和 `email.sent`。Cloudflare secret 列表里四个名字都在：`WEBHOOK_SECRET`、`RESEND_API_KEY`、`MCP_TOKEN`、`INTERNAL_TOKEN`。
 
 ## 验证
 
@@ -617,7 +626,7 @@ curl -sS "https://<WORKER_NAME>.<WORKERS_SUBDOMAIN>.workers.dev/health"
 python3 skill/mcp_cli.py --url "https://<WORKER_NAME>.<WORKERS_SUBDOMAIN>.workers.dev" health
 ```
 
-**预期输出。** HTTP 200，JSON 只有三个字段：`ok` 为 `true`，`last_received_at`（还没有收件时是 `null`），`count_24h` 是数字。`/health` 只查 D1，不读 `MCP_TOKEN`、`RESEND_API_KEY`、`WEBHOOK_SECRET`。这三个 secret 没设时，表和绑定正确仍然是这个结果。
+**预期输出。** HTTP 200，JSON 只有三个字段：`ok` 为 `true`，`last_received_at`（还没有收件时是 `null`），`count_24h` 是数字。`/health` 只查 D1，不读 `MCP_TOKEN`、`RESEND_API_KEY`、`WEBHOOK_SECRET`、`INTERNAL_TOKEN`。这些 secret 没设时，表和绑定正确仍然是这个结果。
 
 **验证。** 两个命令的 JSON 一致。响应里没有 subject、正文、token。503、`ok: false`（`count_24h` 为 `null`）是 D1 查询抛错，去修表或绑定，不是去补 secret。
 
@@ -767,13 +776,13 @@ Secure Vault：credential 名 `custom.abot-mail`，字段名 `MCP_TOKEN`，值�
 
 **cron PUT 报 body 不合法，或 GET schedules 是空的。** body 必须是裸数组 `[{"cron":"20 1 * * *"}]`。`{"schedules":[{"cron":"20 1 * * *"}]}` 是错的。空数组会清空已有 cron。
 
-**重新上传脚本之后 MCP 突然 401，或 webhook 突然 401。** 检查 metadata 里是不是写了空的 `secret_text`。正确做法是整段省略 `secret_text`，已有 secret 会留下。省略本身不会删除。确认 secret 列表里三个名字还在，值错了就再 PUT 一次。
+**重新上传脚本之后 MCP 突然 401，或 webhook 突然 401。** 检查 metadata 里是不是写了空的 `secret_text`。正确做法是整段省略 `secret_text`，已有 secret 会留下。省略本身不会删除。确认 secret 列表里 `WEBHOOK_SECRET`、`RESEND_API_KEY`、`MCP_TOKEN`、`INTERNAL_TOKEN` 还在，值错了就再 PUT 一次。不要把 `INTERNAL_TOKEN` 写成 `plain_text`。
 
 **D1 建表失败，或只建出了表、没有触发器。** 不要用 batch 端点，也不要把 `09.sql` 按分号拆开。每条语句单独 `POST .../d1/database/<D1_DATABASE_ID>/query`。触发器是一条语句。错误是 `incomplete input` 时，`BEGIN` 不是大写，或 `09.sql` 是 CRLF。改成大写 `BEGIN` 和 LF 换行，再 POST 这一段。
 
 **消费者创建失败，提示找不到脚本。** 先完成第 6 步。死信队列必须先于主队列的 consumer 存在。`max_wait_time_ms` 用 `1000`。
 
-**`/health` 是 503，`ok: false`。** D1 查询抛错：绑定的 id 不是 `<D1_DATABASE_ID>`，或第 2 步的表没建完。`count_24h` 在失败时会是 `null`。这和 secret 无关。`MCP_TOKEN`、`RESEND_API_KEY`、`WEBHOOK_SECRET` 没设时，表和绑定正确仍然是 HTTP 200、`ok: true`。路由已经通了，修绑定或补表，不要重装账号。
+**`/health` 是 503，`ok: false`。** D1 查询抛错：绑定的 id 不是 `<D1_DATABASE_ID>`，或第 2 步的表没建完。`count_24h` 在失败时会是 `null`。这和 secret 无关。`MCP_TOKEN`、`RESEND_API_KEY`、`WEBHOOK_SECRET`、`INTERNAL_TOKEN` 没设时，表和绑定正确仍然是 HTTP 200、`ok: true`。路由已经通了，修绑定或补表，不要重装账号。
 
 **`POST /mcp` 415。** `Content-Type` 不是 `application/json`。
 
