@@ -2501,6 +2501,7 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
         summaryTimeoutMs: deps.summaryTimeoutMs,
         trace,
         ownerEmail,
+        env,
       });
       if (rpc.type === "notification") {
         trace.outcome = "ok";
