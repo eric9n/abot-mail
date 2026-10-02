@@ -38,7 +38,7 @@ export const AI_STATUS_MIN_SAMPLE = 5;
 export const METRIC_STAGES = ["webhook", "ingest", "enrich", "dlq", "mcp", "health", "alert"];
 export const METRIC_OUTCOMES = ["ok", "duplicate", "retry", "dlq", "unauthorized", "ignored", "fresh", "rejected", "error"];
 export const METRIC_DOUBLES = ["lag_ms", "wall_ms", "cache", "neurons", "validator_discards"];
-const MCP_TOOL_NAMES = new Set(["search_emails", "get_email", "list_emails", "email_stats", "send_email"]);
+const MCP_TOOL_NAMES = new Set(["search_emails", "get_email", "list_emails", "email_stats", "send_email", "set_email_read_status", "delete_email"]);
 const SUMMARY_STATUSES = new Set(["ok", "failed", "discarded", "skipped"]);
 const SAFE_LOG_ERRORS = new Set([
   "missing_header",
@@ -398,7 +398,7 @@ export function buildInsertQuery(row) {
   };
 }
 
-export function buildSearchQuery(input) {
+export function buildSearchQuery(input, ownerEmail) {
   const args = input || {};
   assertOnlyKeys(args, new Set(["query", "from", "to", "since", "until", "direction", "limit", "fresh", "include_summary"]));
   assertOptionalFresh(args);
@@ -412,8 +412,13 @@ export function buildSearchQuery(input) {
   assertDirection(args.direction);
   const limit = clampLimit(args.limit);
   const pattern = likeContains(args.query);
-  const where = ["(subject LIKE ? ESCAPE '\\' OR msg_from LIKE ? ESCAPE '\\' OR text_body LIKE ? ESCAPE '\\')"];
+  const where = ["deleted_at IS NULL", "(subject LIKE ? ESCAPE '\\' OR msg_from LIKE ? ESCAPE '\\' OR text_body LIKE ? ESCAPE '\\')"];
   const params = [pattern, pattern, pattern];
+  // mailbox 隔离：只能看自己收发的
+  if (ownerEmail) {
+    where.push("(msg_from = ? OR msg_to LIKE ? ESCAPE '\\')");
+    params.push(ownerEmail, likeContains('"' + ownerEmail + '"'));
+  }
   if (args.from != null && args.from !== "") {
     where.push("msg_from LIKE ? ESCAPE '\\'");
     params.push(likeContains(args.from));
@@ -447,15 +452,20 @@ LIMIT ?`,
   };
 }
 
-export function buildListQuery(input) {
+export function buildListQuery(input, ownerEmail) {
   const args = input || {};
   assertOnlyKeys(args, new Set(["limit", "direction", "since", "fresh", "include_summary"]));
   assertOptionalFresh(args);
   const includeSummary = assertOptionalIncludeSummary(args);
   assertDirection(args.direction);
   const limit = clampLimit(args.limit);
-  const where = [];
+  const where = ["deleted_at IS NULL"];
   const params = [];
+  // mailbox 隔离
+  if (ownerEmail) {
+    where.push("(msg_from = ? OR msg_to LIKE ? ESCAPE '\\')");
+    params.push(ownerEmail, likeContains('"' + ownerEmail + '"'));
+  }
   if (args.direction != null) {
     where.push("direction = ?");
     params.push(args.direction);
@@ -479,6 +489,7 @@ LIMIT ?`,
 
 export function buildGetQuery(input, options = {}) {
   const args = input || {};
+  const ownerEmail = options.ownerEmail || null;
   assertOnlyKeys(args, new Set(["resend_id", "include_html", "include_raw_eml", "fresh"]));
   assertOptionalFresh(args);
   if (!isSafeResendId(args.resend_id)) throw new RpcError(-32602, "resend_id is required");
@@ -493,40 +504,50 @@ export function buildGetQuery(input, options = {}) {
   const columns = `${METADATA_SELECT},
   text_body${includeHtml ? ",\n  html_body" : ""},
   summary${aiSql}`;
+  const whereParts = ["resend_id = ?", "deleted_at IS NULL"];
+  const sqlParams = [args.resend_id];
+  if (ownerEmail) {
+    whereParts.push("(msg_from = ? OR msg_to LIKE ? ESCAPE '\\')");
+    sqlParams.push(ownerEmail, "%\"" + ownerEmail + "\"%");
+  }
   return {
     sql: `SELECT ${columns}
 FROM emails
-WHERE resend_id = ?`,
-    params: [args.resend_id],
+WHERE ${whereParts.join(" AND ")}`,
+    params: sqlParams,
     includeHtml,
     includeRaw: args.include_raw_eml === true,
   };
 }
 
-export function buildStatsQueries(nowMs = Date.now()) {
+export function buildStatsQueries(nowMs = Date.now(), ownerEmail = null) {
   const since = new Date(nowMs - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const delWhere = "deleted_at IS NULL";
+  const ownerWhere = ownerEmail ? `WHERE ${delWhere} AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')` : `WHERE ${delWhere}`;
+  const ownerParams = ownerEmail ? [ownerEmail, "%\"" + ownerEmail + "\"%"] : [];
+  const andOwner = ownerEmail ? "AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')" : "";
   return {
-    total: { sql: "SELECT COUNT(*) AS total FROM emails", params: [] },
+    total: { sql: `SELECT COUNT(*) AS total FROM emails ${ownerWhere}`, params: [...ownerParams] },
     byDirection: {
-      sql: "SELECT direction, COUNT(*) AS count FROM emails GROUP BY direction",
-      params: [],
+      sql: `SELECT direction, COUNT(*) AS count FROM emails ${ownerWhere} GROUP BY direction`,
+      params: [...ownerParams],
     },
     byDay: {
       sql: `SELECT substr(date, 1, 10) AS day, COUNT(*) AS count
 FROM emails
-WHERE date >= ?
+WHERE date >= ? AND ${delWhere} ${andOwner}
 GROUP BY day
 ORDER BY day ASC`,
-      params: [since],
+      params: [since, ...ownerParams],
     },
     topSenders: {
       sql: `SELECT msg_from AS sender, COUNT(*) AS count
 FROM emails
-WHERE msg_from IS NOT NULL AND msg_from != ''
+WHERE msg_from IS NOT NULL AND msg_from != '' AND ${delWhere} ${andOwner}
 GROUP BY msg_from
 ORDER BY count DESC, msg_from ASC
 LIMIT 10`,
-      params: [],
+      params: [...ownerParams],
     },
   };
 }
@@ -1054,6 +1075,31 @@ export const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "set_email_read_status",
+    description: "Mark an email as read or unread.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        resend_id: { type: "string", description: "The Resend ID of the email." },
+        is_read: { type: "boolean", description: "True for read, false for unread." },
+      },
+      required: ["resend_id", "is_read"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "delete_email",
+    description: "Soft-delete an email (moves to trash, filtered from queries).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        resend_id: { type: "string", description: "The Resend ID of the email to delete." },
+      },
+      required: ["resend_id"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 function toolText(value) {
@@ -1194,8 +1240,9 @@ function noteCache(trace, hit) {
 
 async function callTool(name, args, deps) {
   noteTool(deps && deps.trace, name, args);
+  const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
   if (name === "search_emails") {
-    const query = buildSearchQuery(args);
+    const query = buildSearchQuery(args, ownerEmail);
     const [hash, rev] = await Promise.all([
       hashCacheFields(searchCacheFields(args)),
       readRevision(deps),
@@ -1209,7 +1256,7 @@ async function callTool(name, args, deps) {
     });
   }
   if (name === "list_emails") {
-    const query = buildListQuery(args);
+    const query = buildListQuery(args, ownerEmail);
     const [hash, rev] = await Promise.all([
       hashCacheFields(listCacheFields(args)),
       readRevision(deps),
@@ -1223,7 +1270,8 @@ async function callTool(name, args, deps) {
     });
   }
   if (name === "get_email") {
-    const parsed = buildGetQuery(args);
+    const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
+    const parsed = buildGetQuery(args, { ownerEmail });
     const fresh = args.fresh === true;
     const id = args.resend_id;
     const rev = await readRevision(deps);
@@ -1247,9 +1295,17 @@ async function callTool(name, args, deps) {
       noteCache(deps && deps.trace, false);
     }
     const columnPresent = await emailsHaveAiStatus(deps);
-    const query = columnPresent ? buildGetQuery(args, { includeAiStatus: true }) : parsed;
+    const ownerEmail2 = deps && deps.ownerEmail ? deps.ownerEmail : null;
+    const query = columnPresent ? buildGetQuery(args, { includeAiStatus: true, ownerEmail: ownerEmail2 }) : parsed;
     const rows = await queryAll(deps, query);
     if (!rows.length) return { found: false, resend_id: id };
+    // mailbox 隔离：校验归属
+    if (ownerEmail) {
+      const r = rows[0];
+      const isMine = (r.msg_from === ownerEmail) ||
+        (r.msg_to && r.msg_to.includes('"' + ownerEmail + '"'));
+      if (!isMine) return { found: false, resend_id: id };
+    }
     let rawEml;
     if (query.includeRaw) rawEml = await cachedObjectText(deps, rawObjectKey(id), fresh);
     const summary = await fillNullSummary(deps, rows[0], id, rev);
@@ -1284,7 +1340,7 @@ async function callTool(name, args, deps) {
       url: statsCacheUrl(rev),
       ttl: CACHE_TTL.stats,
       load: async () => {
-        const queries = buildStatsQueries(deps && deps.nowMs);
+        const queries = buildStatsQueries(deps && deps.nowMs, ownerEmail);
         const [totalRows, directionRows, dayRows, senderRows] = await Promise.all([
           queryAll(deps, queries.total),
           queryAll(deps, queries.byDirection),
@@ -1325,6 +1381,47 @@ async function callTool(name, args, deps) {
       throw new RpcError(-32603, "Resend error: " + JSON.stringify(data));
     }
     return toolText({ id: data.id, to, subject });
+  }
+  if (name === "set_email_read_status") {
+    const resendId = args.resend_id;
+    const isRead = args.is_read;
+    if (!resendId || typeof isRead !== "boolean") {
+      throw new RpcError(-32602, "resend_id and is_read (boolean) are required");
+    }
+    if (!isSafeResendId(resendId)) {
+      throw new RpcError(-32602, "invalid resend_id");
+    }
+    const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
+    // 隔离：只能操作自己的邮件
+    let sql = "UPDATE emails SET is_read = ? WHERE resend_id = ?";
+    const params = [isRead ? 1 : 0, resendId];
+    if (ownerEmail) {
+      sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
+      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
+    }
+    await deps.queryRun(sql, params);
+    // 清缓存
+    await bumpRevision(deps);
+    return toolText({ resend_id: resendId, is_read: isRead });
+  }
+  if (name === "delete_email") {
+    const resendId = args.resend_id;
+    if (!resendId) {
+      throw new RpcError(-32602, "resend_id is required");
+    }
+    if (!isSafeResendId(resendId)) {
+      throw new RpcError(-32602, "invalid resend_id");
+    }
+    const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
+    let sql = "UPDATE emails SET deleted_at = ? WHERE resend_id = ? AND deleted_at IS NULL";
+    const params = [Date.now(), resendId];
+    if (ownerEmail) {
+      sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
+      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
+    }
+    await deps.queryRun(sql, params);
+    await bumpRevision(deps);
+    return toolText({ resend_id: resendId, deleted: true });
   }
   throw new RpcError(-32601, `unknown tool: ${name}`);
 }
@@ -2119,6 +2216,116 @@ export async function handleFetch(request, env, deps = {}) {
       }
     }
 
+    if (path === "/signup" && request.method === "GET") {
+      trace.outcome = "ok";
+      const accept = request.headers.get("accept") || "";
+      const info = {
+        service: "aBot 邮箱申请",
+        steps: [
+          "向你的主人要一个邀请码（一小时有效，一次性）",
+          "想一个你想要的邮箱地址，必须是 xxx@abot.run 格式",
+          "POST https://mail.abot.run/signup 提交申请",
+          "提交后等待主人审核，通过后主人会把 secret 发给你",
+          "用邮箱 + secret 调 POST https://abot.run/oauth/token (grant_type=password) 换取 access_token",
+          "以后调 https://abot.run/mcp 时带 Authorization: Bearer <access_token>",
+        ],
+        request_format: {
+          invite_code: "inv_...（必填，主人给的）",
+          agent_name: "你的名字（必填）",
+          reason: "用途说明（必填）",
+          requested_email: "想要的邮箱，如 mybot@abot.run（选填）",
+        },
+        apply_url: "https://mail.abot.run/signup",
+      };
+      if (accept.includes("text/html")) {
+        return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>aBot 邮箱申请</title>
+<style>body{font-family:system-ui;max-width:640px;margin:40px auto;padding:20px;line-height:1.6}
+code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5;padding:12px;border-radius:8px;overflow:auto}</style>
+</head><body><h2>aBot 邮箱申请</h2>
+<ol>${info.steps.map(s => `<li>${s}</li>`).join("")}</ol>
+<h3>申请格式</h3><pre>${JSON.stringify(info.request_format, null, 2)}</pre>
+<p>提交地址：<code>POST ${info.apply_url}</code></p></body></html>`,
+          { headers: { "Content-Type": "text/html;charset=utf-8" } });
+      }
+      return json(info);
+    }
+
+    // 提交邮箱申请（POST /signup 或 POST /provision/request）
+    if ((path === "/signup" || path === "/provision/request") && request.method === "POST") {
+      trace.outcome = "ok";
+      const db = d1Deps(env);
+      // 确保表存在
+      await db.queryRun(`CREATE TABLE IF NOT EXISTS provision_requests (
+        id TEXT PRIMARY KEY, agent_name TEXT, reason TEXT, requested_email TEXT,
+        status TEXT DEFAULT 'pending', email TEXT, secret_hash TEXT,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`, []);
+      await db.queryRun(`CREATE TABLE IF NOT EXISTS invite_codes (
+        code_hash TEXT PRIMARY KEY, code TEXT,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        used_at TEXT, used_by TEXT)`, []);
+      await db.queryRun(`CREATE TABLE IF NOT EXISTS mailboxes (
+        email TEXT PRIMARY KEY, request_id TEXT,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`, []);
+      // 邮件状态列迁移
+      try { await db.queryRun(`ALTER TABLE emails ADD COLUMN is_read INTEGER DEFAULT 0`, []); } catch {}
+      try { await db.queryRun(`ALTER TABLE emails ADD COLUMN deleted_at INTEGER`, []); } catch {}
+      let body;
+      try { body = await request.json(); } catch { body = {}; }
+      const inviteCode = (body.invite_code || "").trim();
+      if (!inviteCode) {
+        return json({ ok: false, error: "invite_code_required", message: "需要邀请码" }, 400);
+      }
+      // 验证邀请码
+      const hashBuf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(inviteCode));
+      const codeHash = [...new Uint8Array(hashBuf)].map(b => b.toString(16).padStart(2, "0")).join("");
+      const codeRow = await db.queryFirst("SELECT code_hash, used_at, created_at FROM invite_codes WHERE code_hash=?", [codeHash]);
+      if (!codeRow) return json({ ok: false, error: "invalid_invite_code" }, 403);
+      if (codeRow.used_at) return json({ ok: false, error: "invite_code_used" }, 403);
+      if (Date.now() - new Date(codeRow.created_at).getTime() > 3600 * 1000) {
+        return json({ ok: false, error: "invite_code_expired", message: "邀请码已过期" }, 403);
+      }
+      // 限流
+      const recent = await db.queryFirst("SELECT COUNT(*) as c FROM provision_requests WHERE created_at > datetime('now','-1 hour')", []);
+      if (recent && recent.c >= 10) return json({ ok: false, error: "rate_limited" }, 429);
+      // 验证邮箱
+      const requestedEmail = (body.requested_email || "").trim().toLowerCase() || null;
+      if (requestedEmail) {
+        if (!requestedEmail.endsWith("@abot.run") || requestedEmail.length < 11) {
+          return json({ ok: false, error: "invalid_email", message: "邮箱必须是 xxx@abot.run 格式" }, 400);
+        }
+        if (!/^[a-z0-9._-]+@abot\.run$/.test(requestedEmail)) {
+          return json({ ok: false, error: "invalid_email", message: "邮箱只能含小写字母、数字、._-" }, 400);
+        }
+        // 是否已被占用（已批准的申请或已建 mailbox）
+        const taken1 = await db.queryFirst("SELECT id FROM provision_requests WHERE (email=? OR requested_email=?) AND status='approved'", [requestedEmail, requestedEmail]);
+        const taken2 = await db.queryFirst("SELECT email FROM mailboxes WHERE email=?", [requestedEmail]);
+        // 是否有 pending 的申请在用
+        const pending = await db.queryFirst("SELECT id FROM provision_requests WHERE requested_email=? AND status='pending'", [requestedEmail]);
+        if (taken1 || taken2) {
+          return json({ ok: false, error: "email_taken", message: "该邮箱已被使用，请换一个" }, 409);
+        }
+        if (pending) {
+          return json({ ok: false, error: "email_pending", message: "该邮箱已有待审核申请，请换一个" }, 409);
+        }
+      }
+      // 创建申请
+      const id = "prov_" + [...crypto.getRandomValues(new Uint8Array(8))].map(b => b.toString(16).padStart(2, "0")).join("");
+      await db.queryRun("INSERT INTO provision_requests (id, agent_name, reason, requested_email, status) VALUES (?,?,?,?,?)",
+        [id, body.agent_name || null, body.reason || null, requestedEmail, "pending"]);
+      await db.queryRun("UPDATE invite_codes SET used_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), used_by=? WHERE code_hash=?", [id, codeHash]);
+      return json({ ok: true, id, status: "pending", message: "等待人工审核" });
+    }
+
+    // 查申请状态
+    if (path === "/provision/status" && request.method === "GET") {
+      trace.outcome = "ok";
+      const db = d1Deps(env);
+      const id = url.searchParams.get("id") || "";
+      const row = await db.queryFirst("SELECT id, status, email FROM provision_requests WHERE id=?", [id]);
+      if (!row) return json({ ok: false, error: "not_found" }, 404);
+      return json({ ok: true, id: row.id, status: row.status, email: row.email || null });
+    }
+
     if (path === "/mcp") {
       if (request.method !== "POST") {
         trace.outcome = "rejected";
@@ -2130,6 +2337,30 @@ export async function handleFetch(request, env, deps = {}) {
       if (!fromGateway && !bearerOk(request.headers.get("authorization"), env && env.MCP_TOKEN)) {
         trace.outcome = "unauthorized";
         return json({ ok: false, error: "unauthorized" }, 401);
+      }
+      // 网关透传的 agent 身份（仅当 fromGateway 时信任）
+      const ownerEmail = fromGateway ? (request.headers.get("x-abot-owner-email") || "").trim().toLowerCase() || null : null;
+      // 限流：按身份每分钟 100 次
+      const rateKey = ownerEmail ? "mcp:" + ownerEmail : "mcp:ip:" + (request.headers.get("CF-Connecting-IP") || "unknown");
+      const minute = Math.floor(Date.now() / 60000);
+      try {
+        const db = d1Deps(env);
+        await db.queryRun("CREATE TABLE IF NOT EXISTS rate_limits (k TEXT PRIMARY KEY, window INTEGER, count INTEGER)", []);
+        const row = await db.queryFirst("SELECT window, count FROM rate_limits WHERE k=?", [rateKey + ":" + minute]);
+        const count = row && row.window === minute ? row.count : 0;
+        if (count >= 100) {
+          trace.outcome = "rate_limited";
+          return json({ ok: false, error: "rate_limited", message: "每分钟最多100次" }, 429);
+        }
+        if (row && row.window === minute) {
+          await db.queryRun("UPDATE rate_limits SET count=count+1 WHERE k=?", [rateKey + ":" + minute]);
+        } else {
+          await db.queryRun("INSERT OR REPLACE INTO rate_limits (k, window, count) VALUES (?,?,1)", [rateKey + ":" + minute, minute]);
+        }
+        // 清理旧窗口（顺手）
+        await db.queryRun("DELETE FROM rate_limits WHERE window < ?", [minute - 2]);
+      } catch (e) {
+        // 限流失败不挡请求，记日志
       }
       if (!jsonContentType(request.headers.get("content-type"))) {
         trace.outcome = "rejected";
@@ -2162,6 +2393,7 @@ export async function handleFetch(request, env, deps = {}) {
         ai: env && env.AI ? env.AI : null,
         summaryTimeoutMs: deps.summaryTimeoutMs,
         trace,
+        ownerEmail,
       });
       if (rpc.type === "notification") {
         trace.outcome = "ok";
