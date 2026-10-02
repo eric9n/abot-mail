@@ -38,7 +38,7 @@ export const AI_STATUS_MIN_SAMPLE = 5;
 export const METRIC_STAGES = ["webhook", "ingest", "enrich", "dlq", "mcp", "health", "alert"];
 export const METRIC_OUTCOMES = ["ok", "duplicate", "retry", "dlq", "unauthorized", "ignored", "fresh", "rejected", "error"];
 export const METRIC_DOUBLES = ["lag_ms", "wall_ms", "cache", "neurons", "validator_discards"];
-const MCP_TOOL_NAMES = new Set(["search_emails", "get_email", "list_emails", "email_stats"]);
+const MCP_TOOL_NAMES = new Set(["search_emails", "get_email", "list_emails", "email_stats", "send_email"]);
 const SUMMARY_STATUSES = new Set(["ok", "failed", "discarded", "skipped"]);
 const SAFE_LOG_ERRORS = new Set([
   "missing_header",
@@ -1039,6 +1039,21 @@ export const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "send_email",
+    description: "Send an email via Resend. IMPORTANT: Before using this tool, you MUST show the recipient and content to the user and get explicit approval. Do not send without user confirmation.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        to: { type: "string", description: "Recipient email address." },
+        subject: { type: "string", description: "Email subject." },
+        body: { type: "string", description: "Email body (plain text)." },
+        from: { type: "string", description: "Sender address (must be @abot.run). Defaults to noreply@abot.run." },
+      },
+      required: ["to", "subject", "body"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 function toolText(value) {
@@ -1280,6 +1295,36 @@ async function callTool(name, args, deps) {
       },
       store: () => true,
     });
+  }
+  if (name === "send_email") {
+    const to = args.to;
+    const subject = args.subject;
+    const body = args.body;
+    const from = args.from || "noreply@abot.run";
+    if (!to || !subject || !body) {
+      throw new RpcError(-32602, "to, subject, body are required");
+    }
+    if (!from.endsWith("@abot.run")) {
+      throw new RpcError(-32602, "from must be @abot.run address");
+    }
+    const apiKey = deps.env.RESEND_API_KEY;
+    if (!apiKey) {
+      throw new RpcError(-32603, "RESEND_API_KEY not configured");
+    }
+    const resp = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + apiKey,
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+      },
+      body: JSON.stringify({ from, to, subject, text: body }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new RpcError(-32603, "Resend error: " + JSON.stringify(data));
+    }
+    return toolText({ id: data.id, to, subject });
   }
   throw new RpcError(-32601, `unknown tool: ${name}`);
 }
