@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS emails (
   auth        TEXT,                     -- JSON {spf,dkim,dmarc}, inbound only
   attachments TEXT,                     -- JSON [{filename, content_type, size, r2_key}]
   summary     TEXT,                     -- JSON {"points":[...],"todos":[{"text","deadline"}]} or NULL
+  is_read     INTEGER NOT NULL DEFAULT 0,
+  deleted_at  INTEGER,                  -- unix ms when soft-deleted; NULL while visible
+  is_archived INTEGER NOT NULL DEFAULT 0,
   created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
@@ -53,6 +56,6 @@ END;
 -- summary is nullable and is not indexed. This file is safe to re-run:
 -- CREATE TABLE IF NOT EXISTS does not add columns to a table that already
 -- exists, and AFTER INSERT is the only revision bump (UPDATE does not fire).
--- The worker adds summary on "no such column: summary" and ignores
--- "duplicate column name: summary", so an already-deployed database picks
--- the column up without a second manual ALTER.
+-- The worker adds summary, is_read, deleted_at, and is_archived when those
+-- columns are missing, and ignores "duplicate column name", so an
+-- already-deployed database picks the columns up without a second manual ALTER.

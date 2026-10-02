@@ -335,6 +335,20 @@ function assertDirection(direction) {
   }
 }
 
+function assertOptionalBoolean(args, key) {
+  if (!Object.prototype.hasOwnProperty.call(args, key) || args[key] == null) return;
+  if (typeof args[key] !== "boolean") throw new RpcError(-32602, `${key} must be a boolean`);
+}
+
+/** Exact mailbox match. Underscore in an address is a literal, not a LIKE wildcard. */
+function ownerPredicate(ownerEmail) {
+  if (!ownerEmail) return null;
+  return {
+    sql: "(msg_from = ? OR msg_to LIKE ? ESCAPE '\\')",
+    params: [ownerEmail, likeContains(`"${ownerEmail}"`)],
+  };
+}
+
 function assertOnlyKeys(obj, allowed) {
   for (const key of Object.keys(obj)) {
     if (!allowed.has(key)) throw new RpcError(-32602, `unexpected argument: ${key}`);
@@ -410,11 +424,14 @@ export function buildSearchQuery(input, ownerEmail) {
   if (args.from != null && typeof args.from !== "string") throw new RpcError(-32602, "from must be a string");
   if (args.to != null && typeof args.to !== "string") throw new RpcError(-32602, "to must be a string");
   assertDirection(args.direction);
+  assertOptionalBoolean(args, "is_read");
+  assertOptionalBoolean(args, "is_archived");
+  assertOptionalBoolean(args, "include_archived");
   const limit = clampLimit(args.limit);
   const pattern = likeContains(args.query);
   const where = ["deleted_at IS NULL", "(subject LIKE ? ESCAPE '\\' OR msg_from LIKE ? ESCAPE '\\' OR text_body LIKE ? ESCAPE '\\')"];
-  // 默认过滤已归档
-  if (args.include_archived !== true) {
+  // 默认过滤已归档。显式 is_archived=true 表示只要归档，不再叠一层 = 0。
+  if (args.include_archived !== true && args.is_archived !== true) {
     where.push("is_archived = 0");
   }
   if (args.is_read === true) where.push("is_read = 1");
@@ -423,9 +440,10 @@ export function buildSearchQuery(input, ownerEmail) {
   if (args.is_archived === false) where.push("is_archived = 0");
   const params = [pattern, pattern, pattern];
   // mailbox 隔离：只能看自己收发的
-  if (ownerEmail) {
-    where.push("(msg_from = ? OR msg_to LIKE ? ESCAPE '\\')");
-    params.push(ownerEmail, likeContains('"' + ownerEmail + '"'));
+  const owner = ownerPredicate(ownerEmail);
+  if (owner) {
+    where.push(owner.sql);
+    params.push(...owner.params);
   }
   if (args.from != null && args.from !== "") {
     where.push("msg_from LIKE ? ESCAPE '\\'");
@@ -466,10 +484,13 @@ export function buildListQuery(input, ownerEmail) {
   assertOptionalFresh(args);
   const includeSummary = assertOptionalIncludeSummary(args);
   assertDirection(args.direction);
+  assertOptionalBoolean(args, "is_read");
+  assertOptionalBoolean(args, "is_archived");
+  assertOptionalBoolean(args, "include_archived");
   const limit = clampLimit(args.limit);
   const where = ["deleted_at IS NULL"];
   const params = [];
-  if (args.include_archived !== true) {
+  if (args.include_archived !== true && args.is_archived !== true) {
     where.push("is_archived = 0");
   }
   if (args.is_read === true) where.push("is_read = 1");
@@ -477,9 +498,10 @@ export function buildListQuery(input, ownerEmail) {
   if (args.is_archived === true) where.push("is_archived = 1");
   if (args.is_archived === false) where.push("is_archived = 0");
   // mailbox 隔离
-  if (ownerEmail) {
-    where.push("(msg_from = ? OR msg_to LIKE ? ESCAPE '\\')");
-    params.push(ownerEmail, likeContains('"' + ownerEmail + '"'));
+  const owner = ownerPredicate(ownerEmail);
+  if (owner) {
+    where.push(owner.sql);
+    params.push(...owner.params);
   }
   if (args.direction != null) {
     where.push("direction = ?");
@@ -521,9 +543,10 @@ export function buildGetQuery(input, options = {}) {
   summary${aiSql}`;
   const whereParts = ["resend_id = ?", "deleted_at IS NULL"];
   const sqlParams = [args.resend_id];
-  if (ownerEmail) {
-    whereParts.push("(msg_from = ? OR msg_to LIKE ? ESCAPE '\\')");
-    sqlParams.push(ownerEmail, "%\"" + ownerEmail + "\"%");
+  const owner = ownerPredicate(ownerEmail);
+  if (owner) {
+    whereParts.push(owner.sql);
+    sqlParams.push(...owner.params);
   }
   return {
     sql: `SELECT ${columns}
@@ -538,9 +561,10 @@ WHERE ${whereParts.join(" AND ")}`,
 export function buildStatsQueries(nowMs = Date.now(), ownerEmail = null) {
   const since = new Date(nowMs - 30 * 24 * 60 * 60 * 1000).toISOString();
   const delWhere = "deleted_at IS NULL";
-  const ownerWhere = ownerEmail ? `WHERE ${delWhere} AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')` : `WHERE ${delWhere}`;
-  const ownerParams = ownerEmail ? [ownerEmail, "%\"" + ownerEmail + "\"%"] : [];
-  const andOwner = ownerEmail ? "AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')" : "";
+  const owner = ownerPredicate(ownerEmail);
+  const ownerWhere = owner ? `WHERE ${delWhere} AND ${owner.sql}` : `WHERE ${delWhere}`;
+  const ownerParams = owner ? [...owner.params] : [];
+  const andOwner = owner ? `AND ${owner.sql}` : "";
   return {
     total: { sql: `SELECT COUNT(*) AS total FROM emails ${ownerWhere}`, params: [...ownerParams] },
     byDirection: {
@@ -947,6 +971,15 @@ function revisionFromRow(row) {
  * Callers must use the same session as the archive read that follows, so a
  * replica cannot pair a new generation with an older result set.
  */
+/** UPDATE does not fire the insert trigger, so writers bump the generation themselves. */
+async function bumpRevision(deps) {
+  if (!deps || typeof deps.queryRun !== "function") return;
+  await deps.queryRun(
+    "INSERT INTO cache_revision (id, rev) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET rev = rev + 1",
+    [],
+  );
+}
+
 async function readRevision(deps) {
   if (!deps) return 0;
   if (typeof deps.queryFirst === "function") {
@@ -1046,6 +1079,9 @@ export const TOOLS = [
         direction: { type: "string", enum: ["in", "out"] },
         limit: { type: "integer", minimum: 1, maximum: 100, default: 20 },
         include_summary: { type: "boolean", default: false, description: "Attach the stored summary object. Does not generate one." },
+        is_read: { type: "boolean", description: "When set, keep only read (true) or unread (false) mail." },
+        is_archived: { type: "boolean", description: "When set, keep only archived (true) or unarchived (false) mail." },
+        include_archived: { type: "boolean", default: false, description: "Include archived mail. Default queries hide it." },
         fresh: { type: "boolean", description: "Skip the cache and read the archive again." },
       },
       required: ["query"],
@@ -1078,6 +1114,9 @@ export const TOOLS = [
         direction: { type: "string", enum: ["in", "out"] },
         since: { type: "string", description: "Inclusive ISO8601 lower bound on date." },
         include_summary: { type: "boolean", default: false, description: "Attach the stored summary object. Does not generate one." },
+        is_read: { type: "boolean", description: "When set, keep only read (true) or unread (false) mail." },
+        is_archived: { type: "boolean", description: "When set, keep only archived (true) or unarchived (false) mail." },
+        include_archived: { type: "boolean", default: false, description: "Include archived mail. Default queries hide it." },
         fresh: { type: "boolean", description: "Skip the cache and read the archive again." },
       },
       additionalProperties: false,
@@ -1311,6 +1350,41 @@ function noteCache(trace, hit) {
   trace.cache = hit ? 1 : 0;
 }
 
+async function applyOwnerWrite(deps, sql, params, ownerEmail) {
+  const owner = ownerPredicate(ownerEmail);
+  if (owner) {
+    sql += ` AND ${owner.sql}`;
+    params = params.concat(owner.params);
+  }
+  if (!deps || typeof deps.queryRun !== "function") throw new Error("queryRun is not configured");
+  const result = await deps.queryRun(sql, params);
+  if (summaryWriteChanges(result) === 0) {
+    throw new RpcError(-32602, "email not found or access denied");
+  }
+  await bumpRevision(deps);
+}
+
+async function readAttachmentBytes(deps, key) {
+  if (deps && typeof deps.getObjectBytes === "function") return deps.getObjectBytes(key);
+  if (deps && typeof deps.getObjectText === "function") {
+    const text = await deps.getObjectText(key);
+    if (text == null) return null;
+    return new TextEncoder().encode(text);
+  }
+  throw new Error("object store is not configured");
+}
+
+function parseAttachments(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== "string" || !value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 async function callTool(name, args, deps) {
   noteTool(deps && deps.trace, name, args);
   const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
@@ -1435,28 +1509,30 @@ async function callTool(name, args, deps) {
     if (!ownerEmail) {
       throw new RpcError(-32001, "agent email not bound");
     }
-    // 默认用 agent 绑定的邮箱
-    const from = args.from || ownerEmail;
-    if (!to || !subject || !body) {
+    if (typeof to !== "string" || !to || typeof subject !== "string" || !subject || typeof body !== "string" || !body) {
       throw new RpcError(-32602, "to, subject, body are required");
     }
-    if (!from.endsWith("@abot.run")) {
-      throw new RpcError(-32602, "from must be @abot.run address");
+    if (args.from != null && typeof args.from !== "string") {
+      throw new RpcError(-32602, "from must be a string");
     }
-    // 如果指定了 from，必须是自己的邮箱（防冒充）
-    if (args.from && ownerEmail && args.from.toLowerCase() !== ownerEmail.toLowerCase()) {
+    // 发件人永远是绑定邮箱。调用方传了别人的地址就拒绝，不能冒充。
+    if (args.from && args.from.trim().toLowerCase() !== ownerEmail) {
       throw new RpcError(-32602, "cannot send as another agent");
     }
-    const apiKey = deps.env.RESEND_API_KEY;
+    if (!ownerEmail.endsWith("@abot.run")) {
+      throw new RpcError(-32602, "from must be @abot.run address");
+    }
+    const from = ownerEmail;
+    const apiKey = deps.env && deps.env.RESEND_API_KEY;
     if (!apiKey) {
       throw new RpcError(-32603, "RESEND_API_KEY not configured");
     }
-    const resp = await fetch("https://api.resend.com/emails", {
+    const doFetch = (deps && deps.fetchImpl) || fetch;
+    const resp = await doFetch("https://api.resend.com/emails", {
       method: "POST",
       headers: {
-        "Authorization": "Bearer " + apiKey,
+        Authorization: "Bearer " + apiKey,
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
       },
       body: JSON.stringify({ from, to, subject, text: body }),
     });
@@ -1464,7 +1540,7 @@ async function callTool(name, args, deps) {
     if (!resp.ok) {
       throw new RpcError(-32603, "Resend error: " + JSON.stringify(data));
     }
-    return toolText({ id: data.id, to, subject });
+    return { id: data.id, from, to, subject };
   }
   if (name === "set_email_read_status") {
     const resendId = args.resend_id;
@@ -1476,17 +1552,13 @@ async function callTool(name, args, deps) {
       throw new RpcError(-32602, "invalid resend_id");
     }
     const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
-    // 隔离：只能操作自己的邮件
-    let sql = "UPDATE emails SET is_read = ? WHERE resend_id = ?";
-    const params = [isRead ? 1 : 0, resendId];
-    if (ownerEmail) {
-      sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
-      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
-    }
-    await deps.queryRun(sql, params);
-    // 清缓存
-    await bumpRevision(deps);
-    return toolText({ resend_id: resendId, is_read: isRead });
+    await applyOwnerWrite(
+      deps,
+      "UPDATE emails SET is_read = ? WHERE resend_id = ? AND deleted_at IS NULL",
+      [isRead ? 1 : 0, resendId],
+      ownerEmail,
+    );
+    return { resend_id: resendId, is_read: isRead };
   }
   if (name === "delete_email") {
     const resendId = args.resend_id;
@@ -1497,15 +1569,13 @@ async function callTool(name, args, deps) {
       throw new RpcError(-32602, "invalid resend_id");
     }
     const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
-    let sql = "UPDATE emails SET deleted_at = ? WHERE resend_id = ? AND deleted_at IS NULL";
-    const params = [Date.now(), resendId];
-    if (ownerEmail) {
-      sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
-      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
-    }
-    await deps.queryRun(sql, params);
-    await bumpRevision(deps);
-    return toolText({ resend_id: resendId, deleted: true });
+    await applyOwnerWrite(
+      deps,
+      "UPDATE emails SET deleted_at = ? WHERE resend_id = ? AND deleted_at IS NULL",
+      [Date.now(), resendId],
+      ownerEmail,
+    );
+    return { resend_id: resendId, deleted: true };
   }
   if (name === "set_email_archived_status") {
     const resendId = args.resend_id;
@@ -1515,50 +1585,62 @@ async function callTool(name, args, deps) {
     }
     if (!isSafeResendId(resendId)) throw new RpcError(-32602, "invalid resend_id");
     const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
-    let sql = "UPDATE emails SET is_archived = ? WHERE resend_id = ? AND deleted_at IS NULL";
-    const params = [isArchived ? 1 : 0, resendId];
-    if (ownerEmail) {
-      sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
-      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
-    }
-    await deps.queryRun(sql, params);
-    await bumpRevision(deps);
-    return toolText({ resend_id: resendId, is_archived: isArchived });
+    await applyOwnerWrite(
+      deps,
+      "UPDATE emails SET is_archived = ? WHERE resend_id = ? AND deleted_at IS NULL",
+      [isArchived ? 1 : 0, resendId],
+      ownerEmail,
+    );
+    return { resend_id: resendId, is_archived: isArchived };
   }
   if (name === "list_attachments") {
     const resendId = args.resend_id;
     if (!resendId || !isSafeResendId(resendId)) throw new RpcError(-32602, "valid resend_id is required");
     const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
+    const owner = ownerPredicate(ownerEmail);
     let sql = "SELECT attachments FROM emails WHERE resend_id = ? AND deleted_at IS NULL";
     const params = [resendId];
-    if (ownerEmail) {
-      sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
-      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
+    if (owner) {
+      sql += ` AND ${owner.sql}`;
+      params.push(...owner.params);
     }
     const row = await deps.queryFirst(sql, params);
-    if (!row) return toolText({ resend_id: resendId, attachments: [] });
-    let atts = [];
-    try { atts = JSON.parse(row.attachments || "[]"); } catch {}
-    return toolText({ resend_id: resendId, attachments: atts.map(a => ({ filename: a.filename, content_type: a.content_type, size: a.size })) });
+    if (!row) throw new RpcError(-32602, "email not found or access denied");
+    const attachments = parseAttachments(row.attachments).map((item) => ({
+      filename: item.filename,
+      content_type: item.content_type,
+      size: item.size,
+    }));
+    return { resend_id: resendId, attachments };
   }
   if (name === "get_attachment") {
     const resendId = args.resend_id;
     const filename = args.filename;
     if (!resendId || !isSafeResendId(resendId)) throw new RpcError(-32602, "valid resend_id is required");
-    if (!filename) throw new RpcError(-32602, "filename is required");
+    if (!filename || typeof filename !== "string") throw new RpcError(-32602, "filename is required");
     const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
-    let sql = "SELECT resend_id FROM emails WHERE resend_id = ? AND deleted_at IS NULL";
+    const owner = ownerPredicate(ownerEmail);
+    let sql = "SELECT attachments FROM emails WHERE resend_id = ? AND deleted_at IS NULL";
     const params = [resendId];
-    if (ownerEmail) {
-      sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
-      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
+    if (owner) {
+      sql += ` AND ${owner.sql}`;
+      params.push(...owner.params);
     }
     const row = await deps.queryFirst(sql, params);
     if (!row) throw new RpcError(-32602, "email not found or access denied");
-    const key = `attachments/${resendId}/${filename}`;
-    const data = await deps.getObjectText(key);
-    if (!data) throw new RpcError(-32602, "attachment not found");
-    return toolText({ resend_id: resendId, filename, content_base64: data });
+    const att = parseAttachments(row.attachments).find((item) => item && item.filename === filename);
+    if (!att || typeof att.r2_key !== "string" || !att.r2_key) {
+      throw new RpcError(-32602, "attachment not found");
+    }
+    const bytes = await readAttachmentBytes(deps, att.r2_key);
+    if (bytes == null) throw new RpcError(-32602, "attachment not found");
+    return {
+      resend_id: resendId,
+      filename,
+      content_type: att.content_type || "application/octet-stream",
+      size: Number.isFinite(att.size) ? att.size : bytes.byteLength,
+      content_base64: bytesToBase64(bytes),
+    };
   }
   throw new RpcError(-32601, `unknown tool: ${name}`);
 }
@@ -1582,6 +1664,43 @@ function duplicateSummaryColumn(err) {
   return String((err && err.message) || "").toLowerCase().includes("duplicate column name: summary");
 }
 
+function duplicateColumn(err) {
+  return String((err && err.message) || "").toLowerCase().includes("duplicate column");
+}
+
+const mailboxColumnsReady = new WeakMap();
+
+/**
+ * CREATE TABLE IF NOT EXISTS will not add mailbox columns to a database
+ * created before them. The first query adds the columns; a repeat is ignored.
+ */
+async function ensureMailboxColumns(key, source) {
+  const mapKey = key || source;
+  if (!mapKey || !source || typeof source.prepare !== "function") return;
+  let pending = mailboxColumnsReady.get(mapKey);
+  if (!pending) {
+    pending = (async () => {
+      const statements = [
+        "ALTER TABLE emails ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE emails ADD COLUMN deleted_at INTEGER",
+        "ALTER TABLE emails ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0",
+      ];
+      for (const sql of statements) {
+        try {
+          await source.prepare(sql).run();
+        } catch (err) {
+          if (!duplicateColumn(err)) throw err;
+        }
+      }
+    })().catch((err) => {
+      mailboxColumnsReady.delete(mapKey);
+      throw err;
+    });
+    mailboxColumnsReady.set(mapKey, pending);
+  }
+  await pending;
+}
+
 /**
  * CREATE TABLE IF NOT EXISTS will not add summary to a database created before
  * this column. The first statement that names it adds the column and retries.
@@ -1603,23 +1722,35 @@ async function withSummaryColumn(source, run) {
 
 function d1Deps(env) {
   const source = d1Session(env && env.DB);
+  const columnKey = env && env.DB ? env.DB : source;
+  const ready = () => ensureMailboxColumns(columnKey, source);
   return {
     async queryAll(sql, params) {
+      await ready();
       return withSummaryColumn(source, async () => {
         const out = await bindStmt(source, sql, params).all();
         return out.results || [];
       });
     },
     async queryFirst(sql, params) {
+      await ready();
       return withSummaryColumn(source, () => bindStmt(source, sql, params).first());
     },
     async queryRun(sql, params) {
+      await ready();
       return withSummaryColumn(source, () => bindStmt(source, sql, params).run());
     },
     async getObjectText(key) {
       const obj = await env.ARCHIVE_BUCKET.get(key);
       if (!obj) return null;
       return obj.text();
+    },
+    async getObjectBytes(key) {
+      const obj = await env.ARCHIVE_BUCKET.get(key);
+      if (!obj) return null;
+      if (typeof obj.arrayBuffer === "function") return new Uint8Array(await obj.arrayBuffer());
+      if (typeof obj.text === "function") return new TextEncoder().encode(await obj.text());
+      return null;
     },
   };
 }
@@ -2115,6 +2246,7 @@ export function buildInvocationLog(fields) {
   if (fields && (fields.enqueued === true || fields.enqueued === false)) log.enqueued = fields.enqueued;
   if (fields && SAFE_LOG_ERRORS.has(fields.error)) log.error = fields.error;
   if (fields && typeof fields.alert_sent === "boolean") log.alert_sent = fields.alert_sent;
+  if (fields && typeof fields.breaches === "string" && /^[a-z0-9_,]+$/.test(fields.breaches)) log.breaches = fields.breaches;
   if (fields && typeof fields.skipped === "string" && /^[a-z0-9_,]+$/.test(fields.skipped)) log.skipped = fields.skipped;
   return log;
 }
@@ -2282,9 +2414,14 @@ export async function handleScheduled(event, env, deps = {}) {
     const report = await collectAlertSignals(env, nowMs);
     if (report.skipped.length) trace.skipped = report.skipped.join(",");
     if (report.breaches.length === 0) return { sent: false, breaches: [] };
+    const names = report.breaches.map((signal) => signal.name);
+    if (env && (env.ALERT_ENABLED === false || env.ALERT_ENABLED === "false")) {
+      trace.breaches = names.join(",");
+      return { sent: false, breaches: names };
+    }
     await sendAlertEmail(env, buildAlertEmail(report, env), deps.fetch);
     trace.alert_sent = true;
-    return { sent: true, breaches: report.breaches.map((signal) => signal.name) };
+    return { sent: true, breaches: names };
   } catch (err) {
     trace.outcome = "error";
     trace.error = "alert_failed";
@@ -2479,13 +2616,14 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
       // 网关透传的 agent 身份（仅当 fromGateway 时信任）— 强校验必传
       const ownerEmail = fromGateway ? (request.headers.get("x-abot-owner-email") || "").trim().toLowerCase() || null : null;
       if (fromGateway && !ownerEmail) {
+        trace.outcome = "unauthorized";
         return json({ ok: false, error: "x-abot-owner-email required" }, 401);
       }
-      // 限流：按身份每分钟 100 次
+      // 限流和这次读取共用一个 primary session，避免修订号和结果来自不同副本。
+      const db = d1Deps(env);
       const rateKey = ownerEmail ? "mcp:" + ownerEmail : "mcp:ip:" + (request.headers.get("CF-Connecting-IP") || "unknown");
       const minute = Math.floor(Date.now() / 60000);
       try {
-        const db = d1Deps(env);
         await db.queryRun("CREATE TABLE IF NOT EXISTS rate_limits (k TEXT PRIMARY KEY, window INTEGER, count INTEGER)", []);
         const row = await db.queryFirst("SELECT window, count FROM rate_limits WHERE k=?", [rateKey + ":" + minute]);
         const count = row && row.window === minute ? row.count : 0;
@@ -2522,12 +2660,13 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
         trace.outcome = "rejected";
         return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400);
       }
-      const db = d1Deps(env);
       const rpc = await handleMcpRpc(message, {
         queryAll: (sql, params) => db.queryAll(sql, params),
         queryFirst: (sql, params) => db.queryFirst(sql, params),
         queryRun: (sql, params) => db.queryRun(sql, params),
         getObjectText: (key) => db.getObjectText(key),
+        getObjectBytes: (key) => db.getObjectBytes(key),
+        fetchImpl: deps.fetch,
         nowMs: deps.nowMs,
         cache: resolveCache(deps),
         ctx: deps.ctx || null,

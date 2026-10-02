@@ -613,7 +613,18 @@ test("webhook archives inbound mail once, then MCP can read it", async () => {
   const listedTools = await mcp({ jsonrpc: "2.0", id: 1, method: "tools/list" });
   assert.deepEqual(
     listedTools.body.result.tools.map((tool) => tool.name),
-    ["search_emails", "get_email", "list_emails", "email_stats"],
+    [
+      "search_emails",
+      "get_email",
+      "list_emails",
+      "email_stats",
+      "send_email",
+      "set_email_read_status",
+      "delete_email",
+      "set_email_archived_status",
+      "list_attachments",
+      "get_attachment",
+    ],
   );
   for (const tool of listedTools.body.result.tools) {
     assert.equal(typeof tool.description, "string");
@@ -1388,8 +1399,16 @@ function toolValue(rpc) {
   return JSON.parse(rpc.body.result.content[0].text);
 }
 
+function isHousekeepingSql(sql) {
+  return sql.includes("rate_limits") || sql.startsWith("ALTER TABLE emails ADD COLUMN");
+}
+
 function dataSqls(sqls) {
-  return sqls.filter((sql) => sql !== READ_REVISION_SQL);
+  return sqls.filter((sql) => sql !== READ_REVISION_SQL && !isHousekeepingSql(sql));
+}
+
+function cacheProbeSqls(sqls) {
+  return sqls.filter((sql) => !isHousekeepingSql(sql));
 }
 
 function cacheRev(db) {
@@ -1487,8 +1506,10 @@ test("cache keys follow the phase-2 table and fresh is optional", async () => {
   const cache = memoryCache();
   const listed = await mcpCall(env, { jsonrpc: "2.0", id: 1, method: "tools/list" }, { cache, nowMs: NOW_MS });
   assert.equal(listed.status, 200);
+  const cachedReads = new Set(["search_emails", "get_email", "list_emails", "email_stats"]);
   for (const tool of listed.body.result.tools) {
     assert.equal(tool.inputSchema.additionalProperties, false);
+    if (!cachedReads.has(tool.name)) continue;
     assert.equal(tool.inputSchema.properties.fresh.type, "boolean");
     assert.equal((tool.inputSchema.required || []).includes("fresh"), false);
   }
@@ -1586,7 +1607,7 @@ test("MCP reads hit the cache and stay no-store", async () => {
   sqls.reset();
   const searchAgain = toolValue(await mcpCall(env, toolMessage(2, "search_emails", { limit: 100, query: "invoice" }), deps));
   assert.equal(searchAgain.length, 1);
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(cacheProbeSqls(sqls.sqls), [READ_REVISION_SQL]);
   sqls.reset();
   const other = toolValue(await mcpCall(env, toolMessage(3, "search_emails", { query: "missing" }), deps));
   assert.equal(other.length, 0);
@@ -1603,7 +1624,7 @@ test("MCP reads hit the cache and stay no-store", async () => {
   assert.equal(cache.puts.find((put) => put.url === listUrl).cacheControl, "max-age=10");
   sqls.reset();
   toolValue(await mcpCall(env, toolMessage(5, "list_emails", { since: "2026-09-01T00:00:00.000Z", direction: "in" }), deps));
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(cacheProbeSqls(sqls.sqls), [READ_REVISION_SQL]);
 
   sqls.reset();
   const stats = toolValue(await mcpCall(env, toolMessage(6, "email_stats", {}), deps));
@@ -1616,7 +1637,7 @@ test("MCP reads hit the cache and stay no-store", async () => {
   sqls.reset();
   const statsAgain = toolValue(await mcpCall(env, toolMessage(7, "email_stats", {}), deps));
   assert.deepEqual(statsAgain, stats);
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(cacheProbeSqls(sqls.sqls), [READ_REVISION_SQL]);
 
   sqls.reset();
   const detail = toolValue(
@@ -1632,7 +1653,7 @@ test("MCP reads hit the cache and stay no-store", async () => {
   sqls.reset();
   const plainAgain = toolValue(await mcpCall(env, toolMessage(9, "get_email", { resend_id: EMAIL_ID }), deps));
   assert.equal(plainAgain.text_body, "please pay");
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(cacheProbeSqls(sqls.sqls), [READ_REVISION_SQL]);
   assert.equal(r2Gets.length, 0);
 
   sqls.reset();
@@ -1700,14 +1721,14 @@ test("fresh bypasses the cache and TTLs expire entries", async () => {
   cache.puts.length = 0;
   const stale = toolValue(await mcpCall(env, toolMessage(1, "email_stats", {}), deps));
   assert.equal(stale.total, 999);
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(cacheProbeSqls(sqls.sqls), [READ_REVISION_SQL]);
   const fresh = toolValue(await mcpCall(env, toolMessage(2, "email_stats", { fresh: true }), deps));
   assert.equal(fresh.total, 0);
   assert.equal(dataSqls(sqls.sqls).length, 4);
   sqls.reset();
   const updated = toolValue(await mcpCall(env, toolMessage(3, "email_stats", { fresh: false }), deps));
   assert.equal(updated.total, 0);
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(cacheProbeSqls(sqls.sqls), [READ_REVISION_SQL]);
 
   const row = mapEmailForStorage(
     { id: "ttl-1", from: "a@b.c", to: ["eric@abot.run"], subject: "ttl", text: "body", created_at: "2026-09-28T00:00:00.000Z" },
@@ -1719,7 +1740,7 @@ test("fresh bypasses the cache and TTLs expire entries", async () => {
   cache.advance(9_000);
   sqls.reset();
   toolValue(await mcpCall(env, toolMessage(5, "search_emails", { query: "ttl" }), deps));
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(cacheProbeSqls(sqls.sqls), [READ_REVISION_SQL]);
   cache.advance(2_000);
   sqls.reset();
   toolValue(await mcpCall(env, toolMessage(6, "search_emails", { query: "ttl" }), deps));
@@ -1730,7 +1751,7 @@ test("fresh bypasses the cache and TTLs expire entries", async () => {
   cache.advance(9_000);
   sqls.reset();
   toolValue(await mcpCall(env, toolMessage(8, "list_emails", { limit: 1 }), deps));
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(cacheProbeSqls(sqls.sqls), [READ_REVISION_SQL]);
   cache.advance(2_000);
   sqls.reset();
   toolValue(await mcpCall(env, toolMessage(9, "list_emails", { limit: 1 }), deps));
@@ -1743,7 +1764,7 @@ test("fresh bypasses the cache and TTLs expire entries", async () => {
   cache.advance(119_000);
   sqls.reset();
   toolValue(await mcpCall(env, toolMessage(11, "email_stats", {}), deps));
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(cacheProbeSqls(sqls.sqls), [READ_REVISION_SQL]);
   cache.advance(2_000);
   sqls.reset();
   toolValue(await mcpCall(env, toolMessage(12, "email_stats", {}), deps));
@@ -1756,7 +1777,7 @@ test("fresh bypasses the cache and TTLs expire entries", async () => {
   sqls.reset();
   const cachedEmail = toolValue(await mcpCall(env, toolMessage(14, "get_email", { resend_id: "ttl-1" }), deps));
   assert.equal(cachedEmail.text_body, "body");
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(cacheProbeSqls(sqls.sqls), [READ_REVISION_SQL]);
   const refreshed = toolValue(await mcpCall(env, toolMessage(15, "get_email", { resend_id: "ttl-1", fresh: true }), deps));
   assert.equal(refreshed.text_body, "changed");
   cache.advance(CACHE_TTL.getEmail * 1000);
@@ -2060,7 +2081,7 @@ test("MCP cache fills through waitUntil when a context is present", async () => 
   const sqls = instrumentDb(env);
   const second = toolValue(await mcpCall(env, toolMessage(2, "email_stats", {}), { cache, nowMs: NOW_MS }));
   assert.equal(second.total, 0);
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(cacheProbeSqls(sqls.sqls), [READ_REVISION_SQL]);
 });
 
 test("MCP reads take the revision and the row read from one primary session", async () => {
