@@ -1077,14 +1077,14 @@ export const TOOLS = [
   },
   {
     name: "send_email",
-    description: "Send an email via Resend from your @abot.run address.",
+    description: "Send an email via Resend. Defaults to your bound @abot.run address.",
     inputSchema: {
       type: "object",
       properties: {
         to: { type: "string", description: "Recipient email address." },
         subject: { type: "string", description: "Email subject." },
         body: { type: "string", description: "Email body (plain text)." },
-        from: { type: "string", description: "Sender address (must be @abot.run). Defaults to noreply@abot.run." },
+        from: { type: "string", description: "Sender address. Defaults to your bound email. Must be @abot.run." },
       },
       required: ["to", "subject", "body"],
       additionalProperties: false,
@@ -1409,12 +1409,18 @@ async function callTool(name, args, deps) {
     const to = args.to;
     const subject = args.subject;
     const body = args.body;
-    const from = args.from || "noreply@abot.run";
+    const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
+    // 默认用 agent 绑定的邮箱
+    const from = args.from || ownerEmail || "noreply@abot.run";
     if (!to || !subject || !body) {
       throw new RpcError(-32602, "to, subject, body are required");
     }
     if (!from.endsWith("@abot.run")) {
       throw new RpcError(-32602, "from must be @abot.run address");
+    }
+    // 如果指定了 from，必须是自己的邮箱（防冒充）
+    if (args.from && ownerEmail && args.from.toLowerCase() !== ownerEmail.toLowerCase()) {
+      throw new RpcError(-32602, "cannot send as another agent");
     }
     const apiKey = deps.env.RESEND_API_KEY;
     if (!apiKey) {
