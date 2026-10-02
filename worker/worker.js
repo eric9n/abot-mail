@@ -381,6 +381,66 @@ const METADATA_SELECT = `
   CASE WHEN text_body IS NOT NULL AND text_body != '' THEN 1 ELSE 0 END AS has_text,
   CASE WHEN html_body IS NOT NULL AND html_body != '' THEN 1 ELSE 0 END AS has_html`.trim();
 
+/**
+ * Columns added after the first production CREATE. schema.sql no longer
+ * alters an existing table, so a live D1 can lack any of these.
+ * `false` means the read must not name the column. Omitted / true keeps it.
+ */
+const OPTIONAL_READ_COLUMNS = new Set(["deleted_at", "is_archived", "is_read", "auth", "summary", "ai_status"]);
+
+/** Idempotent mailbox flags. Same statements as worker/migrations/mailbox-columns.sql. */
+export const EMAIL_MAILBOX_COLUMN_DDL = [
+  ["is_read", "ALTER TABLE emails ADD COLUMN is_read INTEGER DEFAULT 0"],
+  ["deleted_at", "ALTER TABLE emails ADD COLUMN deleted_at INTEGER"],
+  ["is_archived", "ALTER TABLE emails ADD COLUMN is_archived INTEGER DEFAULT 0"],
+];
+
+export function emailColumnFlags(columnNames) {
+  const names = new Set((columnNames || []).map((name) => String(name).toLowerCase()));
+  const flags = { probed: names.has("resend_id") };
+  for (const name of OPTIONAL_READ_COLUMNS) flags[name] = names.has(name);
+  return flags;
+}
+
+export function missingColumnName(err) {
+  const message = String((err && err.message) || "");
+  const match = /no such column:\s*(?:[\w]+\.)?([A-Za-z_][A-Za-z0-9_]*)/i.exec(message);
+  return match ? match[1].toLowerCase() : null;
+}
+
+function hasColumn(schema, name) {
+  if (schema == null) return true;
+  return schema[name] !== false;
+}
+
+function metadataSelect(schema) {
+  if (hasColumn(schema, "auth")) return METADATA_SELECT;
+  return METADATA_SELECT.replace("\n  auth,", "");
+}
+
+function pushDeleted(where, schema) {
+  if (hasColumn(schema, "deleted_at")) where.push("deleted_at IS NULL");
+}
+
+function pushArchive(where, args, schema) {
+  if (!hasColumn(schema, "is_archived")) {
+    if (args.is_archived === true) where.push("0 = 1");
+    return;
+  }
+  if (args.include_archived !== true) where.push("is_archived = 0");
+  if (args.is_archived === true) where.push("is_archived = 1");
+  if (args.is_archived === false) where.push("is_archived = 0");
+}
+
+function pushRead(where, args, schema) {
+  if (args.is_read !== true && args.is_read !== false) return;
+  if (!hasColumn(schema, "is_read")) {
+    if (args.is_read === true) where.push("0 = 1");
+    return;
+  }
+  where.push(args.is_read === true ? "is_read = 1" : "is_read = 0");
+}
+
 export function buildExistsQuery(resendId) {
   return {
     sql: "SELECT resend_id FROM emails WHERE resend_id = ?",
@@ -412,7 +472,7 @@ export function buildInsertQuery(row) {
   };
 }
 
-export function buildSearchQuery(input, ownerEmail) {
+export function buildSearchQuery(input, ownerEmail, schema) {
   const args = input || {};
   assertOnlyKeys(args, new Set(["query", "from", "to", "since", "until", "direction", "limit", "fresh", "include_summary", "is_read", "is_archived", "include_archived"]));
   assertOptionalFresh(args);
@@ -426,15 +486,11 @@ export function buildSearchQuery(input, ownerEmail) {
   assertDirection(args.direction);
   const limit = clampLimit(args.limit);
   const pattern = likeContains(args.query);
-  const where = ["deleted_at IS NULL", "(subject LIKE ? ESCAPE '\\' OR msg_from LIKE ? ESCAPE '\\' OR text_body LIKE ? ESCAPE '\\')"];
-  // 默认过滤已归档
-  if (args.include_archived !== true) {
-    where.push("is_archived = 0");
-  }
-  if (args.is_read === true) where.push("is_read = 1");
-  if (args.is_read === false) where.push("is_read = 0");
-  if (args.is_archived === true) where.push("is_archived = 1");
-  if (args.is_archived === false) where.push("is_archived = 0");
+  const where = ["(subject LIKE ? ESCAPE '\\' OR msg_from LIKE ? ESCAPE '\\' OR text_body LIKE ? ESCAPE '\\')"];
+  pushDeleted(where, schema);
+  // 默认过滤已归档。缺列时不能把条件写进 SQL，否则整次搜索变成 -32603。
+  pushArchive(where, args, schema);
+  pushRead(where, args, schema);
   const params = [pattern, pattern, pattern];
   // mailbox 隔离：只能看自己收发的
   if (ownerEmail) {
@@ -464,7 +520,7 @@ export function buildSearchQuery(input, ownerEmail) {
   params.push(limit);
   const summarySql = includeSummary ? ",\n  summary" : "";
   return {
-    sql: `SELECT ${METADATA_SELECT}${summarySql}
+    sql: `SELECT ${metadataSelect(schema)}${summarySql}
 FROM emails
 WHERE ${where.join("\n  AND ")}
 ORDER BY date DESC, resend_id DESC
@@ -474,22 +530,18 @@ LIMIT ?`,
   };
 }
 
-export function buildListQuery(input, ownerEmail) {
+export function buildListQuery(input, ownerEmail, schema) {
   const args = input || {};
   assertOnlyKeys(args, new Set(["limit", "direction", "since", "fresh", "include_summary", "is_read", "is_archived", "include_archived"]));
   assertOptionalFresh(args);
   const includeSummary = assertOptionalIncludeSummary(args);
   assertDirection(args.direction);
   const limit = clampLimit(args.limit);
-  const where = ["deleted_at IS NULL"];
+  const where = [];
   const params = [];
-  if (args.include_archived !== true) {
-    where.push("is_archived = 0");
-  }
-  if (args.is_read === true) where.push("is_read = 1");
-  if (args.is_read === false) where.push("is_read = 0");
-  if (args.is_archived === true) where.push("is_archived = 1");
-  if (args.is_archived === false) where.push("is_archived = 0");
+  pushDeleted(where, schema);
+  pushArchive(where, args, schema);
+  pushRead(where, args, schema);
   // mailbox 隔离
   if (ownerEmail) {
     where.push("(msg_from = ? OR msg_to LIKE ? ESCAPE '\\')");
@@ -507,7 +559,7 @@ export function buildListQuery(input, ownerEmail) {
   const whereSql = where.length ? `WHERE ${where.join("\n  AND ")}\n` : "";
   const summarySql = includeSummary ? ",\n  summary" : "";
   return {
-    sql: `SELECT ${METADATA_SELECT}${summarySql}
+    sql: `SELECT ${metadataSelect(schema)}${summarySql}
 FROM emails
 ${whereSql}ORDER BY date DESC, resend_id DESC
 LIMIT ?`,
@@ -529,11 +581,13 @@ export function buildGetQuery(input, options = {}) {
     throw new RpcError(-32602, "include_raw_eml must be a boolean");
   }
   const includeHtml = args.include_html === true;
-  const aiSql = options.includeAiStatus ? ",\n  ai_status" : "";
-  const columns = `${METADATA_SELECT},
+  const schema = options.schema;
+  const aiSql = options.includeAiStatus && hasColumn(schema, "ai_status") ? ",\n  ai_status" : "";
+  const columns = `${metadataSelect(schema)},
   text_body${includeHtml ? ",\n  html_body" : ""},
   summary${aiSql}`;
-  const whereParts = ["resend_id = ?", "deleted_at IS NULL"];
+  const whereParts = ["resend_id = ?"];
+  if (hasColumn(schema, "deleted_at")) whereParts.push("deleted_at IS NULL");
   const sqlParams = [args.resend_id];
   if (ownerEmail) {
     whereParts.push("(msg_from = ? OR msg_to LIKE ? ESCAPE '\\')");
@@ -549,22 +603,24 @@ WHERE ${whereParts.join(" AND ")}`,
   };
 }
 
-export function buildStatsQueries(nowMs = Date.now(), ownerEmail = null) {
+export function buildStatsQueries(nowMs = Date.now(), ownerEmail = null, schema) {
   const since = new Date(nowMs - 30 * 24 * 60 * 60 * 1000).toISOString();
-  const delWhere = "deleted_at IS NULL";
-  const ownerWhere = ownerEmail ? `WHERE ${delWhere} AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')` : `WHERE ${delWhere}`;
+  const filters = [];
+  if (hasColumn(schema, "deleted_at")) filters.push("deleted_at IS NULL");
+  if (ownerEmail) filters.push("(msg_from = ? OR msg_to LIKE ? ESCAPE '\\')");
   const ownerParams = ownerEmail ? [ownerEmail, "%\"" + ownerEmail + "\"%"] : [];
-  const andOwner = ownerEmail ? "AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')" : "";
+  const whereSql = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  const andFilters = filters.length ? `AND ${filters.join(" AND ")}` : "";
   return {
-    total: { sql: `SELECT COUNT(*) AS total FROM emails ${ownerWhere}`, params: [...ownerParams] },
+    total: { sql: `SELECT COUNT(*) AS total FROM emails ${whereSql}`.trimEnd(), params: [...ownerParams] },
     byDirection: {
-      sql: `SELECT direction, COUNT(*) AS count FROM emails ${ownerWhere} GROUP BY direction`,
+      sql: `SELECT direction, COUNT(*) AS count FROM emails${whereSql ? ` ${whereSql}` : ""} GROUP BY direction`,
       params: [...ownerParams],
     },
     byDay: {
       sql: `SELECT substr(date, 1, 10) AS day, COUNT(*) AS count
 FROM emails
-WHERE date >= ? AND ${delWhere} ${andOwner}
+WHERE date >= ? ${andFilters}
 GROUP BY day
 ORDER BY day ASC`,
       params: [since, ...ownerParams],
@@ -572,7 +628,7 @@ ORDER BY day ASC`,
     topSenders: {
       sql: `SELECT msg_from AS sender, COUNT(*) AS count
 FROM emails
-WHERE msg_from IS NOT NULL AND msg_from != '' AND ${delWhere} ${andOwner}
+WHERE msg_from IS NOT NULL AND msg_from != '' ${andFilters}
 GROUP BY msg_from
 ORDER BY count DESC, msg_from ASC
 LIMIT 10`,
@@ -988,15 +1044,22 @@ function revisionFromRow(row) {
  * replica cannot pair a new generation with an older result set.
  */
 async function readRevision(deps) {
-  if (!deps) return 0;
-  if (typeof deps.queryFirst === "function") {
-    return revisionFromRow(await deps.queryFirst(READ_REVISION_SQL, []));
+  try {
+    if (!deps) return 0;
+    if (typeof deps.queryFirst === "function") {
+      return revisionFromRow(await deps.queryFirst(READ_REVISION_SQL, []));
+    }
+    if (typeof deps.queryAll === "function") {
+      const rows = await deps.queryAll(READ_REVISION_SQL, []);
+      return revisionFromRow(Array.isArray(rows) ? rows[0] : null);
+    }
+    return 0;
+  } catch (err) {
+    const message = String((err && err.message) || "").toLowerCase();
+    // A database created before cache_revision must still answer reads.
+    if (message.includes("no such table: cache_revision")) return 0;
+    throw err;
   }
-  if (typeof deps.queryAll === "function") {
-    const rows = await deps.queryAll(READ_REVISION_SQL, []);
-    return revisionFromRow(Array.isArray(rows) ? rows[0] : null);
-  }
-  return 0;
 }
 
 async function readThrough(deps, { fresh, url, ttl, load, store }) {
@@ -1026,16 +1089,112 @@ async function readThrough(deps, { fresh, url, ttl, load, store }) {
   return value;
 }
 
-async function emailsHaveAiStatus(deps) {
+function unprobedEmailColumns() {
+  return {
+    probed: false,
+    deleted_at: true,
+    is_archived: true,
+    is_read: true,
+    auth: true,
+    summary: true,
+    ai_status: false,
+  };
+}
+
+async function loadEmailReadColumns(deps) {
   try {
     const rows = await queryAll(deps, {
-      sql: "SELECT name FROM pragma_table_info('emails') WHERE name = 'ai_status'",
+      sql: "SELECT name FROM pragma_table_info('emails')",
       params: [],
     });
-    return Array.isArray(rows) && rows.some((row) => row && row.name === "ai_status");
+    const names = [];
+    for (const row of rows || []) {
+      if (row && row.name) names.push(row.name);
+    }
+    const flags = emailColumnFlags(names);
+    if (!flags.probed) return unprobedEmailColumns();
+    return flags;
   } catch {
-    return false;
+    return unprobedEmailColumns();
   }
+}
+
+async function ensureMailboxColumns(deps, schema) {
+  if (!schema || schema.probed !== true) return schema;
+  if (!deps || typeof deps.queryRun !== "function") return schema;
+  let next = schema;
+  for (const [name, sql] of EMAIL_MAILBOX_COLUMN_DDL) {
+    if (next[name] !== false) continue;
+    try {
+      await deps.queryRun(sql, []);
+      next = { ...next, [name]: true };
+    } catch (err) {
+      const message = String((err && err.message) || "").toLowerCase();
+      if (message.includes("duplicate column")) next = { ...next, [name]: true };
+    }
+  }
+  return next;
+}
+
+/** Probe emails once per MCP call. Adds mailbox columns when they are missing. */
+async function readSchema(deps) {
+  if (deps && deps._emailColumns) return deps._emailColumns;
+  let schema = await loadEmailReadColumns(deps);
+  schema = await ensureMailboxColumns(deps, schema);
+  if (deps) deps._emailColumns = schema;
+  return schema;
+}
+
+async function emailsHaveAiStatus(deps) {
+  const schema = deps && deps._emailColumns ? deps._emailColumns : await loadEmailReadColumns(deps);
+  return schema.ai_status === true;
+}
+
+async function queryAllAdaptive(deps, build) {
+  let schema = await readSchema(deps);
+  let lastErr;
+  for (let attempt = 0; attempt < OPTIONAL_READ_COLUMNS.size; attempt++) {
+    const query = build(schema);
+    try {
+      const rows = await queryAll(deps, query);
+      return { rows, query, schema };
+    } catch (err) {
+      lastErr = err;
+      const column = missingColumnName(err);
+      if (!column || schema[column] === false || !OPTIONAL_READ_COLUMNS.has(column)) throw err;
+      const next = { ...schema, [column]: false };
+      if (build(next).sql === query.sql) throw err;
+      schema = next;
+      if (deps) deps._emailColumns = schema;
+    }
+  }
+  throw lastErr || new Error("email read failed");
+}
+
+async function statsAdaptive(deps, ownerEmail) {
+  let schema = await readSchema(deps);
+  let lastErr;
+  for (let attempt = 0; attempt < OPTIONAL_READ_COLUMNS.size; attempt++) {
+    const queries = buildStatsQueries(deps && deps.nowMs, ownerEmail, schema);
+    try {
+      const [totalRows, directionRows, dayRows, senderRows] = await Promise.all([
+        queryAll(deps, queries.total),
+        queryAll(deps, queries.byDirection),
+        queryAll(deps, queries.byDay),
+        queryAll(deps, queries.topSenders),
+      ]);
+      return assembleStats(totalRows, directionRows, dayRows, senderRows);
+    } catch (err) {
+      lastErr = err;
+      const column = missingColumnName(err);
+      if (!column || schema[column] === false || !OPTIONAL_READ_COLUMNS.has(column)) throw err;
+      const next = { ...schema, [column]: false };
+      if (buildStatsQueries(deps && deps.nowMs, ownerEmail, next).total.sql === queries.total.sql) throw err;
+      schema = next;
+      if (deps) deps._emailColumns = schema;
+    }
+  }
+  throw lastErr || new Error("email read failed");
 }
 
 async function cachedObjectText(deps, key, fresh) {
@@ -1303,7 +1462,7 @@ async function callTool(name, args, deps) {
   noteTool(deps && deps.trace, name, args);
   const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
   if (name === "search_emails") {
-    const query = buildSearchQuery(args, ownerEmail);
+    buildSearchQuery(args, ownerEmail);
     const [hash, rev] = await Promise.all([
       hashCacheFields(searchCacheFields(args, ownerEmail)),
       readRevision(deps),
@@ -1312,12 +1471,15 @@ async function callTool(name, args, deps) {
       fresh: args.fresh === true,
       url: searchCacheUrl(hash, rev),
       ttl: CACHE_TTL.search,
-      load: async () => (await queryAll(deps, query)).map((row) => toMetadata(row, { includeSummary: query.includeSummary })),
+      load: async () => {
+        const loaded = await queryAllAdaptive(deps, (schema) => buildSearchQuery(args, ownerEmail, schema));
+        return loaded.rows.map((row) => toMetadata(row, { includeSummary: loaded.query.includeSummary }));
+      },
       store: () => true,
     });
   }
   if (name === "list_emails") {
-    const query = buildListQuery(args, ownerEmail);
+    buildListQuery(args, ownerEmail);
     const [hash, rev] = await Promise.all([
       hashCacheFields(listCacheFields(args, ownerEmail)),
       readRevision(deps),
@@ -1326,7 +1488,10 @@ async function callTool(name, args, deps) {
       fresh: args.fresh === true,
       url: listCacheUrl(hash, rev),
       ttl: CACHE_TTL.list,
-      load: async () => (await queryAll(deps, query)).map((row) => toMetadata(row, { includeSummary: query.includeSummary })),
+      load: async () => {
+        const loaded = await queryAllAdaptive(deps, (schema) => buildListQuery(args, ownerEmail, schema));
+        return loaded.rows.map((row) => toMetadata(row, { includeSummary: loaded.query.includeSummary }));
+      },
       store: () => true,
     });
   }
@@ -1355,10 +1520,12 @@ async function callTool(name, args, deps) {
       }
       noteCache(deps && deps.trace, false);
     }
-    const columnPresent = await emailsHaveAiStatus(deps);
-    const ownerEmail2 = deps && deps.ownerEmail ? deps.ownerEmail : null;
-    const query = columnPresent ? buildGetQuery(args, { includeAiStatus: true, ownerEmail: ownerEmail2 }) : parsed;
-    const rows = await queryAll(deps, query);
+    const loaded = await queryAllAdaptive(deps, (schema) =>
+      buildGetQuery(args, { includeAiStatus: schema.ai_status === true, ownerEmail, schema }),
+    );
+    const columnPresent = loaded.schema.ai_status === true;
+    const query = loaded.query;
+    const rows = loaded.rows;
     if (!rows.length) return { found: false, resend_id: id };
     // mailbox 隔离：校验归属
     if (ownerEmail) {
@@ -1396,16 +1563,7 @@ async function callTool(name, args, deps) {
       fresh: args.fresh === true,
       url: statsCacheUrl(rev, ownerEmail),
       ttl: CACHE_TTL.stats,
-      load: async () => {
-        const queries = buildStatsQueries(deps && deps.nowMs, ownerEmail);
-        const [totalRows, directionRows, dayRows, senderRows] = await Promise.all([
-          queryAll(deps, queries.total),
-          queryAll(deps, queries.byDirection),
-          queryAll(deps, queries.byDay),
-          queryAll(deps, queries.topSenders),
-        ]);
-        return assembleStats(totalRows, directionRows, dayRows, senderRows);
-      },
+      load: () => statsAdaptive(deps, ownerEmail),
       store: () => true,
     });
   }
@@ -1458,6 +1616,7 @@ async function callTool(name, args, deps) {
       throw new RpcError(-32602, "invalid resend_id");
     }
     const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
+    await readSchema(deps);
     // 隔离：只能操作自己的邮件
     let sql = "UPDATE emails SET is_read = ? WHERE resend_id = ?";
     const params = [isRead ? 1 : 0, resendId];
@@ -1479,6 +1638,7 @@ async function callTool(name, args, deps) {
       throw new RpcError(-32602, "invalid resend_id");
     }
     const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
+    await readSchema(deps);
     let sql = "UPDATE emails SET deleted_at = ? WHERE resend_id = ? AND deleted_at IS NULL";
     const params = [Date.now(), resendId];
     if (ownerEmail) {
@@ -1497,6 +1657,7 @@ async function callTool(name, args, deps) {
     }
     if (!isSafeResendId(resendId)) throw new RpcError(-32602, "invalid resend_id");
     const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
+    await readSchema(deps);
     let sql = "UPDATE emails SET is_archived = ? WHERE resend_id = ? AND deleted_at IS NULL";
     const params = [isArchived ? 1 : 0, resendId];
     if (ownerEmail) {
@@ -1511,13 +1672,17 @@ async function callTool(name, args, deps) {
     const resendId = args.resend_id;
     if (!resendId || !isSafeResendId(resendId)) throw new RpcError(-32602, "valid resend_id is required");
     const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
-    let sql = "SELECT attachments FROM emails WHERE resend_id = ? AND deleted_at IS NULL";
-    const params = [resendId];
-    if (ownerEmail) {
-      sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
-      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
-    }
-    const row = await deps.queryFirst(sql, params);
+    const loaded = await queryAllAdaptive(deps, (schema) => {
+      let sql = "SELECT attachments FROM emails WHERE resend_id = ?";
+      const params = [resendId];
+      if (hasColumn(schema, "deleted_at")) sql += " AND deleted_at IS NULL";
+      if (ownerEmail) {
+        sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
+        params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
+      }
+      return { sql, params };
+    });
+    const row = loaded.rows[0];
     if (!row) return toolText({ resend_id: resendId, attachments: [] });
     let atts = [];
     try { atts = JSON.parse(row.attachments || "[]"); } catch {}
@@ -1529,13 +1694,17 @@ async function callTool(name, args, deps) {
     if (!resendId || !isSafeResendId(resendId)) throw new RpcError(-32602, "valid resend_id is required");
     if (!filename) throw new RpcError(-32602, "filename is required");
     const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
-    let sql = "SELECT resend_id FROM emails WHERE resend_id = ? AND deleted_at IS NULL";
-    const params = [resendId];
-    if (ownerEmail) {
-      sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
-      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
-    }
-    const row = await deps.queryFirst(sql, params);
+    const loaded = await queryAllAdaptive(deps, (schema) => {
+      let sql = "SELECT resend_id FROM emails WHERE resend_id = ?";
+      const params = [resendId];
+      if (hasColumn(schema, "deleted_at")) sql += " AND deleted_at IS NULL";
+      if (ownerEmail) {
+        sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
+        params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
+      }
+      return { sql, params };
+    });
+    const row = loaded.rows[0];
     if (!row) throw new RpcError(-32602, "email not found or access denied");
     const key = `attachments/${resendId}/${filename}`;
     const data = await deps.getObjectText(key);
@@ -2520,9 +2689,9 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
         email TEXT PRIMARY KEY, request_id TEXT,
         created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`, []);
       // 邮件状态列迁移
-      try { await db.queryRun(`ALTER TABLE emails ADD COLUMN is_read INTEGER DEFAULT 0`, []); } catch {}
-      try { await db.queryRun(`ALTER TABLE emails ADD COLUMN deleted_at INTEGER`, []); } catch {}
-      try { await db.queryRun(`ALTER TABLE emails ADD COLUMN is_archived INTEGER DEFAULT 0`, []); } catch {}
+      for (const [, ddl] of EMAIL_MAILBOX_COLUMN_DDL) {
+        try { await db.queryRun(ddl, []); } catch {}
+      }
       let body;
       try { body = await request.json(); } catch { body = {}; }
       const inviteCode = (body.invite_code || "").trim();

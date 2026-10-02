@@ -127,7 +127,10 @@ CREATE TABLE IF NOT EXISTS emails (
   auth        TEXT,
   attachments TEXT,
   summary     TEXT,
-  created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  is_read     INTEGER DEFAULT 0,
+  deleted_at  INTEGER,
+  is_archived INTEGER DEFAULT 0
 );
 ```
 
@@ -244,6 +247,8 @@ ORDER BY name;
 ```
 
 7 行都在。再查 `SELECT rev FROM cache_revision WHERE id = 1`，得到 `0`。
+
+**已经存在的库。** `CREATE TABLE IF NOT EXISTS` 不会给旧的 `emails` 加上 `is_read`、`deleted_at`、`is_archived`。缺 `deleted_at` 时，`search_emails` 和 `email_stats` 的 SELECT 会失败，MCP 收成 JSON-RPC `-32603`。新 Worker 会在读的时候探测列并尝试补上；仍然要对已有库把 `worker/migrations/mailbox-columns.sql` 里的三条 `ALTER` 各 POST 一次（一条一个请求，不要 batch）。`duplicate column name` 表示这列已经在，停在这条即可。补完后用 `fresh: true` 调一次搜索和统计。
 
 ### 3. 创建 R2 桶 `abot-mail-archive`
 
