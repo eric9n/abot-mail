@@ -1077,7 +1077,7 @@ export const TOOLS = [
   },
   {
     name: "send_email",
-    description: "Send an email via Resend. IMPORTANT: Before using this tool, you MUST show the recipient and content to the user and get explicit approval. Do not send without user confirmation.",
+    description: "Send an email via Resend from your @abot.run address.",
     inputSchema: {
       type: "object",
       properties: {
