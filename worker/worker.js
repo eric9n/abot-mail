@@ -2079,7 +2079,10 @@ export async function handleFetch(request, env, deps = {}) {
         trace.outcome = "rejected";
         return json({ ok: false, error: "method not allowed" }, 405);
       }
-      if (!bearerOk(request.headers.get("authorization"), env && env.MCP_TOKEN)) {
+      // 内部鉴权：网关透传
+      const it = request.headers.get("x-internal-token") || "";
+      const fromGateway = env.INTERNAL_TOKEN && it === env.INTERNAL_TOKEN;
+      if (!fromGateway && !bearerOk(request.headers.get("authorization"), env && env.MCP_TOKEN)) {
         trace.outcome = "unauthorized";
         return json({ ok: false, error: "unauthorized" }, 401);
       }
