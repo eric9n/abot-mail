@@ -523,7 +523,7 @@ export function buildGetQuery(input, options = {}) {
   const sqlParams = [args.resend_id];
   if (ownerEmail) {
     whereParts.push("(msg_from = ? OR msg_to LIKE ? ESCAPE '\\')");
-    sqlParams.push(ownerEmail, "%\"" + ownerEmail + "\"%");
+    sqlParams.push(ownerEmail, likeContains('"' + ownerEmail + '"'));
   }
   return {
     sql: `SELECT ${columns}
@@ -539,7 +539,7 @@ export function buildStatsQueries(nowMs = Date.now(), ownerEmail = null) {
   const since = new Date(nowMs - 30 * 24 * 60 * 60 * 1000).toISOString();
   const delWhere = "deleted_at IS NULL";
   const ownerWhere = ownerEmail ? `WHERE ${delWhere} AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')` : `WHERE ${delWhere}`;
-  const ownerParams = ownerEmail ? [ownerEmail, "%\"" + ownerEmail + "\"%"] : [];
+  const ownerParams = ownerEmail ? [ownerEmail, likeContains('"' + ownerEmail + '"')] : [];
   const andOwner = ownerEmail ? "AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')" : "";
   return {
     total: { sql: `SELECT COUNT(*) AS total FROM emails ${ownerWhere}`, params: [...ownerParams] },
@@ -959,6 +959,18 @@ async function readRevision(deps) {
   return 0;
 }
 
+/**
+ * 变更操作（已读/删除/归档）后推进缓存世代，使各 colo 的读缓存失效。
+ * 与 cache_revision_after_email_insert 触发器用相同的 upsert 语句。
+ */
+async function bumpRevision(deps) {
+  if (!deps || typeof deps.queryRun !== "function") return;
+  await deps.queryRun(
+    "INSERT INTO cache_revision (id, rev) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET rev = rev + 1",
+    [],
+  );
+}
+
 async function readThrough(deps, { fresh, url, ttl, load, store }) {
   const cache = deps && deps.cache;
   if (cache && !fresh) {
@@ -1103,7 +1115,6 @@ export const TOOLS = [
         to: { type: "string", description: "Recipient email address." },
         subject: { type: "string", description: "Email subject." },
         body: { type: "string", description: "Email body (plain text)." },
-        from: { type: "string", description: "Sender address. Defaults to your bound email. Must be @abot.run." },
       },
       required: ["to", "subject", "body"],
       additionalProperties: false,
@@ -1311,6 +1322,18 @@ function noteCache(trace, hit) {
   trace.cache = hit ? 1 : 0;
 }
 
+/** 变更前校验：邮件存在、未删除且属于当前 owner。不存在或无权限时抛错，避免"操作成功"的假象。 */
+async function assertEmailOwned(deps, resendId, ownerEmail) {
+  let sql = "SELECT resend_id FROM emails WHERE resend_id = ? AND deleted_at IS NULL";
+  const params = [resendId];
+  if (ownerEmail) {
+    sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
+    params.push(ownerEmail, likeContains('"' + ownerEmail + '"'));
+  }
+  const row = await deps.queryFirst(sql, params);
+  if (!row) throw new RpcError(-32602, "email not found or access denied");
+}
+
 async function callTool(name, args, deps) {
   noteTool(deps && deps.trace, name, args);
   const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
@@ -1435,17 +1458,10 @@ async function callTool(name, args, deps) {
     if (!ownerEmail) {
       throw new RpcError(-32001, "agent email not bound");
     }
-    // 默认用 agent 绑定的邮箱
-    const from = args.from || ownerEmail;
+    // 发件人恒为 agent 绑定的邮箱，不接受客户端指定（防冒充）
+    const from = ownerEmail;
     if (!to || !subject || !body) {
       throw new RpcError(-32602, "to, subject, body are required");
-    }
-    if (!from.endsWith("@abot.run")) {
-      throw new RpcError(-32602, "from must be @abot.run address");
-    }
-    // 如果指定了 from，必须是自己的邮箱（防冒充）
-    if (args.from && ownerEmail && args.from.toLowerCase() !== ownerEmail.toLowerCase()) {
-      throw new RpcError(-32602, "cannot send as another agent");
     }
     const apiKey = deps.env.RESEND_API_KEY;
     if (!apiKey) {
@@ -1464,7 +1480,7 @@ async function callTool(name, args, deps) {
     if (!resp.ok) {
       throw new RpcError(-32603, "Resend error: " + JSON.stringify(data));
     }
-    return toolText({ id: data.id, to, subject });
+    return { id: data.id, to, subject };
   }
   if (name === "set_email_read_status") {
     const resendId = args.resend_id;
@@ -1476,17 +1492,14 @@ async function callTool(name, args, deps) {
       throw new RpcError(-32602, "invalid resend_id");
     }
     const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
-    // 隔离：只能操作自己的邮件
-    let sql = "UPDATE emails SET is_read = ? WHERE resend_id = ?";
+    // 隔离：只能操作自己的邮件；不存在或无权限直接报错
+    await assertEmailOwned(deps, resendId, ownerEmail);
+    const sql = "UPDATE emails SET is_read = ? WHERE resend_id = ?";
     const params = [isRead ? 1 : 0, resendId];
-    if (ownerEmail) {
-      sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
-      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
-    }
     await deps.queryRun(sql, params);
     // 清缓存
     await bumpRevision(deps);
-    return toolText({ resend_id: resendId, is_read: isRead });
+    return { resend_id: resendId, is_read: isRead };
   }
   if (name === "delete_email") {
     const resendId = args.resend_id;
@@ -1497,15 +1510,13 @@ async function callTool(name, args, deps) {
       throw new RpcError(-32602, "invalid resend_id");
     }
     const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
-    let sql = "UPDATE emails SET deleted_at = ? WHERE resend_id = ? AND deleted_at IS NULL";
+    // 隔离：只能操作自己的邮件；不存在或无权限直接报错
+    await assertEmailOwned(deps, resendId, ownerEmail);
+    const sql = "UPDATE emails SET deleted_at = ? WHERE resend_id = ? AND deleted_at IS NULL";
     const params = [Date.now(), resendId];
-    if (ownerEmail) {
-      sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
-      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
-    }
     await deps.queryRun(sql, params);
     await bumpRevision(deps);
-    return toolText({ resend_id: resendId, deleted: true });
+    return { resend_id: resendId, deleted: true };
   }
   if (name === "set_email_archived_status") {
     const resendId = args.resend_id;
@@ -1515,15 +1526,13 @@ async function callTool(name, args, deps) {
     }
     if (!isSafeResendId(resendId)) throw new RpcError(-32602, "invalid resend_id");
     const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
-    let sql = "UPDATE emails SET is_archived = ? WHERE resend_id = ? AND deleted_at IS NULL";
+    // 隔离：只能操作自己的邮件；不存在或无权限直接报错
+    await assertEmailOwned(deps, resendId, ownerEmail);
+    const sql = "UPDATE emails SET is_archived = ? WHERE resend_id = ? AND deleted_at IS NULL";
     const params = [isArchived ? 1 : 0, resendId];
-    if (ownerEmail) {
-      sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
-      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
-    }
     await deps.queryRun(sql, params);
     await bumpRevision(deps);
-    return toolText({ resend_id: resendId, is_archived: isArchived });
+    return { resend_id: resendId, is_archived: isArchived };
   }
   if (name === "list_attachments") {
     const resendId = args.resend_id;
@@ -1533,32 +1542,45 @@ async function callTool(name, args, deps) {
     const params = [resendId];
     if (ownerEmail) {
       sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
-      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
+      params.push(ownerEmail, likeContains('"' + ownerEmail + '"'));
     }
     const row = await deps.queryFirst(sql, params);
-    if (!row) return toolText({ resend_id: resendId, attachments: [] });
+    if (!row) return { resend_id: resendId, attachments: [] };
     let atts = [];
     try { atts = JSON.parse(row.attachments || "[]"); } catch {}
-    return toolText({ resend_id: resendId, attachments: atts.map(a => ({ filename: a.filename, content_type: a.content_type, size: a.size })) });
+    return { resend_id: resendId, attachments: atts.map(a => ({ filename: a.filename, content_type: a.content_type, size: a.size })) };
   }
   if (name === "get_attachment") {
     const resendId = args.resend_id;
     const filename = args.filename;
     if (!resendId || !isSafeResendId(resendId)) throw new RpcError(-32602, "valid resend_id is required");
-    if (!filename) throw new RpcError(-32602, "filename is required");
+    if (typeof filename !== "string" || !filename) throw new RpcError(-32602, "filename is required");
+    // 安全：文件名不得含路径分隔符或 ..，且必须与邮件记录的附件名精确匹配（防 R2 路径遍历）
+    if (filename.includes("/") || filename.includes("\\") || filename.includes("..")) {
+      throw new RpcError(-32602, "invalid filename");
+    }
     const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
-    let sql = "SELECT resend_id FROM emails WHERE resend_id = ? AND deleted_at IS NULL";
+    let sql = "SELECT attachments FROM emails WHERE resend_id = ? AND deleted_at IS NULL";
     const params = [resendId];
     if (ownerEmail) {
       sql += " AND (msg_from = ? OR msg_to LIKE ? ESCAPE '\\')";
-      params.push(ownerEmail, "%\"" + ownerEmail + "\"%");
+      params.push(ownerEmail, likeContains('"' + ownerEmail + '"'));
     }
     const row = await deps.queryFirst(sql, params);
     if (!row) throw new RpcError(-32602, "email not found or access denied");
-    const key = `attachments/${resendId}/${filename}`;
-    const data = await deps.getObjectText(key);
+    let atts = [];
+    try { atts = JSON.parse(row.attachments || "[]"); } catch {}
+    const match = atts.find(a => a && a.filename === filename);
+    if (!match) throw new RpcError(-32602, "attachment not found");
+    // 安全：只允许读取本邮件前缀下的 r2_key（防存储数据被篡改导致的越权读取）
+    const prefix = `attachments/${resendId}/`;
+    const key = match.r2_key;
+    if (typeof key !== "string" || !key.startsWith(prefix) || key.includes("..")) {
+      throw new RpcError(-32602, "attachment not found");
+    }
+    const data = await deps.getObjectBase64(key);
     if (!data) throw new RpcError(-32602, "attachment not found");
-    return toolText({ resend_id: resendId, filename, content_base64: data });
+    return { resend_id: resendId, filename: match.filename, content_base64: data };
   }
   throw new RpcError(-32601, `unknown tool: ${name}`);
 }
@@ -1601,25 +1623,62 @@ async function withSummaryColumn(source, run) {
   }
 }
 
+function missingStateColumn(err) {
+  return /no such column: (is_read|deleted_at|is_archived)/i.test(String((err && err.message) || ""));
+}
+
+function duplicateStateColumn(err) {
+  return String((err && err.message) || "").toLowerCase().includes("duplicate column name");
+}
+
+/**
+ * 状态列（is_read / deleted_at / is_archived）是后加的。
+ * 旧库第一次用到时自动 ALTER，忽略并发重复。模式与 withSummaryColumn 一致。
+ */
+async function withStateColumns(source, run) {
+  try {
+    return await withSummaryColumn(source, run);
+  } catch (err) {
+    if (!missingStateColumn(err)) throw err;
+    for (const ddl of [
+      "ALTER TABLE emails ADD COLUMN is_read INTEGER DEFAULT 0",
+      "ALTER TABLE emails ADD COLUMN deleted_at INTEGER",
+      "ALTER TABLE emails ADD COLUMN is_archived INTEGER DEFAULT 0",
+    ]) {
+      try {
+        await source.prepare(ddl).run();
+      } catch (alterErr) {
+        if (!duplicateStateColumn(alterErr)) throw alterErr;
+      }
+    }
+    return await withSummaryColumn(source, run);
+  }
+}
+
 function d1Deps(env) {
   const source = d1Session(env && env.DB);
   return {
     async queryAll(sql, params) {
-      return withSummaryColumn(source, async () => {
+      return withStateColumns(source, async () => {
         const out = await bindStmt(source, sql, params).all();
         return out.results || [];
       });
     },
     async queryFirst(sql, params) {
-      return withSummaryColumn(source, () => bindStmt(source, sql, params).first());
+      return withStateColumns(source, () => bindStmt(source, sql, params).first());
     },
     async queryRun(sql, params) {
-      return withSummaryColumn(source, () => bindStmt(source, sql, params).run());
+      return withStateColumns(source, () => bindStmt(source, sql, params).run());
     },
     async getObjectText(key) {
       const obj = await env.ARCHIVE_BUCKET.get(key);
       if (!obj) return null;
       return obj.text();
+    },
+    async getObjectBase64(key) {
+      const obj = await env.ARCHIVE_BUCKET.get(key);
+      if (!obj) return null;
+      return bytesToBase64(new Uint8Array(await obj.arrayBuffer()));
     },
   };
 }
@@ -2403,10 +2462,7 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
       await db.queryRun(`CREATE TABLE IF NOT EXISTS mailboxes (
         email TEXT PRIMARY KEY, request_id TEXT,
         created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`, []);
-      // 邮件状态列迁移
-      try { await db.queryRun(`ALTER TABLE emails ADD COLUMN is_read INTEGER DEFAULT 0`, []); } catch {}
-      try { await db.queryRun(`ALTER TABLE emails ADD COLUMN deleted_at INTEGER`, []); } catch {}
-      try { await db.queryRun(`ALTER TABLE emails ADD COLUMN is_archived INTEGER DEFAULT 0`, []); } catch {}
+      // 状态列迁移已由 d1Deps 懒迁移（withStateColumns）处理，不在此处执行
       let body;
       try { body = await request.json(); } catch { body = {}; }
       const inviteCode = (body.invite_code || "").trim();
@@ -2469,16 +2525,16 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
         trace.outcome = "rejected";
         return json({ ok: false, error: "method not allowed" }, 405);
       }
-      // 内部鉴权：网关透传
+      // 内部鉴权：网关透传（恒时比较防时序攻击）
       const it = request.headers.get("x-internal-token") || "";
-      const fromGateway = env.INTERNAL_TOKEN && it === env.INTERNAL_TOKEN;
+      const fromGateway = !!(env.INTERNAL_TOKEN && timingSafeEqual(it, env.INTERNAL_TOKEN));
       if (!fromGateway && !bearerOk(request.headers.get("authorization"), env && env.MCP_TOKEN)) {
         trace.outcome = "unauthorized";
         return json({ ok: false, error: "unauthorized" }, 401);
       }
-      // 网关透传的 agent 身份（仅当 fromGateway 时信任）— 强校验必传
+      // 网关透传的 agent 身份（仅当 fromGateway 时信任）— 强校验必传且格式合法
       const ownerEmail = fromGateway ? (request.headers.get("x-abot-owner-email") || "").trim().toLowerCase() || null : null;
-      if (fromGateway && !ownerEmail) {
+      if (fromGateway && (!ownerEmail || !/^[a-z0-9._-]+@abot\.run$/.test(ownerEmail))) {
         return json({ ok: false, error: "x-abot-owner-email required" }, 401);
       }
       // 限流：按身份每分钟 100 次

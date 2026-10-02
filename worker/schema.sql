@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS emails (
   auth        TEXT,                     -- JSON {spf,dkim,dmarc}, inbound only
   attachments TEXT,                     -- JSON [{filename, content_type, size, r2_key}]
   summary     TEXT,                     -- JSON {"points":[...],"todos":[{"text","deadline"}]} or NULL
+  is_read     INTEGER DEFAULT 0,        -- 0 未读 / 1 已读
+  deleted_at  INTEGER,                  -- 软删除时间戳（毫秒），NULL = 未删除
+  is_archived INTEGER DEFAULT 0,        -- 0 未归档 / 1 已归档
   created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
@@ -49,6 +52,11 @@ BEGIN
   INSERT INTO cache_revision (id, rev) VALUES (1, 1)
   ON CONFLICT(id) DO UPDATE SET rev = rev + 1;
 END;
+
+-- 状态列（is_read / deleted_at / is_archived）是后加的：
+-- 新库由上面的 CREATE TABLE 直接建列；
+-- 旧库由 worker 的 withStateColumns 懒迁移自动 ALTER（忽略 duplicate column name），
+-- 无需手动执行。
 
 -- summary is nullable and is not indexed. This file is safe to re-run:
 -- CREATE TABLE IF NOT EXISTS does not add columns to a table that already

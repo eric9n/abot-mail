@@ -421,7 +421,10 @@ function sqliteEnv() {
       async get(key) {
         const hit = bucket.get(key);
         if (!hit) return null;
-        return { async text() { return new TextDecoder().decode(hit.bytes); } };
+        return {
+          async text() { return new TextDecoder().decode(hit.bytes); },
+          async arrayBuffer() { return hit.bytes.slice().buffer; },
+        };
       },
     },
     INGEST_QUEUE: {
