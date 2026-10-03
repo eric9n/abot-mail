@@ -34,7 +34,23 @@ npx wrangler deploy
 
 Staging 使用另一套名字，不能和生产队列混用：`mail-ingest-staging`、`mail-ingest-staging-dlq`、D1 `abot-mail-archive-staging`、R2 `abot-mail-archive-staging`、Worker `resend-agent-mail-relay-staging`。绑定写在 `worker/wrangler.toml` 的 `[env.staging]`。staging 的 `database_id` 要换成 `wrangler d1 create` 打印的 id，占位符不是生产库。部署 staging 用 `npx wrangler deploy --env staging`，secrets 也加 `--env staging`。
 
-`schema.sql` 使用 `IF NOT EXISTS`，重复执行不会清掉已有邮件。Worker 名称与现有脚本相同，部署后地址保持 `https://resend-agent-mail-relay.eric9n-cf.workers.dev`。
+`schema.sql` 使用 `IF NOT EXISTS`，重复执行不会清掉已有邮件，也**不会**给已经存在的 `emails` 表加列。Worker 名称与现有脚本相同，部署后地址保持 `https://resend-agent-mail-relay.eric9n-cf.workers.dev`。
+
+生产库如果是在 `is_read` / `deleted_at` / `is_archived` 写进建表语句之前建的，`search_emails` 和 `email_stats` 都会在 D1 上报 `no such column: deleted_at`（搜索还会再撞上 `is_archived`）。这两条 SELECT 的异常被收成 JSON-RPC `-32603`。`auth` 不在这个失败里：统计查询不选它，而它本来就在最初的建表语句里。
+
+部署下面这个 Worker 之后，读路径会查 `pragma_table_info('emails')`。缺这三列就补 `ALTER`（`duplicate column name` 忽略）；补不上就把该列从当次 SELECT 拿掉，搜索和统计仍返回邮件。`X-Internal-Token` 仍是整段逐字符比较。网关请求没有 `x-abot-owner-email` 仍然 401。带了 owner 的查询仍然只返回该邮箱收发的信。
+
+请在生产 D1 `abot-mail-archive`（`779058bf-f5c1-44de-b2c8-99350ec7748e`）上把下面三条各执行一次。可以先部署再执行，也可以先执行再部署。列已经存在时语句会报 `duplicate column name`，那就是补过了，不要重跑。不要用 batch。
+
+```bash
+cd worker
+npx wrangler d1 execute abot-mail-archive --remote --command "ALTER TABLE emails ADD COLUMN is_read INTEGER DEFAULT 0"
+npx wrangler d1 execute abot-mail-archive --remote --command "ALTER TABLE emails ADD COLUMN deleted_at INTEGER"
+npx wrangler d1 execute abot-mail-archive --remote --command "ALTER TABLE emails ADD COLUMN is_archived INTEGER DEFAULT 0"
+npx wrangler deploy
+```
+
+然后对 `email_stats` 和 `search_emails` 带 `fresh: true` 各调一次，避开最多 120 秒的统计缓存。若 `cache_revision` 表本身不存在，读会按 revision `0` 继续，不会再变成 `-32603`；这时按 `docs/install.md` 第 2 步把 `06.sql`–`09.sql` 补上。
 
 四个 secret（`INTERNAL_TOKEN` 可以不设，不设就只有 Bearer 能进 `/mcp`）：
 

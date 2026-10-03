@@ -40,6 +40,9 @@ import worker, {
   buildListQuery,
   buildSearchQuery,
   buildStatsQueries,
+  EMAIL_MAILBOX_COLUMN_DDL,
+  emailColumnFlags,
+  missingColumnName,
   canonicalBound,
   canonicalCacheRecord,
   collectAlertSignals,
@@ -624,7 +627,7 @@ test("webhook archives inbound mail once, then MCP can read it", async () => {
   const listedTools = await mcp({ jsonrpc: "2.0", id: 1, method: "tools/list" });
   assert.deepEqual(
     listedTools.body.result.tools.map((tool) => tool.name),
-    ["search_emails", "get_email", "list_emails", "email_stats"],
+    ["search_emails", "get_email", "list_emails", "email_stats", "send_email", "set_email_read_status", "delete_email", "set_email_archived_status", "list_attachments", "get_attachment"],
   );
   for (const tool of listedTools.body.result.tools) {
     assert.equal(typeof tool.description, "string");
@@ -1407,8 +1410,17 @@ function toolValue(rpc) {
   return JSON.parse(rpc.body.result.content[0].text);
 }
 
+function observedSqls(sqls) {
+  return sqls.filter((sql) => !/rate_limits/i.test(sql));
+}
+
 function dataSqls(sqls) {
-  return sqls.filter((sql) => sql !== READ_REVISION_SQL);
+  return observedSqls(sqls).filter((sql) => {
+    if (sql === READ_REVISION_SQL) return false;
+    if (/pragma_table_info/i.test(sql)) return false;
+    if (/^ALTER TABLE emails ADD COLUMN (is_read|deleted_at|is_archived)\b/i.test(String(sql).trim())) return false;
+    return true;
+  });
 }
 
 function cacheRev(db) {
@@ -1506,8 +1518,10 @@ test("cache keys follow the phase-2 table and fresh is optional", async () => {
   const cache = memoryCache();
   const listed = await mcpCall(env, { jsonrpc: "2.0", id: 1, method: "tools/list" }, { cache, nowMs: NOW_MS });
   assert.equal(listed.status, 200);
+  const readTools = new Set(["search_emails", "get_email", "list_emails", "email_stats"]);
   for (const tool of listed.body.result.tools) {
     assert.equal(tool.inputSchema.additionalProperties, false);
+    if (!readTools.has(tool.name)) continue;
     assert.equal(tool.inputSchema.properties.fresh.type, "boolean");
     assert.equal((tool.inputSchema.required || []).includes("fresh"), false);
   }
@@ -1605,7 +1619,7 @@ test("MCP reads hit the cache and stay no-store", async () => {
   sqls.reset();
   const searchAgain = toolValue(await mcpCall(env, toolMessage(2, "search_emails", { limit: 100, query: "invoice" }), deps));
   assert.equal(searchAgain.length, 1);
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(observedSqls(sqls.sqls), [READ_REVISION_SQL]);
   sqls.reset();
   const other = toolValue(await mcpCall(env, toolMessage(3, "search_emails", { query: "missing" }), deps));
   assert.equal(other.length, 0);
@@ -1622,7 +1636,7 @@ test("MCP reads hit the cache and stay no-store", async () => {
   assert.equal(cache.puts.find((put) => put.url === listUrl).cacheControl, "max-age=10");
   sqls.reset();
   toolValue(await mcpCall(env, toolMessage(5, "list_emails", { since: "2026-09-01T00:00:00.000Z", direction: "in" }), deps));
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(observedSqls(sqls.sqls), [READ_REVISION_SQL]);
 
   sqls.reset();
   const stats = toolValue(await mcpCall(env, toolMessage(6, "email_stats", {}), deps));
@@ -1635,7 +1649,7 @@ test("MCP reads hit the cache and stay no-store", async () => {
   sqls.reset();
   const statsAgain = toolValue(await mcpCall(env, toolMessage(7, "email_stats", {}), deps));
   assert.deepEqual(statsAgain, stats);
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(observedSqls(sqls.sqls), [READ_REVISION_SQL]);
 
   sqls.reset();
   const detail = toolValue(
@@ -1651,7 +1665,7 @@ test("MCP reads hit the cache and stay no-store", async () => {
   sqls.reset();
   const plainAgain = toolValue(await mcpCall(env, toolMessage(9, "get_email", { resend_id: EMAIL_ID }), deps));
   assert.equal(plainAgain.text_body, "please pay");
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(observedSqls(sqls.sqls), [READ_REVISION_SQL]);
   assert.equal(r2Gets.length, 0);
 
   sqls.reset();
@@ -1719,14 +1733,14 @@ test("fresh bypasses the cache and TTLs expire entries", async () => {
   cache.puts.length = 0;
   const stale = toolValue(await mcpCall(env, toolMessage(1, "email_stats", {}), deps));
   assert.equal(stale.total, 999);
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(observedSqls(sqls.sqls), [READ_REVISION_SQL]);
   const fresh = toolValue(await mcpCall(env, toolMessage(2, "email_stats", { fresh: true }), deps));
   assert.equal(fresh.total, 0);
   assert.equal(dataSqls(sqls.sqls).length, 4);
   sqls.reset();
   const updated = toolValue(await mcpCall(env, toolMessage(3, "email_stats", { fresh: false }), deps));
   assert.equal(updated.total, 0);
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(observedSqls(sqls.sqls), [READ_REVISION_SQL]);
 
   const row = mapEmailForStorage(
     { id: "ttl-1", from: "a@b.c", to: ["eric@abot.run"], subject: "ttl", text: "body", created_at: "2026-09-28T00:00:00.000Z" },
@@ -1738,7 +1752,7 @@ test("fresh bypasses the cache and TTLs expire entries", async () => {
   cache.advance(9_000);
   sqls.reset();
   toolValue(await mcpCall(env, toolMessage(5, "search_emails", { query: "ttl" }), deps));
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(observedSqls(sqls.sqls), [READ_REVISION_SQL]);
   cache.advance(2_000);
   sqls.reset();
   toolValue(await mcpCall(env, toolMessage(6, "search_emails", { query: "ttl" }), deps));
@@ -1749,7 +1763,7 @@ test("fresh bypasses the cache and TTLs expire entries", async () => {
   cache.advance(9_000);
   sqls.reset();
   toolValue(await mcpCall(env, toolMessage(8, "list_emails", { limit: 1 }), deps));
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(observedSqls(sqls.sqls), [READ_REVISION_SQL]);
   cache.advance(2_000);
   sqls.reset();
   toolValue(await mcpCall(env, toolMessage(9, "list_emails", { limit: 1 }), deps));
@@ -1762,7 +1776,7 @@ test("fresh bypasses the cache and TTLs expire entries", async () => {
   cache.advance(119_000);
   sqls.reset();
   toolValue(await mcpCall(env, toolMessage(11, "email_stats", {}), deps));
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(observedSqls(sqls.sqls), [READ_REVISION_SQL]);
   cache.advance(2_000);
   sqls.reset();
   toolValue(await mcpCall(env, toolMessage(12, "email_stats", {}), deps));
@@ -1775,7 +1789,7 @@ test("fresh bypasses the cache and TTLs expire entries", async () => {
   sqls.reset();
   const cachedEmail = toolValue(await mcpCall(env, toolMessage(14, "get_email", { resend_id: "ttl-1" }), deps));
   assert.equal(cachedEmail.text_body, "body");
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(observedSqls(sqls.sqls), [READ_REVISION_SQL]);
   const refreshed = toolValue(await mcpCall(env, toolMessage(15, "get_email", { resend_id: "ttl-1", fresh: true }), deps));
   assert.equal(refreshed.text_body, "changed");
   cache.advance(CACHE_TTL.getEmail * 1000);
@@ -2079,7 +2093,7 @@ test("MCP cache fills through waitUntil when a context is present", async () => 
   const sqls = instrumentDb(env);
   const second = toolValue(await mcpCall(env, toolMessage(2, "email_stats", {}), { cache, nowMs: NOW_MS }));
   assert.equal(second.total, 0);
-  assert.deepEqual(sqls.sqls, [READ_REVISION_SQL]);
+  assert.deepEqual(observedSqls(sqls.sqls), [READ_REVISION_SQL]);
 });
 
 test("MCP reads take the revision and the row read from one primary session", async () => {
@@ -2104,7 +2118,7 @@ test("MCP reads take the revision and the row read from one primary session", as
   const cache = memoryCache();
   const rows = toolValue(await mcpCall(env, toolMessage(1, "search_emails", { query: "x" }), { cache, nowMs: NOW_MS }));
   assert.deepEqual(rows, []);
-  assert.equal(seen.filter((entry) => entry.via === "session" && entry.constraint === "first-primary").length, 1);
+  assert.equal(seen.filter((entry) => entry.via === "session" && entry.constraint === "first-primary").length, 2);
   assert.ok(seen.some((entry) => entry.via === "primary" && entry.sql === READ_REVISION_SQL));
   assert.ok(seen.some((entry) => entry.via === "primary" && entry.sql.includes("FROM emails")));
   assert.equal(seen.some((entry) => entry.via === "database"), false);
@@ -3107,7 +3121,6 @@ test("mapEmailForStorage truncates text and html that would bloat D1", () => {
 
 test("include_raw_eml returns r2_key instead of inlining an oversized object", async () => {
   const { db, env } = sqliteEnv();
-  db.exec("ALTER TABLE emails ADD COLUMN deleted_at INTEGER");
   const row = mapEmailForStorage(
     {
       id: EMAIL_ID,
@@ -3313,4 +3326,231 @@ test("rule events use a stable id and send only when the insert changes a row", 
   assert.equal(kept.status, 200);
   assert.equal(kept.body.ok, true);
   assert.equal(broken.db.prepare("SELECT COUNT(*) AS n FROM emails").get().n, 1);
+});
+
+const LEGACY_EMAILS_SQL = `CREATE TABLE emails (
+  resend_id TEXT PRIMARY KEY,
+  direction TEXT NOT NULL,
+  msg_from TEXT,
+  msg_to TEXT,
+  cc TEXT,
+  subject TEXT,
+  date TEXT,
+  text_body TEXT,
+  html_body TEXT,
+  message_id TEXT,
+  auth TEXT,
+  attachments TEXT,
+  summary TEXT,
+  created_at TEXT
+)`;
+
+function restoreEmailTrigger(db) {
+  db.exec(`CREATE TRIGGER cache_revision_after_email_insert
+    AFTER INSERT ON emails
+    BEGIN
+      INSERT INTO cache_revision (id, rev) VALUES (1, 1)
+      ON CONFLICT(id) DO UPDATE SET rev = rev + 1;
+    END`);
+}
+
+function legacyArchiveEnv() {
+  const { db, env } = sqliteEnv();
+  db.exec("DROP TRIGGER IF EXISTS cache_revision_after_email_insert");
+  db.exec("DROP TABLE emails");
+  db.exec(LEGACY_EMAILS_SQL);
+  restoreEmailTrigger(db);
+  return { db, env };
+}
+
+function insertLegacyMail(db, { id, from, to, subject, text, auth = null }) {
+  db.prepare(
+    `INSERT INTO emails (resend_id, direction, msg_from, msg_to, cc, subject, date, text_body, attachments, auth)
+     VALUES (?, 'in', ?, ?, '[]', ?, '2026-09-28T00:00:00.000Z', ?, '[]', ?)`,
+  ).run(id, from, JSON.stringify([to]), subject, text, auth);
+}
+
+async function postMcp(env, message, headers, deps) {
+  const res = await handleFetch(
+    new Request("https://example.test/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify(message),
+    }),
+    env,
+    deps,
+  );
+  return { status: res.status, body: await res.json() };
+}
+
+test("email column flags and the mailbox migration match", () => {
+  const flags = emailColumnFlags(["resend_id", "auth", "summary", "msg_from"]);
+  assert.equal(flags.probed, true);
+  assert.equal(flags.auth, true);
+  assert.equal(flags.summary, true);
+  assert.equal(flags.deleted_at, false);
+  assert.equal(flags.is_archived, false);
+  assert.equal(flags.is_read, false);
+  assert.equal(flags.ai_status, false);
+  assert.equal(emailColumnFlags([]).probed, false);
+  assert.equal(missingColumnName(new Error("D1_ERROR: no such column: emails.deleted_at: SQLITE_ERROR")), "deleted_at");
+  assert.equal(missingColumnName(new Error("no such column: is_archived")), "is_archived");
+  assert.equal(missingColumnName(new Error("database is locked")), null);
+  const file = readFileSync(new URL("./migrations/mailbox-columns.sql", import.meta.url), "utf8");
+  assert.equal(EMAIL_MAILBOX_COLUMN_DDL.length, 3);
+  for (const [, sql] of EMAIL_MAILBOX_COLUMN_DDL) assert.equal(file.includes(sql + ";"), true);
+});
+
+test("search and stats omit missing mailbox columns and still isolate owners", () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec(LEGACY_EMAILS_SQL);
+  insertLegacyMail(db, { id: "legacy-eric", from: "alice@example.com", to: "eric@abot.run", subject: "invoice", text: "pay eric" });
+  insertLegacyMail(db, { id: "legacy-other", from: "bob@example.com", to: "other@abot.run", subject: "invoice", text: "pay other" });
+  const legacy = { deleted_at: false, is_archived: false, is_read: false, auth: true, summary: true };
+  assert.throws(() => db.prepare(buildSearchQuery({ query: "invoice" }).sql).all(), /no such column: deleted_at/);
+  assert.throws(() => db.prepare(buildStatsQueries(NOW_MS).total.sql).get(), /no such column: deleted_at/);
+
+  const search = buildSearchQuery({ query: "invoice" }, "eric@abot.run", legacy);
+  assert.equal(search.sql.includes("deleted_at"), false);
+  assert.equal(search.sql.includes("is_archived"), false);
+  assert.match(search.sql, /msg_from = \?/);
+  const rows = db.prepare(search.sql).all(...search.params).map(toMetadata);
+  assert.deepEqual(rows.map((row) => row.resend_id), ["legacy-eric"]);
+  assert.equal(rows[0].auth, null);
+
+  const stats = buildStatsQueries(NOW_MS, "eric@abot.run", legacy);
+  for (const query of [stats.total, stats.byDirection, stats.byDay, stats.topSenders]) {
+    assert.equal(query.sql.includes("deleted_at"), false);
+    assert.match(query.sql, /msg_from = \?/);
+  }
+  const total = db.prepare(stats.total.sql).get(...stats.total.params);
+  assert.equal(Number(total.total), 1);
+  const everyone = db.prepare(buildStatsQueries(NOW_MS, null, legacy).total.sql).get();
+  assert.equal(Number(everyone.total), 2);
+});
+
+test("legacy archive search_emails and email_stats survive missing columns", async () => {
+  const { db, env } = legacyArchiveEnv();
+  env.INTERNAL_TOKEN = "internal-token-value";
+  env.MCP_TOKEN = "test-mcp-token";
+  insertLegacyMail(db, {
+    id: "legacy-eric",
+    from: "alice@example.com",
+    to: "eric@abot.run",
+    subject: "invoice",
+    text: "pay eric",
+    auth: JSON.stringify({ spf: "pass", dkim: "pass", dmarc: "pass" }),
+  });
+  insertLegacyMail(db, { id: "legacy-other", from: "bob@example.com", to: "other@abot.run", subject: "invoice", text: "pay other" });
+  const deps = { nowMs: NOW_MS };
+  const owned = (id, name, args, owner) =>
+    postMcp(env, toolMessage(id, name, args), {
+      "x-internal-token": "internal-token-value",
+      "x-abot-owner-email": owner,
+    }, deps);
+  const prefix = await postMcp(
+    env,
+    toolMessage(1, "email_stats", {}),
+    { "x-internal-token": "internal-token-valu" },
+    deps,
+  );
+  assert.equal(prefix.status, 401);
+  const unbound = await postMcp(env, toolMessage(2, "search_emails", { query: "invoice" }), { "x-internal-token": "internal-token-value" }, deps);
+  assert.equal(unbound.status, 401);
+  assert.equal(unbound.body.error, "x-abot-owner-email required");
+
+  const search = await owned(3, "search_emails", { query: "invoice" }, "eric@abot.run");
+  const searchRows = toolValue(search);
+  assert.deepEqual(searchRows.map((row) => row.resend_id), ["legacy-eric"]);
+  assert.deepEqual(searchRows[0].auth, { spf: "pass", dkim: "pass", dmarc: "pass" });
+  const hidden = await owned(4, "search_emails", { query: "invoice", fresh: true }, "other@abot.run");
+  assert.deepEqual(toolValue(hidden).map((row) => row.resend_id), ["legacy-other"]);
+  const stats = toolValue(await owned(5, "email_stats", { fresh: true }, "eric@abot.run"));
+  assert.equal(stats.total, 1);
+  assert.equal(stats.by_direction.in, 1);
+  for (const name of ["is_read", "deleted_at", "is_archived"]) {
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM pragma_table_info('emails') WHERE name = ?").get(name).n, 1, name);
+  }
+
+  db.prepare("UPDATE emails SET deleted_at = ? WHERE resend_id = ?").run(NOW_MS, "legacy-eric");
+  db.prepare("UPDATE emails SET is_archived = 1 WHERE resend_id = ?").run("legacy-other");
+  const afterDelete = toolValue(await owned(6, "search_emails", { query: "invoice", fresh: true }, "eric@abot.run"));
+  assert.deepEqual(afterDelete, []);
+  const ericStats = toolValue(await owned(7, "email_stats", { fresh: true }, "eric@abot.run"));
+  assert.equal(ericStats.total, 0);
+  const archivedHidden = toolValue(await owned(8, "search_emails", { query: "invoice", fresh: true }, "other@abot.run"));
+  assert.deepEqual(archivedHidden, []);
+  const archivedShown = toolValue(
+    await owned(9, "search_emails", { query: "invoice", fresh: true, include_archived: true }, "other@abot.run"),
+  );
+  assert.deepEqual(archivedShown.map((row) => row.resend_id), ["legacy-other"]);
+});
+
+test("reads still succeed when mailbox ALTERs are refused", async () => {
+  const { db, env } = legacyArchiveEnv();
+  env.INTERNAL_TOKEN = "internal-token-value";
+  insertLegacyMail(db, { id: "legacy-eric", from: "alice@example.com", to: "eric@abot.run", subject: "invoice", text: "pay eric" });
+  insertLegacyMail(db, { id: "legacy-other", from: "bob@example.com", to: "other@abot.run", subject: "invoice", text: "pay other" });
+  const orig = env.DB.prepare.bind(env.DB);
+  env.DB.prepare = (sql) => {
+    if (/^ALTER TABLE emails ADD COLUMN (is_read|deleted_at|is_archived)\b/i.test(String(sql).trim())) {
+      throw new Error("alter refused");
+    }
+    return orig(sql);
+  };
+  const sqls = instrumentDb(env);
+  const deps = { nowMs: NOW_MS };
+  const headers = { "x-internal-token": "internal-token-value", "x-abot-owner-email": "eric@abot.run" };
+  const search = toolValue(await postMcp(env, toolMessage(1, "search_emails", { query: "invoice" }), headers, deps));
+  assert.deepEqual(search.map((row) => row.resend_id), ["legacy-eric"]);
+  const stats = toolValue(await postMcp(env, toolMessage(2, "email_stats", { fresh: true }), headers, deps));
+  assert.equal(stats.total, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM pragma_table_info('emails') WHERE name = 'deleted_at'").get().n, 0);
+  const reads = sqls.sqls.filter((sql) => /FROM emails/i.test(sql));
+  assert.equal(reads.length > 0, true);
+  assert.equal(reads.some((sql) => sql.includes("deleted_at")), false);
+  assert.equal(reads.some((sql) => sql.includes("msg_from = ?")), true);
+});
+
+test("missing auth or cache_revision does not turn reads into internal errors", async () => {
+  const { db, env } = legacyArchiveEnv();
+  db.exec("DROP TRIGGER IF EXISTS cache_revision_after_email_insert");
+  db.exec("DROP TABLE emails");
+  db.exec(`CREATE TABLE emails (
+    resend_id TEXT PRIMARY KEY,
+    direction TEXT NOT NULL,
+    msg_from TEXT,
+    msg_to TEXT,
+    cc TEXT,
+    subject TEXT,
+    date TEXT,
+    text_body TEXT,
+    html_body TEXT,
+    message_id TEXT,
+    attachments TEXT,
+    summary TEXT,
+    created_at TEXT
+  )`);
+  db.prepare(
+    "INSERT INTO emails (resend_id, direction, msg_from, msg_to, cc, subject, date, text_body, attachments) VALUES (?, 'in', ?, ?, '[]', 'invoice', '2026-09-28T00:00:00.000Z', 'pay eric', '[]')",
+  ).run("legacy-eric", "alice@example.com", JSON.stringify(["eric@abot.run"]));
+  db.exec("DROP TABLE cache_revision");
+  env.INTERNAL_TOKEN = "internal-token-value";
+  const headers = { "x-internal-token": "internal-token-value", "x-abot-owner-email": "eric@abot.run" };
+  const deps = { nowMs: NOW_MS };
+  const search = toolValue(await postMcp(env, toolMessage(1, "search_emails", { query: "invoice" }), headers, deps));
+  assert.equal(search.length, 1);
+  assert.equal(search[0].resend_id, "legacy-eric");
+  assert.equal(search[0].auth, null);
+  const stats = toolValue(await postMcp(env, toolMessage(2, "email_stats", { fresh: true }), headers, deps));
+  assert.equal(stats.total, 1);
+  const other = toolValue(
+    await postMcp(
+      env,
+      toolMessage(3, "search_emails", { query: "invoice", fresh: true }),
+      { "x-internal-token": "internal-token-value", "x-abot-owner-email": "other@abot.run" },
+      deps,
+    ),
+  );
+  assert.deepEqual(other, []);
 });

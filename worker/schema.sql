@@ -13,7 +13,10 @@ CREATE TABLE IF NOT EXISTS emails (
   auth        TEXT,                     -- JSON {spf,dkim,dmarc}, inbound only
   attachments TEXT,                     -- JSON [{filename, content_type, size, r2_key}]
   summary     TEXT,                     -- JSON {"points":[...],"todos":[{"text","deadline"}]} or NULL
-  created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  is_read     INTEGER DEFAULT 0,        -- 1 read, 0 unread
+  deleted_at  INTEGER,                  -- unix ms when soft-deleted; NULL is live
+  is_archived INTEGER DEFAULT 0         -- 1 hidden from default search/list
 );
 
 CREATE INDEX IF NOT EXISTS idx_emails_date ON emails(date);
@@ -56,3 +59,11 @@ END;
 -- The worker adds summary on "no such column: summary" and ignores
 -- "duplicate column name: summary", so an already-deployed database picks
 -- the column up without a second manual ALTER.
+--
+-- is_read, deleted_at, and is_archived are part of this CREATE for a new
+-- database. They are NOT added by re-running this file on a database created
+-- before them. Readers detect the columns. When they are missing, the worker
+-- applies worker/migrations/mailbox-columns.sql (duplicate column name is
+-- ignored) and, if that ALTER fails, omits the column from that SELECT.
+-- A missing column must not turn search_emails or email_stats into JSON-RPC
+-- -32603. Run the migration on the existing production database anyway.
