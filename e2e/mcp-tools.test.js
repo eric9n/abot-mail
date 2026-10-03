@@ -335,7 +335,6 @@ test("send_email sends as the bound mailbox and rejects spoofing", async () => {
     const unbound = await postMcp(
       env,
       mcpRequest({
-        token: MCP_TOKEN,
         message: {
           jsonrpc: "2.0",
           id: "e2e",
@@ -344,7 +343,8 @@ test("send_email sends as the bound mailbox and rejects spoofing", async () => {
         },
       }),
     );
-    assert.equal(rpcError(unbound).code, -32001);
+    assert.equal(unbound.status, 401);
+    assert.equal(unbound.json.error, "x-abot-owner-email required");
     assert.equal(calls.length, 0);
   } finally {
     globalThis.fetch = prev;
@@ -574,8 +574,8 @@ test("unauthorized mcp requests return 401 before touching the database", async 
     mcpRequest({ message: { jsonrpc: "2.0", id: 1, method: "tools/list" } }),
     mcpRequest({ token: "wrong-token", message: { jsonrpc: "2.0", id: 1, method: "tools/list" } }),
     mcpRequest({
-      internal: "wrong-internal",
-      owner: ALICE,
+      token: "wrong-token",
+      owner: "not-an-email",
       message: { jsonrpc: "2.0", id: 1, method: "tools/list" },
     }),
     mcpRequest({

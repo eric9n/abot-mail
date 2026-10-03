@@ -2,19 +2,17 @@
  * abot.run mail archive.
  * POST /      Resend webhook (Svix): verify, enqueue, return
  * queue       mail-ingest consumer: Resend API → Workers AI summary → D1 + R2
- * POST /mcp   MCP (Streamable HTTP, JSON-RPC)
- *             Bearer MCP_TOKEN, X-Internal-Token, or a Service Binding call
- *             with no token (still requires x-abot-owner-email)
+ * POST /mcp   MCP (Streamable HTTP, JSON-RPC) via Service Bindings only
+ *             requires x-abot-owner-email; does not check any token
  *             reads may use the Cache API after auth; HTTP responses stay no-store
  *             search/list/stats/get_email keys include a D1 revision bumped on insert
  * GET /health public counts only (never cached)
  * scheduled   01:20 UTC D1 alert cron (ALERT_ENABLED === "false" logs only)
  *
- * Secrets come from the Worker env: WEBHOOK_SECRET, RESEND_API_KEY, MCP_TOKEN,
- * and optional INTERNAL_TOKEN (X-Internal-Token on POST /mcp). All four are
- * Worker secrets (`wrangler secret put`), never plain vars.
- * Gateway calls via Service Bindings omit X-Internal-Token. A presented token
- * is still compared in full; a missing token is trusted only with a valid owner.
+ * Secrets come from the Worker env: WEBHOOK_SECRET, RESEND_API_KEY.
+ * Both are Worker secrets (`wrangler secret put`), never plain vars.
+ * Public ingress is off. The gateway calls this worker with a Service Binding
+ * and always sends x-abot-owner-email. MCP_TOKEN and INTERNAL_TOKEN are not read.
  * Observability uses the METRICS binding. It does not change archive responses.
  */
 
@@ -2657,11 +2655,6 @@ function json(body, status = 200, extraHeaders) {
   });
 }
 
-function headerTokenOk(header, token) {
-  if (typeof header !== "string" || typeof token !== "string" || token.length === 0) return false;
-  return timingSafeEqual(header, token);
-}
-
 function mcpLimit(env) {
   if (!env || env.MCP_RATE_LIMIT == null || env.MCP_RATE_LIMIT === "") return MCP_RATE_LIMIT;
   const n = Number(env.MCP_RATE_LIMIT);
@@ -2669,12 +2662,10 @@ function mcpLimit(env) {
   return n;
 }
 
-/** Credential when one was presented, otherwise the client IP. Not logged. */
+/** Per mailbox when the gateway sent one, otherwise the client IP. Not logged. */
 export function mcpClientKey(request) {
-  const internal = request.headers.get("x-internal-token");
-  if (typeof internal === "string" && internal.length > 0) return `internal:${internal}`;
-  const authorization = request.headers.get("authorization");
-  if (typeof authorization === "string" && authorization.length > 0) return `auth:${authorization}`;
+  const owner = request.headers.get("x-abot-owner-email");
+  if (typeof owner === "string" && owner.trim()) return `owner:${owner.trim().toLowerCase()}`;
   const ip = request.headers.get("cf-connecting-ip") || "unknown";
   return `ip:${ip}`;
 }
@@ -2702,13 +2693,6 @@ function pathOf(request) {
   const url = new URL(request.url);
   if (url.pathname.length > 1 && url.pathname.endsWith("/")) return url.pathname.slice(0, -1);
   return url.pathname;
-}
-
-function bearerOk(header, token) {
-  if (typeof header !== "string" || typeof token !== "string" || token.length === 0) return false;
-  const match = /^Bearer (.+)$/i.exec(header);
-  if (!match) return false;
-  return timingSafeEqual(match[1], token);
 }
 
 function jsonContentType(header) {
@@ -2866,27 +2850,11 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
         trace.outcome = "rejected";
         return json({ ok: false, error: "method not allowed" }, 405);
       }
-      // A presented X-Internal-Token must match INTERNAL_TOKEN (timing-safe, full
-      // string), same as before. Bearer MCP_TOKEN still authenticates direct clients.
-      // No token at all is a Service Binding call (env.BACKEND_*.fetch): the gateway
-      // no longer sends the header, and that call is trusted. Custom-domain callers
-      // that do send the header still have to pass the check.
-      const internalHeader = request.headers.get("x-internal-token");
-      const presentedInternal = typeof internalHeader === "string" && internalHeader.length > 0;
-      const fromGateway = headerTokenOk(internalHeader, env && env.INTERNAL_TOKEN);
-      const authorization = request.headers.get("authorization");
-      const presentedBearer = typeof authorization === "string" && authorization.length > 0;
-      const bearer = bearerOk(authorization, env && env.MCP_TOKEN);
-      if ((presentedInternal || presentedBearer) && !fromGateway && !bearer) {
-        trace.outcome = "unauthorized";
-        return json({ ok: false, error: "unauthorized" }, 401);
-      }
-      // 网关身份：校验通过的 X-Internal-Token，或没带 token 的 Service Binding。
-      // 两种都会带 x-abot-owner-email，格式不合法就拒绝。Bearer 直连不信这个头。
-      const bindingCall = !presentedInternal && !bearer;
-      const trustOwner = fromGateway || bindingCall;
-      const ownerEmail = trustOwner ? (request.headers.get("x-abot-owner-email") || "").trim().toLowerCase() || null : null;
-      if (trustOwner && (!ownerEmail || !/^[a-z0-9._-]+@abot\.run$/.test(ownerEmail))) {
+      // Public hosts are off. The only caller is the gateway via a Service Binding,
+      // which does not send a token. X-Internal-Token and Authorization are ignored.
+      // x-abot-owner-email is required and is the mailbox scope for the call.
+      const ownerEmail = (request.headers.get("x-abot-owner-email") || "").trim().toLowerCase() || null;
+      if (!ownerEmail || !/^[a-z0-9._-]+@abot\.run$/.test(ownerEmail)) {
         trace.outcome = "unauthorized";
         return json({ ok: false, error: "x-abot-owner-email required" }, 401);
       }

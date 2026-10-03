@@ -18,9 +18,9 @@ bucket_name = "abot-mail-archive"
 binding = "AI"
 
 # Production ingest queue. Staging must not bind this name; see [env.staging].
-# Secrets stay in `wrangler secret put` (WEBHOOK_SECRET, RESEND_API_KEY, MCP_TOKEN, INTERNAL_TOKEN).
-# INTERNAL_TOKEN is optional. When X-Internal-Token is sent, it must match.
-# Service Binding calls omit the header and are trusted with x-abot-owner-email.
+# Secrets stay in `wrangler secret put` (WEBHOOK_SECRET, RESEND_API_KEY).
+# POST /mcp does not read MCP_TOKEN or INTERNAL_TOKEN.
+# Service Binding calls must send x-abot-owner-email.
 # Never write secret values in this file.
 [[queues.producers]]
 binding = "INGEST_QUEUE"
