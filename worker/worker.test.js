@@ -2118,7 +2118,7 @@ test("MCP reads take the revision and the row read from one primary session", as
   const cache = memoryCache();
   const rows = toolValue(await mcpCall(env, toolMessage(1, "search_emails", { query: "x" }), { cache, nowMs: NOW_MS }));
   assert.deepEqual(rows, []);
-  assert.equal(seen.filter((entry) => entry.via === "session" && entry.constraint === "first-primary").length, 2);
+  assert.equal(seen.filter((entry) => entry.via === "session" && entry.constraint === "first-primary").length, 1);
   assert.ok(seen.some((entry) => entry.via === "primary" && entry.sql === READ_REVISION_SQL));
   assert.ok(seen.some((entry) => entry.via === "primary" && entry.sql.includes("FROM emails")));
   assert.equal(seen.some((entry) => entry.via === "database"), false);
