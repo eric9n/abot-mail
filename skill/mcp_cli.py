@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Call the abot-mail MCP server (read-only).
 
-Subcommands match the Worker tools: search, get, list, stats.
+Subcommands match the Worker tools: search, get, list, stats, account.
 `tools` calls tools/list. `health` is an unauthenticated GET /health.
 
 Token order: environment variable MCP_TOKEN, then Secure Vault credential
@@ -225,6 +225,11 @@ def cmd_stats(args):
     emit(unwrap_tool(result))
 
 
+def cmd_account(args):
+    result = rpc(args.base, args.token, "tools/call", {"name": "get_account", "arguments": {}})
+    emit(unwrap_tool(result))
+
+
 def cmd_tools(args):
     emit(rpc(args.base, args.token, "tools/list"))
 
@@ -277,6 +282,9 @@ def build_parser():
     stats = sub.add_parser("stats", parents=[common], help="Call email_stats.")
     stats.add_argument("--fresh", action="store_true", help="Skip the cache and read the archive again.")
     stats.set_defaults(func=cmd_stats)
+
+    account = sub.add_parser("account", parents=[common], help="Call get_account.")
+    account.set_defaults(func=cmd_account)
 
     tools = sub.add_parser("tools", parents=[common], help="Call tools/list.")
     tools.set_defaults(func=cmd_tools)

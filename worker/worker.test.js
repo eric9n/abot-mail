@@ -630,7 +630,7 @@ test("webhook archives inbound mail once, then MCP can read it", async () => {
   const listedTools = await mcp({ jsonrpc: "2.0", id: 1, method: "tools/list" });
   assert.deepEqual(
     listedTools.body.result.tools.map((tool) => tool.name),
-    ["search_emails", "get_email", "list_emails", "email_stats", "send_email", "set_email_read_status", "delete_email", "set_email_archived_status", "list_attachments", "get_attachment"],
+    ["search_emails", "get_email", "list_emails", "email_stats", "get_account", "send_email", "set_email_read_status", "delete_email", "set_email_archived_status", "list_attachments", "get_attachment"],
   );
   for (const tool of listedTools.body.result.tools) {
     assert.equal(typeof tool.description, "string");
@@ -3540,4 +3540,55 @@ test("missing auth or cache_revision does not turn reads into internal errors", 
     ),
   );
   assert.deepEqual(other, []);
+});
+
+test("get_account returns the bound mailbox and rejects a missing owner or extra arguments", async () => {
+  const message = (id, args) => ({
+    jsonrpc: "2.0",
+    id,
+    method: "tools/call",
+    params: { name: "get_account", arguments: args },
+  });
+  let queried = false;
+  const depsFor = (ownerEmail) => ({
+    ownerEmail,
+    async queryAll() {
+      queried = true;
+      throw new Error("emails were read");
+    },
+    async queryFirst() {
+      queried = true;
+      throw new Error("emails were read");
+    },
+  });
+
+  const alice = await handleMcpRpc(message(1, {}), depsFor("alice@abot.run"));
+  assert.equal(alice.type, "result");
+  const aliceBody = JSON.parse(alice.result.content[0].text);
+  assert.deepEqual(aliceBody, { email: "alice@abot.run", domain: "abot.run" });
+  assert.equal(JSON.stringify(aliceBody).includes("bob@abot.run"), false);
+
+  const bob = await handleMcpRpc(message(2, {}), depsFor("bob@abot.run"));
+  const bobBody = JSON.parse(bob.result.content[0].text);
+  assert.deepEqual(bobBody, { email: "bob@abot.run", domain: "abot.run" });
+  assert.equal(JSON.stringify(bobBody).includes("alice@abot.run"), false);
+  assert.equal(queried, false);
+
+  for (const ownerEmail of [undefined, null, ""]) {
+    const missing = await handleMcpRpc(message(3, {}), depsFor(ownerEmail));
+    assert.equal(missing.type, "error");
+    assert.equal(missing.error.code, -32001);
+    assert.equal(missing.error.message, "agent email not bound");
+  }
+
+  const unexpected = await handleMcpRpc(message(4, { email: "bob@abot.run" }), depsFor("alice@abot.run"));
+  assert.equal(unexpected.type, "error");
+  assert.equal(unexpected.error.code, -32602);
+  assert.equal(unexpected.error.message, "unexpected argument: email");
+
+  const fresh = await handleMcpRpc(message(5, { fresh: true }), depsFor("alice@abot.run"));
+  assert.equal(fresh.type, "error");
+  assert.equal(fresh.error.code, -32602);
+  assert.equal(fresh.error.message, "unexpected argument: fresh");
+  assert.equal(queried, false);
 });
