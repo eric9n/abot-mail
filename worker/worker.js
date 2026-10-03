@@ -53,7 +53,7 @@ export const AI_STATUS_MIN_SAMPLE = 5;
 export const METRIC_STAGES = ["webhook", "ingest", "enrich", "dlq", "mcp", "health", "alert"];
 export const METRIC_OUTCOMES = ["ok", "duplicate", "retry", "dlq", "unauthorized", "ignored", "fresh", "rejected", "error"];
 export const METRIC_DOUBLES = ["lag_ms", "wall_ms", "cache", "neurons", "validator_discards"];
-const MCP_TOOL_NAMES = new Set(["search_emails", "get_email", "list_emails", "email_stats", "send_email", "set_email_read_status", "delete_email", "set_email_archived_status", "list_attachments", "get_attachment"]);
+const MCP_TOOL_NAMES = new Set(["search_emails", "get_email", "list_emails", "email_stats", "get_account", "send_email", "set_email_read_status", "delete_email", "set_email_archived_status", "list_attachments", "get_attachment"]);
 const SUMMARY_STATUSES = new Set(["ok", "failed", "discarded", "skipped"]);
 const SAFE_LOG_ERRORS = new Set([
   "missing_header",
@@ -1338,6 +1338,15 @@ export const TOOLS = [
     },
   },
   {
+    name: "get_account",
+    description: "Return the mailbox address bound to this call. No arguments.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
     name: "send_email",
     description: "Send an email via Resend. Defaults to your bound @abot.run address.",
     inputSchema: {
@@ -1642,6 +1651,15 @@ async function callTool(name, args, deps) {
       load: () => statsAdaptive(deps, ownerEmail),
       store: () => true,
     });
+  }
+  if (name === "get_account") {
+    assertOnlyKeys(args, new Set());
+    if (!ownerEmail) throw new RpcError(-32001, "agent email not bound");
+    const at = ownerEmail.lastIndexOf("@");
+    return {
+      email: ownerEmail,
+      domain: at >= 0 ? ownerEmail.slice(at + 1) : "abot.run",
+    };
   }
   if (name === "send_email") {
     const to = args.to;

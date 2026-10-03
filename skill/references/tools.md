@@ -1,6 +1,6 @@
 # MCP 工具参数
 
-来源是 `worker/worker.js` 的 `TOOLS`。含义不改。四个工具都是只读。`inputSchema.additionalProperties` 都是 `false`，未列出的参数会被拒绝。
+来源是 `worker/worker.js` 的 `TOOLS`。含义不改。五个工具都是只读。`inputSchema.additionalProperties` 都是 `false`，未列出的参数会被拒绝。
 
 `fresh` 在四个工具上的说明相同：Skip the cache and read the archive again. 类型 boolean，不是必填。
 
@@ -69,3 +69,20 @@ Archive counts: total, inbound vs outbound, daily counts for the last 30 days, a
 ```
 
 `by_day` 是近 30 天有邮件的日期。`top_senders` 最多 10 条。
+
+## get_account
+
+Return the mailbox address bound to this call. No arguments.
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- | --- |
+| （无） | | | | 不接受任何参数。 |
+
+返回当前绑定的邮箱，不读邮件，也不返回其他邮箱：
+
+```json
+{
+  "email": "agent@abot.run",
+  "domain": "abot.run"
+}
+```

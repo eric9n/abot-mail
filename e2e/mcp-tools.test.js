@@ -214,6 +214,7 @@ test("tools/list exposes every mail tool", async () => {
     "get_email",
     "list_emails",
     "email_stats",
+    "get_account",
     "send_email",
     "set_email_read_status",
     "delete_email",
@@ -275,6 +276,21 @@ test("list_emails is newest-first metadata for this owner", async () => {
 
   const inbound = payload(await call(ALICE, "list_emails", { direction: "in", fresh: true }));
   assert.deepEqual(inbound.map((row) => row.resend_id), [ALICE_IN]);
+});
+
+test("get_account returns only the bound owner", async () => {
+  const { call } = setup();
+  const alice = payload(await call(ALICE, "get_account", {}));
+  assert.deepEqual(alice, { email: ALICE, domain: "abot.run" });
+  assert.equal(JSON.stringify(alice).includes(BOB), false);
+  assert.equal(JSON.stringify(alice).includes("bob secret"), false);
+  assert.equal(JSON.stringify(alice).includes(BOB_IN), false);
+
+  const bob = payload(await call(BOB, "get_account", {}));
+  assert.deepEqual(bob, { email: BOB, domain: "abot.run" });
+  assert.equal(JSON.stringify(bob).includes(ALICE), false);
+  assert.equal(JSON.stringify(bob).includes("alice secret"), false);
+  assert.equal(JSON.stringify(bob).includes(ALICE_IN), false);
 });
 
 test("email_stats counts only this owner's mail", async () => {
