@@ -223,6 +223,25 @@ test("tools/list exposes every mail tool", async () => {
   ]);
 });
 
+test("service binding calls omit X-Internal-Token and still isolate owners", async () => {
+  const { env } = setup();
+  const http = await postMcp(
+    env,
+    mcpRequest({
+      owner: ALICE,
+      message: {
+        jsonrpc: "2.0",
+        id: "binding",
+        method: "tools/call",
+        params: { name: "search_emails", arguments: { query: "invoice", fresh: true } },
+      },
+    }),
+  );
+  const rows = payload(http);
+  assert.deepEqual(rows.map((row) => row.resend_id), [ALICE_IN]);
+  assert.equal(JSON.stringify(rows).includes("bob secret"), false);
+});
+
 test("search_emails returns only this owner's metadata", async () => {
   const { call } = setup();
   const rows = payload(await call(ALICE, "search_emails", { query: "invoice", fresh: true }));
@@ -560,7 +579,7 @@ test("unauthorized mcp requests return 401 before touching the database", async 
       message: { jsonrpc: "2.0", id: 1, method: "tools/list" },
     }),
     mcpRequest({
-      owner: ALICE,
+      owner: "not-an-email",
       message: { jsonrpc: "2.0", id: 1, method: "initialize" },
     }),
     mcpRequest({

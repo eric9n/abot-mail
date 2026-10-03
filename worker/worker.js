@@ -2,7 +2,9 @@
  * abot.run mail archive.
  * POST /      Resend webhook (Svix): verify, enqueue, return
  * queue       mail-ingest consumer: Resend API → Workers AI summary → D1 + R2
- * POST /mcp   MCP (Streamable HTTP, JSON-RPC), Bearer MCP_TOKEN
+ * POST /mcp   MCP (Streamable HTTP, JSON-RPC)
+ *             Bearer MCP_TOKEN, X-Internal-Token, or a Service Binding call
+ *             with no token (still requires x-abot-owner-email)
  *             reads may use the Cache API after auth; HTTP responses stay no-store
  *             search/list/stats/get_email keys include a D1 revision bumped on insert
  * GET /health public counts only (never cached)
@@ -11,6 +13,8 @@
  * Secrets come from the Worker env: WEBHOOK_SECRET, RESEND_API_KEY, MCP_TOKEN,
  * and optional INTERNAL_TOKEN (X-Internal-Token on POST /mcp). All four are
  * Worker secrets (`wrangler secret put`), never plain vars.
+ * Gateway calls via Service Bindings omit X-Internal-Token. A presented token
+ * is still compared in full; a missing token is trusted only with a valid owner.
  * Observability uses the METRICS binding. It does not change archive responses.
  */
 
@@ -2862,15 +2866,27 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
         trace.outcome = "rejected";
         return json({ ok: false, error: "method not allowed" }, 405);
       }
-      // Gateway header is a Worker secret. Compare the same way as MCP_TOKEN.
-      const fromGateway = headerTokenOk(request.headers.get("x-internal-token"), env && env.INTERNAL_TOKEN);
-      if (!fromGateway && !bearerOk(request.headers.get("authorization"), env && env.MCP_TOKEN)) {
+      // A presented X-Internal-Token must match INTERNAL_TOKEN (timing-safe, full
+      // string), same as before. Bearer MCP_TOKEN still authenticates direct clients.
+      // No token at all is a Service Binding call (env.BACKEND_*.fetch): the gateway
+      // no longer sends the header, and that call is trusted. Custom-domain callers
+      // that do send the header still have to pass the check.
+      const internalHeader = request.headers.get("x-internal-token");
+      const presentedInternal = typeof internalHeader === "string" && internalHeader.length > 0;
+      const fromGateway = headerTokenOk(internalHeader, env && env.INTERNAL_TOKEN);
+      const authorization = request.headers.get("authorization");
+      const presentedBearer = typeof authorization === "string" && authorization.length > 0;
+      const bearer = bearerOk(authorization, env && env.MCP_TOKEN);
+      if ((presentedInternal || presentedBearer) && !fromGateway && !bearer) {
         trace.outcome = "unauthorized";
         return json({ ok: false, error: "unauthorized" }, 401);
       }
-      // 网关透传的 agent 身份（仅当 fromGateway 时信任）— 强校验必传
-      const ownerEmail = fromGateway ? (request.headers.get("x-abot-owner-email") || "").trim().toLowerCase() || null : null;
-      if (fromGateway && (!ownerEmail || !/^[a-z0-9._-]+@abot\.run$/.test(ownerEmail))) {
+      // 网关身份：校验通过的 X-Internal-Token，或没带 token 的 Service Binding。
+      // 两种都会带 x-abot-owner-email，格式不合法就拒绝。Bearer 直连不信这个头。
+      const bindingCall = !presentedInternal && !bearer;
+      const trustOwner = fromGateway || bindingCall;
+      const ownerEmail = trustOwner ? (request.headers.get("x-abot-owner-email") || "").trim().toLowerCase() || null : null;
+      if (trustOwner && (!ownerEmail || !/^[a-z0-9._-]+@abot\.run$/.test(ownerEmail))) {
         trace.outcome = "unauthorized";
         return json({ ok: false, error: "x-abot-owner-email required" }, 401);
       }

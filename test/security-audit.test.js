@@ -251,6 +251,25 @@ test("/mcp 网关调用合法通过", async () => {
   assert.ok(body.result.tools.length > 0);
 });
 
+test("/mcp Service Binding 无 token 但带合法 owner 通过", async () => {
+  const env = mcpEnv();
+  const r = await handleFetch(mcpPost({ "x-abot-owner-email": OWNER_A }), env);
+  assert.equal(r.status, 200);
+  const body = await r.json();
+  assert.ok(body.result.tools.length > 0);
+});
+
+test("/mcp Service Binding 缺 owner 或格式非法被拒绝", async () => {
+  const env = mcpEnv();
+  const missing = await handleFetch(mcpPost({}), env);
+  assert.equal(missing.status, 401);
+  assert.equal((await missing.json()).error, "x-abot-owner-email required");
+  for (const bad of ["not-an-email", "a@evil.com", "a@abot.run.evil.com", ""]) {
+    const r = await handleFetch(mcpPost({ "x-abot-owner-email": bad }), env);
+    assert.equal(r.status, 401, bad || "(empty)");
+  }
+});
+
 test("/mcp 直接 MCP_TOKEN 调用仍可用（owner 为 null）", async () => {
   const env = mcpEnv();
   const r = await handleFetch(
