@@ -435,6 +435,7 @@ function sqliteEnv() {
         return {
           size: hit.bytes.byteLength,
           async text() { return new TextDecoder().decode(hit.bytes); },
+          async arrayBuffer() { return hit.bytes.slice().buffer; },
         };
       },
     },

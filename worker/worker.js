@@ -1768,6 +1768,10 @@ async function callTool(name, args, deps) {
     const filename = args.filename;
     if (!resendId || !isSafeResendId(resendId)) throw new RpcError(-32602, "valid resend_id is required");
     if (!filename || typeof filename !== "string") throw new RpcError(-32602, "filename is required");
+    // Filename is matched against the stored attachment, never joined into an R2 key.
+    if (filename.includes("/") || filename.includes("\\") || filename.includes("..")) {
+      throw new RpcError(-32602, "invalid filename");
+    }
     const ownerEmail = deps && deps.ownerEmail ? deps.ownerEmail : null;
     const loaded = await queryAllAdaptive(deps, (schema) => {
       const where = ["resend_id = ?"];
@@ -1783,7 +1787,13 @@ async function callTool(name, args, deps) {
     const row = loaded.rows[0];
     if (!row) throw new RpcError(-32602, "email not found or access denied");
     const att = parseAttachments(row.attachments).find((item) => item && item.filename === filename);
-    if (!att || typeof att.r2_key !== "string" || !att.r2_key) {
+    const keyPrefix = `attachments/${resendId}/`;
+    if (
+      !att ||
+      typeof att.r2_key !== "string" ||
+      !att.r2_key.startsWith(keyPrefix) ||
+      att.r2_key.includes("..")
+    ) {
       throw new RpcError(-32602, "attachment not found");
     }
     const bytes = await readAttachmentBytes(deps, att.r2_key);
@@ -2860,7 +2870,7 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
       }
       // 网关透传的 agent 身份（仅当 fromGateway 时信任）— 强校验必传
       const ownerEmail = fromGateway ? (request.headers.get("x-abot-owner-email") || "").trim().toLowerCase() || null : null;
-      if (fromGateway && !ownerEmail) {
+      if (fromGateway && (!ownerEmail || !/^[a-z0-9._-]+@abot\.run$/.test(ownerEmail))) {
         trace.outcome = "unauthorized";
         return json({ ok: false, error: "x-abot-owner-email required" }, 401);
       }
