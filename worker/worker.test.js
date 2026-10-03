@@ -87,6 +87,7 @@ const SECRET_RAW = Buffer.from("unit-test-webhook-secret");
 const WEBHOOK_SECRET = `whsec_${SECRET_RAW.toString("base64")}`;
 const NOW_MS = Date.parse("2026-09-28T12:00:00.000Z");
 const EMAIL_ID = "435eb30a-d52d-4f7c-a400-ccac381b7cc4";
+const MCP_OWNER = "eric@abot.run";
 
 function sign(id, timestamp, body) {
   const mac = createHmac("sha256", SECRET_RAW).update(`${id}.${timestamp}.${body}`).digest("base64");
@@ -615,6 +616,7 @@ test("webhook archives inbound mail once, then MCP can read it", async () => {
         method: "POST",
         headers: {
           authorization: `Bearer ${token}`,
+          "x-abot-owner-email": MCP_OWNER,
           "content-type": "application/json",
         },
         body: JSON.stringify(message),
@@ -878,7 +880,7 @@ test("MCP HTTP auth runs before JSON parsing", async () => {
   const parsed = await handleFetch(
     new Request("https://example.test/mcp", {
       method: "POST",
-      headers: { authorization: "Bearer test-mcp-token", "content-type": "application/json" },
+      headers: { "x-abot-owner-email": MCP_OWNER, "content-type": "application/json" },
       body: "{",
     }),
     env,
@@ -889,7 +891,7 @@ test("MCP HTTP auth runs before JSON parsing", async () => {
   const accepted = await handleFetch(
     new Request("https://example.test/mcp", {
       method: "POST",
-      headers: { authorization: "Bearer test-mcp-token", "content-type": "application/json" },
+      headers: { "x-abot-owner-email": MCP_OWNER, "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
     }),
     env,
@@ -900,7 +902,7 @@ test("MCP HTTP auth runs before JSON parsing", async () => {
   const type = await handleFetch(
     new Request("https://example.test/mcp", {
       method: "POST",
-      headers: { authorization: "Bearer test-mcp-token", "content-type": "text/plain" },
+      headers: { "x-abot-owner-email": MCP_OWNER, "content-type": "text/plain" },
       body: "{}",
     }),
     env,
@@ -948,8 +950,8 @@ test("wrangler keeps production and staging queues apart", () => {
   assert.equal(toml.includes("whsec_"), false);
   assert.equal(/RESEND_API_KEY\s*=/.test(toml), false);
   assert.equal(/MCP_TOKEN\s*=/.test(toml), false);
-  assert.match(toml, /INTERNAL_TOKEN/);
   assert.equal(/INTERNAL_TOKEN\s*=/.test(toml), false);
+  assert.match(toml, /x-abot-owner-email/);
   const parts = toml.split("\n[env.staging]\n");
   assert.equal(parts.length, 2);
   const [prod, staging] = parts;
@@ -1387,6 +1389,7 @@ async function mcpCall(env, message, deps) {
       method: "POST",
       headers: {
         authorization: "Bearer test-mcp-token",
+        "x-abot-owner-email": MCP_OWNER,
         "content-type": "application/json",
       },
       body: JSON.stringify(message),
@@ -1613,7 +1616,7 @@ test("MCP reads hit the cache and stay no-store", async () => {
   assert.equal("text_body" in searchRows[0], false);
   assert.equal(search.cacheControl, "no-store");
   const searchUrl = cache.puts.find((put) => put.url.startsWith("https://cache.internal/mcp/search?")).url;
-  assert.equal(searchUrl, searchCacheUrl(await hashCacheFields(searchCacheFields({ query: "invoice", limit: 100 })), cacheRev(db)));
+  assert.equal(searchUrl, searchCacheUrl(await hashCacheFields(searchCacheFields({ query: "invoice", limit: 100 }, MCP_OWNER)), cacheRev(db)));
   assert.equal(cache.puts.find((put) => put.url === searchUrl).cacheControl, "max-age=10");
   assert.equal(cache.puts.find((put) => put.url === searchUrl).status, 200);
   assert.equal(cache.puts.find((put) => put.url === searchUrl).method, "GET");
@@ -1632,7 +1635,7 @@ test("MCP reads hit the cache and stay no-store", async () => {
   const listUrl = cache.puts.find((put) => put.url.startsWith("https://cache.internal/mcp/list?")).url;
   assert.equal(
     listUrl,
-    listCacheUrl(await hashCacheFields(listCacheFields({ direction: "in", since: "2026-09-01" })), cacheRev(db)),
+    listCacheUrl(await hashCacheFields(listCacheFields({ direction: "in", since: "2026-09-01" }, MCP_OWNER)), cacheRev(db)),
   );
   assert.equal(cache.puts.find((put) => put.url === listUrl).cacheControl, "max-age=10");
   sqls.reset();
@@ -1643,7 +1646,7 @@ test("MCP reads hit the cache and stay no-store", async () => {
   const stats = toolValue(await mcpCall(env, toolMessage(6, "email_stats", {}), deps));
   assert.equal(stats.total, 1);
   assert.equal(stats.by_direction.in, 1);
-  const statsUrl = statsCacheUrl(cacheRev(db));
+  const statsUrl = statsCacheUrl(cacheRev(db), MCP_OWNER);
   assert.equal(cache.puts.filter((put) => put.url === statsUrl).length, 1);
   assert.equal(cache.puts.find((put) => put.url === statsUrl).cacheControl, "max-age=120");
   assert.equal(dataSqls(sqls.sqls).length, 4);
@@ -1661,7 +1664,7 @@ test("MCP reads hit the cache and stay no-store", async () => {
   assert.equal("html_body" in detail, false);
   assert.equal("raw_eml" in detail, false);
   assert.equal("ai_status" in detail, false);
-  const plainUrl = getEmailCacheUrl(EMAIL_ID, false, false, "none", cacheRev(db));
+  const plainUrl = getEmailCacheUrl(EMAIL_ID, false, false, "none", cacheRev(db), MCP_OWNER);
   assert.equal(cache.puts.find((put) => put.url === plainUrl).cacheControl, "max-age=86400");
   sqls.reset();
   const plainAgain = toolValue(await mcpCall(env, toolMessage(9, "get_email", { resend_id: EMAIL_ID }), deps));
@@ -1725,7 +1728,7 @@ test("fresh bypasses the cache and TTLs expire entries", async () => {
   const sqls = instrumentDb(env);
 
   await cache.put(
-    new Request(statsCacheUrl(0)),
+    new Request(statsCacheUrl(0, MCP_OWNER)),
     new Response(JSON.stringify({ total: 999, by_direction: { in: 0, out: 0 }, by_day: [], top_senders: [] }), {
       status: 200,
       headers: { "cache-control": "max-age=120", "content-type": "application/json" },
@@ -1841,7 +1844,7 @@ test("pending and null ai_status are not cached", async () => {
   assert.equal(ok.afterSecond, 0);
   assert.equal(ok.second.text_body, "third");
   assert.equal(ok.puts, 1);
-  assert.equal(cache.puts.at(-1).url, getEmailCacheUrl(EMAIL_ID, false, false, "ok", cacheRev(db)));
+  assert.equal(cache.puts.at(-1).url, getEmailCacheUrl(EMAIL_ID, false, false, "ok", cacheRev(db), MCP_OWNER));
 
   db.prepare("UPDATE emails SET ai_status = ?, text_body = ? WHERE resend_id = ?").run("failed", "fourth", EMAIL_ID);
   sqls.reset();
@@ -1850,7 +1853,7 @@ test("pending and null ai_status are not cached", async () => {
   assert.equal(sqls.sqls.filter((sql) => sql.includes("FROM emails")).length, 0);
   const live = toolValue(await mcpCall(env, toolMessage(4, "get_email", { resend_id: EMAIL_ID, fresh: true }), deps));
   assert.equal(live.text_body, "fourth");
-  assert.equal(cache.puts.at(-1).url, getEmailCacheUrl(EMAIL_ID, false, false, "failed", cacheRev(db)));
+  assert.equal(cache.puts.at(-1).url, getEmailCacheUrl(EMAIL_ID, false, false, "failed", cacheRev(db), MCP_OWNER));
 });
 
 test("a queued insert invalidates reads in another colo and fills R2 cache", async () => {
@@ -1866,7 +1869,7 @@ test("a queued insert invalidates reads in another colo and fills R2 cache", asy
   const before = toolValue(await mcpCall(env, toolMessage(3, "email_stats", {}), deps));
   assert.equal(before.total, 0);
   assert.equal(cacheRev(db), 0);
-  const searchHash = await hashCacheFields(searchCacheFields({ query: "hello" }));
+  const searchHash = await hashCacheFields(searchCacheFields({ query: "hello" }, MCP_OWNER));
   const staleSearch = await fetchCache.match(new Request(searchCacheUrl(searchHash, 0)));
   assert.equal(await staleSearch.text(), "[]");
 
@@ -1902,7 +1905,7 @@ test("a queued insert invalidates reads in another colo and fills R2 cache", asy
   assert.ok(consumerCache.puts.some((put) => put.url === r2CacheUrl(attachmentKey) && put.body === "PNG"));
   const stillStale = await fetchCache.match(new Request(searchCacheUrl(searchHash, 0)));
   assert.equal(await stillStale.text(), "[]");
-  const staleStats = await fetchCache.match(new Request(statsCacheUrl(0)));
+  const staleStats = await fetchCache.match(new Request(statsCacheUrl(0, MCP_OWNER)));
   assert.match(await staleStats.text(), /"total":0/);
 
   sqls.reset();
@@ -2090,7 +2093,7 @@ test("MCP cache fills through waitUntil when a context is present", async () => 
   releasePut();
   await Promise.all(pending);
   assert.equal(cache.puts.length, 1);
-  assert.equal(cache.puts[0].url, statsCacheUrl(0));
+  assert.equal(cache.puts[0].url, statsCacheUrl(0, MCP_OWNER));
   const sqls = instrumentDb(env);
   const second = toolValue(await mcpCall(env, toolMessage(2, "email_stats", {}), { cache, nowMs: NOW_MS }));
   assert.equal(second.total, 0);
@@ -2418,7 +2421,7 @@ test("ingest stores the summary before the row is visible and replay does not re
   const cache = memoryCache();
   const email = toolValue(await mcpCall(env, toolMessage(1, "get_email", { resend_id: EMAIL_ID }), { cache, nowMs: NOW_MS }));
   assert.deepEqual(email.summary, summary);
-  const cached = cache.puts.find((put) => put.url === getEmailCacheUrl(EMAIL_ID, false, false, "none", 1));
+  const cached = cache.puts.find((put) => put.url === getEmailCacheUrl(EMAIL_ID, false, false, "none", 1, MCP_OWNER));
   assert.match(cached.body, /请付款/);
   db.prepare("UPDATE emails SET summary = ?, text_body = ? WHERE resend_id = ?").run(
     summaryJson({ points: ["changed later", "not the ingest summary"], todos: [] }),
@@ -2554,8 +2557,8 @@ test("a database created before summary gains the column on read", async () => {
       ON CONFLICT(id) DO UPDATE SET rev = rev + 1;
     END`);
   db.prepare(
-    "INSERT INTO emails (resend_id, direction, subject, text_body, msg_to, cc, attachments, date) VALUES (?, 'in', 'hi', 'body', '[]', '[]', '[]', '2026-09-28T00:00:00.000Z')",
-  ).run(EMAIL_ID);
+    "INSERT INTO emails (resend_id, direction, subject, text_body, msg_to, cc, attachments, date) VALUES (?, 'in', 'hi', 'body', ?, '[]', '[]', '2026-09-28T00:00:00.000Z')",
+  ).run(EMAIL_ID, JSON.stringify([MCP_OWNER]));
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM pragma_table_info('emails') WHERE name = 'summary'").get().n, 0);
   const detail = toolValue(await mcpCall(env, toolMessage(1, "get_email", { resend_id: EMAIL_ID }), { nowMs: NOW_MS }));
   assert.equal(detail.found, true);
@@ -2798,8 +2801,8 @@ test("mcp reads record cache and fresh without logging the stored summary", asyn
   const points = [];
   env.METRICS = { writeDataPoint(point) { points.push(point); } };
   db.prepare(
-    "INSERT INTO emails (resend_id, direction, subject, text_body, msg_from, msg_to, cc, attachments, date, summary) VALUES (?, 'in', 'SUBJECT-NEEDLE', 'BODY-NEEDLE', 'sender-needle@example.com', '[]', '[]', '[]', '2026-09-28T00:00:00.000Z', ?)",
-  ).run(EMAIL_ID, JSON.stringify({ points: ["needle-point-one", "needle-point-two"], todos: [] }));
+    "INSERT INTO emails (resend_id, direction, subject, text_body, msg_from, msg_to, cc, attachments, date, summary) VALUES (?, 'in', 'SUBJECT-NEEDLE', 'BODY-NEEDLE', 'sender-needle@example.com', ?, '[]', '[]', '2026-09-28T00:00:00.000Z', ?)",
+  ).run(EMAIL_ID, JSON.stringify([MCP_OWNER]), JSON.stringify({ points: ["needle-point-one", "needle-point-two"], todos: [] }));
   let aiCalls = 0;
   env.AI = {
     async run() {
@@ -3160,7 +3163,7 @@ test("include_raw_eml returns r2_key instead of inlining an oversized object", a
   assert.equal(textCalls, 0);
 });
 
-test("POST /mcp accepts X-Internal-Token only as a full timing-safe match", async () => {
+test("POST /mcp ignores tokens and requires x-abot-owner-email", async () => {
   const env = {
     INTERNAL_TOKEN: "internal-token-value",
     MCP_TOKEN: "bearer-token-value",
@@ -3176,63 +3179,46 @@ test("POST /mcp accepts X-Internal-Token only as a full timing-safe match", asyn
       env,
       { nowMs: 50 },
     );
-  assert.equal(
-    (await post({ "x-internal-token": "internal-token-value", "x-abot-owner-email": "owner@abot.run" })).status,
-    200,
-  );
-  assert.equal((await post({ "x-internal-token": "internal-token-valu" })).status, 401);
-  assert.equal((await post({ "x-internal-token": "internal-token-valueX" })).status, 401);
-  assert.equal((await post({ "x-internal-token": "nope", authorization: "Bearer bearer-token-value" })).status, 200);
+  const owner = { "x-abot-owner-email": "owner@abot.run" };
+  assert.equal((await post(owner)).status, 200);
+  assert.equal((await post({ ...owner, "x-internal-token": "internal-token-value" })).status, 200);
+  assert.equal((await post({ ...owner, "x-internal-token": "internal-token-valu" })).status, 200);
+  assert.equal((await post({ ...owner, "x-internal-token": "nope", authorization: "Bearer wrong" })).status, 200);
+  assert.equal((await post({ authorization: "Bearer bearer-token-value" })).status, 401);
   assert.equal((await post({})).status, 401);
-  const unset = await handleFetch(
-    new Request("https://example.test/mcp", {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-internal-token": "internal-token-value" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
-    }),
-    { MCP_TOKEN: "bearer-token-value", DB: env.DB },
-    { nowMs: 50 },
-  );
-  assert.equal(unset.status, 401);
-  const blank = await handleFetch(
-    new Request("https://example.test/mcp", {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-internal-token": "" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
-    }),
-    { ...env, INTERNAL_TOKEN: "" },
-    { nowMs: 51 },
-  );
-  assert.equal(blank.status, 401);
+  assert.equal((await post({ "x-internal-token": "internal-token-value" })).status, 401);
+  assert.equal((await post({ "x-abot-owner-email": "not-an-email" })).status, 401);
+  const missing = await post({ "x-internal-token": "" });
+  assert.equal(missing.status, 401);
+  assert.equal((await missing.json()).error, "x-abot-owner-email required");
 });
 
-test("POST /mcp rate limit is per presented credential", async () => {
+test("POST /mcp rate limit is per owner", async () => {
   assert.equal(MCP_RATE_LIMIT, 120);
   assert.equal(MCP_RATE_WINDOW_MS, 60_000);
   const env = {
-    MCP_TOKEN: "rate-limit-token",
     MCP_RATE_LIMIT: "2",
     DB: { prepare() { throw new Error("db touched"); } },
   };
-  const post = (token, body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })) =>
+  const post = (owner, body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })) =>
     handleFetch(
       new Request("https://example.test/mcp", {
         method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        headers: { "content-type": "application/json", "x-abot-owner-email": owner },
         body,
       }),
-      token === "rate-limit-token" ? env : { ...env, MCP_TOKEN: token },
+      env,
       { nowMs: 80 },
     );
-  assert.equal((await post("rate-limit-token")).status, 200);
-  assert.equal((await post("rate-limit-token")).status, 200);
-  const limited = await post("rate-limit-token", "{");
+  assert.equal((await post("a@abot.run")).status, 200);
+  assert.equal((await post("a@abot.run")).status, 200);
+  const limited = await post("a@abot.run", "{");
   assert.equal(limited.status, 429);
   assert.equal(limited.headers.get("cache-control"), "no-store");
   assert.ok(Number(limited.headers.get("retry-after")) >= 1);
   const body = await limited.json();
   assert.deepEqual(body, { ok: false, error: "rate limited" });
-  const other = await post("other-token", "{");
+  const other = await post("b@abot.run", "{");
   assert.equal(other.status, 400);
 });
 

@@ -223,39 +223,32 @@ function mcpPost(headers) {
   });
 }
 
-test("/mcp 内部 token 错误被拒绝", async () => {
+test("/mcp 不校验 X-Internal-Token，合法 owner 即通过", async () => {
   const env = mcpEnv();
-  const r = await handleFetch(mcpPost({ "x-internal-token": "wrong", "x-abot-owner-email": OWNER_A }), env);
-  assert.equal(r.status, 401);
+  for (const headers of [
+    { "x-abot-owner-email": OWNER_A },
+    { "x-internal-token": "wrong", "x-abot-owner-email": OWNER_A },
+    { "x-internal-token": "internal-secret", "x-abot-owner-email": OWNER_A },
+    { authorization: "Bearer nope", "x-abot-owner-email": OWNER_A },
+  ]) {
+    const r = await handleFetch(mcpPost(headers), env);
+    assert.equal(r.status, 200, JSON.stringify(headers));
+    const body = await r.json();
+    assert.ok(body.result.tools.length > 0);
+  }
 });
 
-test("/mcp 网关调用缺 owner 头被拒绝", async () => {
+test("/mcp 缺 owner 或格式非法被拒绝，token 不能代替", async () => {
   const env = mcpEnv();
-  const r = await handleFetch(mcpPost({ "x-internal-token": "internal-secret" }), env);
-  assert.equal(r.status, 401);
-});
-
-test("/mcp 网关调用 owner 格式非法被拒绝", async () => {
-  const env = mcpEnv();
+  const missing = await handleFetch(mcpPost({}), env);
+  assert.equal(missing.status, 401);
+  assert.equal((await missing.json()).error, "x-abot-owner-email required");
+  const bearer = await handleFetch(mcpPost({ authorization: "Bearer mcp-secret" }), env);
+  assert.equal(bearer.status, 401);
+  const internal = await handleFetch(mcpPost({ "x-internal-token": "internal-secret" }), env);
+  assert.equal(internal.status, 401);
   for (const bad of ["not-an-email", "a@evil.com", "a@abot.run.evil.com", ""]) {
     const r = await handleFetch(mcpPost({ "x-internal-token": "internal-secret", "x-abot-owner-email": bad }), env);
     assert.equal(r.status, 401, bad || "(empty)");
   }
-});
-
-test("/mcp 网关调用合法通过", async () => {
-  const env = mcpEnv();
-  const r = await handleFetch(mcpPost({ "x-internal-token": "internal-secret", "x-abot-owner-email": OWNER_A }), env);
-  assert.equal(r.status, 200);
-  const body = await r.json();
-  assert.ok(body.result.tools.length > 0);
-});
-
-test("/mcp 直接 MCP_TOKEN 调用仍可用（owner 为 null）", async () => {
-  const env = mcpEnv();
-  const r = await handleFetch(
-    mcpPost({ authorization: "Bearer mcp-secret" }),
-    env,
-  );
-  assert.equal(r.status, 200);
 });

@@ -223,6 +223,25 @@ test("tools/list exposes every mail tool", async () => {
   ]);
 });
 
+test("service binding calls omit X-Internal-Token and still isolate owners", async () => {
+  const { env } = setup();
+  const http = await postMcp(
+    env,
+    mcpRequest({
+      owner: ALICE,
+      message: {
+        jsonrpc: "2.0",
+        id: "binding",
+        method: "tools/call",
+        params: { name: "search_emails", arguments: { query: "invoice", fresh: true } },
+      },
+    }),
+  );
+  const rows = payload(http);
+  assert.deepEqual(rows.map((row) => row.resend_id), [ALICE_IN]);
+  assert.equal(JSON.stringify(rows).includes("bob secret"), false);
+});
+
 test("search_emails returns only this owner's metadata", async () => {
   const { call } = setup();
   const rows = payload(await call(ALICE, "search_emails", { query: "invoice", fresh: true }));
@@ -316,7 +335,6 @@ test("send_email sends as the bound mailbox and rejects spoofing", async () => {
     const unbound = await postMcp(
       env,
       mcpRequest({
-        token: MCP_TOKEN,
         message: {
           jsonrpc: "2.0",
           id: "e2e",
@@ -325,7 +343,8 @@ test("send_email sends as the bound mailbox and rejects spoofing", async () => {
         },
       }),
     );
-    assert.equal(rpcError(unbound).code, -32001);
+    assert.equal(unbound.status, 401);
+    assert.equal(unbound.json.error, "x-abot-owner-email required");
     assert.equal(calls.length, 0);
   } finally {
     globalThis.fetch = prev;
@@ -555,12 +574,12 @@ test("unauthorized mcp requests return 401 before touching the database", async 
     mcpRequest({ message: { jsonrpc: "2.0", id: 1, method: "tools/list" } }),
     mcpRequest({ token: "wrong-token", message: { jsonrpc: "2.0", id: 1, method: "tools/list" } }),
     mcpRequest({
-      internal: "wrong-internal",
-      owner: ALICE,
+      token: "wrong-token",
+      owner: "not-an-email",
       message: { jsonrpc: "2.0", id: 1, method: "tools/list" },
     }),
     mcpRequest({
-      owner: ALICE,
+      owner: "not-an-email",
       message: { jsonrpc: "2.0", id: 1, method: "initialize" },
     }),
     mcpRequest({
