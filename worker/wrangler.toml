@@ -2,6 +2,12 @@ name = "resend-agent-mail-relay"
 main = "worker.js"
 compatibility_date = "2026-09-01"
 
+# Live custom route. A deploy from this file must keep mail.abot.run attached.
+# With routes set, Wrangler leaves workers.dev disabled.
+[[routes]]
+pattern = "mail.abot.run/*"
+zone_name = "abot.run"
+
 # D1 database abot-mail-archive (already created).
 [[d1_databases]]
 binding = "DB"
@@ -62,6 +68,8 @@ crons = ["20 1 * * *"]
 
 [env.staging]
 name = "resend-agent-mail-relay-staging"
+# Do not inherit the production mail.abot.run route.
+routes = []
 # Separate worker, D1, R2, and queue. Do not point these at production.
 # Replace database_id after `npx wrangler d1 create abot-mail-archive-staging`.
 # The placeholder is not the production database. Deploy fails until it is replaced
