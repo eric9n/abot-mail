@@ -88,6 +88,7 @@ test("e2e exits non-zero when credentials are missing", () => {
   assert.notEqual(res.status, 0);
   assert.match(res.stderr, /WORKER_URL/);
   assert.match(res.stderr, /WEBHOOK_SECRET/);
+  assert.match(res.stderr, /MCP_URL/);
   assert.match(res.stderr, /MCP_TOKEN/);
   assert.match(res.stderr, /TEST_EMAIL_ID/);
 
