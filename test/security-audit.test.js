@@ -216,7 +216,7 @@ function mcpEnv() {
 }
 
 function mcpPost(headers) {
-  return new Request("https://example.test/mcp", {
+  return new Request("https://backend.internal/mcp", {
     method: "POST",
     headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
@@ -251,4 +251,98 @@ test("/mcp 缺 owner 或格式非法被拒绝，token 不能代替", async () =>
     const r = await handleFetch(mcpPost({ "x-internal-token": "internal-secret", "x-abot-owner-email": bad }), env);
     assert.equal(r.status, 401, bad || "(empty)");
   }
+});
+
+test("/mcp 只接受 Service Binding 的内部 host，公网 host 带 owner 也是 404", async () => {
+  const env = mcpEnv();
+  for (const host of ["mail.abot.run", "resend-agent-mail-relay.eric9n-cf.workers.dev", "example.test"]) {
+    const r = await handleFetch(
+      new Request(`https://${host}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-abot-owner-email": OWNER_A },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      }),
+      env,
+    );
+    assert.equal(r.status, 404, host);
+    assert.equal((await r.json()).error, "not found");
+  }
+  const internal = await handleFetch(mcpPost({ "x-abot-owner-email": OWNER_A }), env);
+  assert.equal(internal.status, 200);
+});
+
+function gatewayEnv(handler) {
+  const calls = [];
+  return {
+    calls,
+    env: {
+      GATEWAY: {
+        async fetch(url, init) {
+          calls.push({ url, init });
+          return handler(url, init);
+        },
+      },
+    },
+  };
+}
+
+test("/signup 转发到 abot-gateway，不在本 Worker 建表或核对邀请码", async () => {
+  const { env, calls } = gatewayEnv(() => Response.json({ id: "prov_1", status: "pending" }));
+  const r = await handleFetch(
+    new Request("https://mail.abot.run/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ invite_code: " inv_x ", agent_name: "bot", reason: "r", requested_email: "Bot@abot.run" }),
+    }),
+    env,
+  );
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { ok: true, id: "prov_1", status: "pending", message: "等待人工审核" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://abot-gateway/provision/request");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    invite_code: "inv_x",
+    agent_name: "bot",
+    reason: "r",
+    requested_email: "bot@abot.run",
+  });
+});
+
+test("/signup 本地拒绝缺邀请码和非法邮箱，网关错误原样带回状态码", async () => {
+  const { env, calls } = gatewayEnv(() => Response.json({ error: "invite_code_used" }, { status: 403 }));
+  const post = (body) =>
+    handleFetch(
+      new Request("https://mail.abot.run/signup", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+      env,
+    );
+  assert.equal((await post({})).status, 400);
+  assert.equal((await post({ invite_code: "inv", requested_email: "x@evil.com" })).status, 400);
+  assert.equal(calls.length, 0);
+  const used = await post({ invite_code: "inv" });
+  assert.equal(used.status, 403);
+  assert.equal((await used.json()).error, "invite_code_used");
+  const missing = await handleFetch(
+    new Request("https://mail.abot.run/signup", { method: "POST", body: JSON.stringify({ invite_code: "inv" }) }),
+    {},
+  );
+  assert.equal(missing.status, 500);
+  assert.equal((await missing.json()).error, "gateway_binding_missing");
+});
+
+test("/provision/status 转发到 abot-gateway 并返回状态", async () => {
+  const { env, calls } = gatewayEnv((url) =>
+    url.endsWith("id=prov_1")
+      ? Response.json({ id: "prov_1", status: "approved", email: "bot@abot.run" })
+      : Response.json({ error: "not_found" }, { status: 404 }),
+  );
+  const ok = await handleFetch(new Request("https://mail.abot.run/provision/status?id=prov_1"), env);
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), { ok: true, id: "prov_1", status: "approved", email: "bot@abot.run" });
+  const missing = await handleFetch(new Request("https://mail.abot.run/provision/status?id=a%26b"), env);
+  assert.equal(missing.status, 404);
+  assert.equal(calls[1].url, "https://abot-gateway/provision/status?id=a%26b");
 });

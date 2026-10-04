@@ -612,7 +612,7 @@ test("webhook archives inbound mail once, then MCP can read it", async () => {
 
   async function mcp(message, token = "test-mcp-token") {
     const res = await handleFetch(
-      new Request("https://example.test/mcp", {
+      new Request("https://backend.internal/mcp", {
         method: "POST",
         headers: {
           authorization: `Bearer ${token}`,
@@ -862,13 +862,13 @@ test("MCP JSON-RPC dispatch", async () => {
 test("MCP HTTP auth runs before JSON parsing", async () => {
   const env = { MCP_TOKEN: "test-mcp-token", DB: { prepare() { throw new Error("db touched"); } } };
   const unauth = await handleFetch(
-    new Request("https://example.test/mcp", { method: "POST", body: "{", headers: { "content-type": "application/json" } }),
+    new Request("https://backend.internal/mcp", { method: "POST", body: "{", headers: { "content-type": "application/json" } }),
     env,
   );
   assert.equal(unauth.status, 401);
 
   const wrong = await handleFetch(
-    new Request("https://example.test/mcp", {
+    new Request("https://backend.internal/mcp", {
       method: "POST",
       headers: { authorization: "Bearer wrong-token", "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
@@ -878,7 +878,7 @@ test("MCP HTTP auth runs before JSON parsing", async () => {
   assert.equal(wrong.status, 401);
 
   const parsed = await handleFetch(
-    new Request("https://example.test/mcp", {
+    new Request("https://backend.internal/mcp", {
       method: "POST",
       headers: { "x-abot-owner-email": MCP_OWNER, "content-type": "application/json" },
       body: "{",
@@ -889,7 +889,7 @@ test("MCP HTTP auth runs before JSON parsing", async () => {
   assert.equal((await parsed.json()).error.code, -32700);
 
   const accepted = await handleFetch(
-    new Request("https://example.test/mcp", {
+    new Request("https://backend.internal/mcp", {
       method: "POST",
       headers: { "x-abot-owner-email": MCP_OWNER, "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
@@ -900,7 +900,7 @@ test("MCP HTTP auth runs before JSON parsing", async () => {
   assert.equal(await accepted.text(), "");
 
   const type = await handleFetch(
-    new Request("https://example.test/mcp", {
+    new Request("https://backend.internal/mcp", {
       method: "POST",
       headers: { "x-abot-owner-email": MCP_OWNER, "content-type": "text/plain" },
       body: "{}",
@@ -1385,7 +1385,7 @@ function instrumentBucket(env) {
 
 async function mcpCall(env, message, deps) {
   const res = await handleFetch(
-    new Request("https://example.test/mcp", {
+    new Request("https://backend.internal/mcp", {
       method: "POST",
       headers: {
         authorization: "Bearer test-mcp-token",
@@ -1951,7 +1951,7 @@ test("unauthorized, health, webhook, and failed ingest do not write the cache", 
   const { db, env } = sqliteEnv();
   const cache = memoryCache();
   const unauth = await handleFetch(
-    new Request("https://example.test/mcp", {
+    new Request("https://backend.internal/mcp", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
@@ -1961,7 +1961,7 @@ test("unauthorized, health, webhook, and failed ingest do not write the cache", 
   );
   assert.equal(unauth.status, 401);
   const wrong = await handleFetch(
-    new Request("https://example.test/mcp", {
+    new Request("https://backend.internal/mcp", {
       method: "POST",
       headers: { authorization: "Bearer wrong-token", "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "email_stats" }),
@@ -2816,7 +2816,7 @@ test("mcp reads record cache and fresh without logging the stored summary", asyn
 
   const denied = await captureLogs(() =>
     handleFetch(
-      new Request("https://example.test/mcp", {
+      new Request("https://backend.internal/mcp", {
         method: "POST",
         headers: { authorization: "Bearer test-mcp-token-nope", "content-type": "application/json" },
         body: "{}",
@@ -3171,7 +3171,7 @@ test("POST /mcp ignores tokens and requires x-abot-owner-email", async () => {
   };
   const post = (headers) =>
     handleFetch(
-      new Request("https://example.test/mcp", {
+      new Request("https://backend.internal/mcp", {
         method: "POST",
         headers: { "content-type": "application/json", ...headers },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
@@ -3202,7 +3202,7 @@ test("POST /mcp rate limit is per owner", async () => {
   };
   const post = (owner, body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })) =>
     handleFetch(
-      new Request("https://example.test/mcp", {
+      new Request("https://backend.internal/mcp", {
         method: "POST",
         headers: { "content-type": "application/json", "x-abot-owner-email": owner },
         body,
@@ -3359,7 +3359,7 @@ function insertLegacyMail(db, { id, from, to, subject, text, auth = null }) {
 
 async function postMcp(env, message, headers, deps) {
   const res = await handleFetch(
-    new Request("https://example.test/mcp", {
+    new Request("https://backend.internal/mcp", {
       method: "POST",
       headers: { "content-type": "application/json", ...headers },
       body: JSON.stringify(message),

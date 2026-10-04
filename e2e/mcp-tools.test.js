@@ -154,7 +154,7 @@ function mcpRequest({ token, internal, owner, message }) {
   if (token) headers.authorization = `Bearer ${token}`;
   if (internal) headers["x-internal-token"] = internal;
   if (owner) headers["x-abot-owner-email"] = owner;
-  return new Request("https://mail.test/mcp", {
+  return new Request("https://backend.internal/mcp", {
     method: "POST",
     headers,
     body: JSON.stringify(message),

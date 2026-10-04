@@ -2,8 +2,11 @@ name = "resend-agent-mail-relay"
 main = "worker.js"
 compatibility_date = "2026-09-01"
 
+# Production is deployed only by Workers Builds running deploy/cloudflare.mjs.
 # Live custom route. A deploy from this file must keep mail.abot.run attached.
-# With routes set, Wrangler leaves workers.dev disabled.
+# workers.dev stays off: POST /mcp trusts only the Service Binding host.
+workers_dev = false
+preview_urls = false
 [[routes]]
 pattern = "mail.abot.run/*"
 zone_name = "abot.run"
@@ -22,6 +25,11 @@ bucket_name = "abot-mail-archive"
 # Workers AI. No external model key. Summaries stay on Cloudflare.
 [ai]
 binding = "AI"
+
+# /signup and /provision/status forward to abot-gateway, which owns invite codes.
+[[services]]
+binding = "GATEWAY"
+service = "abot-gateway"
 
 # Production ingest queue. Staging must not bind this name; see [env.staging].
 # Secrets stay in `wrangler secret put` (WEBHOOK_SECRET, RESEND_API_KEY).
@@ -70,6 +78,7 @@ crons = ["20 1 * * *"]
 name = "resend-agent-mail-relay-staging"
 # Do not inherit the production mail.abot.run route.
 routes = []
+workers_dev = true
 # Separate worker, D1, R2, and queue. Do not point these at production.
 # Replace database_id after `npx wrangler d1 create abot-mail-archive-staging`.
 # The placeholder is not the production database. Deploy fails until it is replaced
