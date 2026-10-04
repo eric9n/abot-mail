@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Call the abot-mail MCP server (read-only).
+"""Call the abot-mail MCP server through abot-gateway (read-only).
 
 Subcommands match the Worker tools: search, get, list, stats, account.
-`tools` calls tools/list. `health` is an unauthenticated GET /health.
+`tools` calls tools/list. `health` is an unauthenticated GET of the Worker's
+/health on mail.abot.run.
+
+The Worker's own /mcp only answers abot-gateway's Service Binding, so MCP
+calls go to the gateway (https://abot.run/mcp by default, override with --url
+or MCP_URL). MCP_TOKEN is the gateway access token for the mailbox; the
+gateway maps it to the mailbox and drops it before calling the Worker.
 
 Token order: environment variable MCP_TOKEN, then Secure Vault credential
 custom.abot-mail via dynamic_credentials.add_surrogate_to_request when that
-module is installed. The Worker URL defaults to the production workers.dev
-host and can be overridden with --url or MCP_URL.
+module is installed.
 """
 
 import argparse
@@ -18,7 +23,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-DEFAULT_BASE = "https://resend-agent-mail-relay.eric9n-cf.workers.dev"
+DEFAULT_BASE = "https://abot.run"
+DEFAULT_HEALTH_URL = "https://mail.abot.run/health"
 VAULT_MODULE = "/opt/hatch/skills/skill-creator/bin/dynamic_credentials.py"
 VAULT_CREDENTIAL = "custom.abot-mail"
 VAULT_ENTRY = "MCP_TOKEN"
@@ -235,7 +241,7 @@ def cmd_tools(args):
 
 
 def cmd_health(args):
-    emit(http_json("GET", args.base + "/health"))
+    emit(http_json("GET", os.environ.get("MAIL_HEALTH_URL") or DEFAULT_HEALTH_URL))
 
 
 def build_parser():
@@ -243,12 +249,12 @@ def build_parser():
     common.add_argument(
         "--url",
         default=os.environ.get("MCP_URL") or DEFAULT_BASE,
-        help="Worker origin. Defaults to MCP_URL, then the production workers.dev host. /mcp and /health suffixes are stripped.",
+        help="Gateway origin. Defaults to MCP_URL, then https://abot.run. A trailing /mcp is stripped.",
     )
 
     parser = argparse.ArgumentParser(
         prog="mcp_cli",
-        description="Read the abot-mail archive through the Worker MCP endpoint. There is no send command.",
+        description="Read the abot-mail archive through the abot-gateway MCP endpoint. There is no send command.",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -289,7 +295,7 @@ def build_parser():
     tools = sub.add_parser("tools", parents=[common], help="Call tools/list.")
     tools.set_defaults(func=cmd_tools)
 
-    health = sub.add_parser("health", parents=[common], help="GET /health. No token.")
+    health = sub.add_parser("health", parents=[common], help="GET mail.abot.run/health (or MAIL_HEALTH_URL). No token.")
     health.set_defaults(func=cmd_health)
     return parser
 
