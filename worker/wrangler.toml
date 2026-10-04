@@ -26,11 +26,6 @@ bucket_name = "abot-mail-archive"
 [ai]
 binding = "AI"
 
-# /signup and /provision/status forward to abot-gateway, which owns invite codes.
-[[services]]
-binding = "GATEWAY"
-service = "abot-gateway"
-
 # Production ingest queue. Staging must not bind this name; see [env.staging].
 # Secrets stay in `wrangler secret put` (WEBHOOK_SECRET, RESEND_API_KEY).
 # POST /mcp does not read MCP_TOKEN or INTERNAL_TOKEN.

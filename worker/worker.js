@@ -14,7 +14,6 @@
  * Both are Worker secrets (`wrangler secret put`), never plain vars.
  * The gateway calls this worker with a Service Binding and always sends
  * x-abot-owner-email. MCP_TOKEN and INTERNAL_TOKEN are not read.
- * /signup and /provision/status forward to abot-gateway through env.GATEWAY.
  * Observability uses the METRICS binding. It does not change archive responses.
  */
 
@@ -2720,37 +2719,6 @@ function pathOf(url) {
   return url.pathname;
 }
 
-async function gatewayProvision(env, trace, target, init) {
-  const gateway = env && env.GATEWAY;
-  if (!gateway || typeof gateway.fetch !== "function") {
-    trace.outcome = "error";
-    return { response: json({ ok: false, error: "gateway_binding_missing" }, 500) };
-  }
-  let upstream;
-  try {
-    upstream = await gateway.fetch(target, init);
-  } catch {
-    trace.outcome = "error";
-    return { response: json({ ok: false, error: "upstream_unavailable" }, 502) };
-  }
-  let payload = {};
-  try {
-    payload = await upstream.json();
-  } catch {
-    payload = {};
-  }
-  if (!payload || typeof payload !== "object") payload = {};
-  if (!upstream.ok || payload.error) {
-    return {
-      response: json(
-        { ok: false, error: payload.error || "upstream_error", message: payload.message },
-        upstream.ok ? 502 : upstream.status,
-      ),
-    };
-  }
-  return { payload };
-}
-
 function jsonContentType(header) {
   if (!header) return false;
   const media = header.split(";", 1)[0].trim().toLowerCase();
@@ -2784,92 +2752,6 @@ export async function handleFetch(request, env, deps = {}) {
         trace.error = "health_failed";
         return json({ ok: false, last_received_at: null, count_24h: null }, 503);
       }
-    }
-
-    if (path === "/signup" && request.method === "GET") {
-      trace.outcome = "ok";
-      const accept = request.headers.get("accept") || "";
-      const info = {
-        service: "aBot 邮箱申请",
-        steps: [
-          "向你的主人要一个邀请码（一小时有效，一次性）",
-          "想一个你想要的邮箱地址，必须是 xxx@abot.run 格式",
-          "POST https://mail.abot.run/signup 提交申请",
-          "提交后等待主人审核，通过后主人会把 secret 发给你",
-          "用邮箱 + secret 调 POST https://abot.run/oauth/token (grant_type=password) 换取 access_token",
-          "以后调 https://abot.run/mcp 时带 Authorization: Bearer <access_token>",
-        ],
-        request_format: {
-          invite_code: "inv_...（必填，主人给的）",
-          agent_name: "你的名字（必填）",
-          reason: "用途说明（必填）",
-          requested_email: "想要的邮箱，如 mybot@abot.run（选填）",
-        },
-        apply_url: "https://mail.abot.run/signup",
-      };
-      if (accept.includes("text/html")) {
-        return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>aBot 邮箱申请</title>
-<style>body{font-family:system-ui;max-width:640px;margin:40px auto;padding:20px;line-height:1.6}
-code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5;padding:12px;border-radius:8px;overflow:auto}</style>
-</head><body><h2>aBot 邮箱申请</h2>
-<ol>${info.steps.map(s => `<li>${s}</li>`).join("")}</ol>
-<h3>申请格式</h3><pre>${JSON.stringify(info.request_format, null, 2)}</pre>
-<p>提交地址：<code>POST ${info.apply_url}</code></p></body></html>`,
-          { headers: { "Content-Type": "text/html;charset=utf-8" } });
-      }
-      return json(info);
-    }
-
-    // 提交邮箱申请（POST /signup 或 POST /provision/request）。邀请码和申请表都在 abot-gateway。
-    if ((path === "/signup" || path === "/provision/request") && request.method === "POST") {
-      trace.outcome = "ok";
-      let body;
-      try {
-        body = await request.json();
-      } catch {
-        body = {};
-      }
-      if (!body || typeof body !== "object") body = {};
-      const inviteCode = (typeof body.invite_code === "string" ? body.invite_code : "").trim();
-      if (!inviteCode) {
-        return json({ ok: false, error: "invite_code_required", message: "需要邀请码" }, 400);
-      }
-      const requestedEmail = (typeof body.requested_email === "string" ? body.requested_email : "").trim().toLowerCase() || null;
-      if (requestedEmail) {
-        if (!requestedEmail.endsWith("@abot.run") || requestedEmail.length < 11) {
-          return json({ ok: false, error: "invalid_email", message: "邮箱必须是 xxx@abot.run 格式" }, 400);
-        }
-        if (!/^[a-z0-9._-]+@abot\.run$/.test(requestedEmail)) {
-          return json({ ok: false, error: "invalid_email", message: "邮箱只能含小写字母、数字、._-" }, 400);
-        }
-      }
-      const forwarded = await gatewayProvision(env, trace, "https://abot-gateway/provision/request", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          invite_code: inviteCode,
-          agent_name: body.agent_name,
-          reason: body.reason,
-          requested_email: requestedEmail,
-        }),
-      });
-      if (forwarded.response) return forwarded.response;
-      const payload = forwarded.payload;
-      return json({ ok: true, id: payload.id, status: payload.status || "pending", message: payload.message || "等待人工审核" });
-    }
-
-    if (path === "/provision/status" && request.method === "GET") {
-      trace.outcome = "ok";
-      const id = url.searchParams.get("id") || "";
-      const forwarded = await gatewayProvision(
-        env,
-        trace,
-        "https://abot-gateway/provision/status?id=" + encodeURIComponent(id),
-        { method: "GET" },
-      );
-      if (forwarded.response) return forwarded.response;
-      const payload = forwarded.payload;
-      return json({ ok: true, id: payload.id, status: payload.status, email: payload.email || null });
     }
 
     if (path === "/mcp") {

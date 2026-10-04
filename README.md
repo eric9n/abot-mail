@@ -29,7 +29,7 @@ D1 binding 名是 `DB`。密钥只放在 Worker secrets 里：`WEBHOOK_SECRET`�
 Workers Builds 先 `npm clean-install`（`package-lock.json` 锁住 `wrangler` 版本），然后执行构建命令和部署命令：
 
 - `npm run gate`：语法检查加全部单元测试，任何一项失败都不会部署。
-- `node deploy/cloudflare.mjs build`：核对 `worker/wrangler.toml` 的默认环境仍是生产配置（Worker 名、`mail.abot.run/*` 路由、`workers_dev = false`、生产 D1 id、R2、`GATEWAY` service binding、`mail-ingest` / `mail-ingest-dlq` 队列、没有 `[vars]`），再用 `wrangler deploy --dry-run` 打包。
+- `node deploy/cloudflare.mjs build`：核对 `worker/wrangler.toml` 的默认环境仍是生产配置（Worker 名、`mail.abot.run/*` 路由、`workers_dev = false`、生产 D1 id、R2、`mail-ingest` / `mail-ingest-dlq` 队列、没有 `[vars]`），再用 `wrangler deploy --dry-run` 打包。
 - `node deploy/cloudflare.mjs deploy`：只在 `WORKERS_CI_BRANCH=main` 时执行 `wrangler deploy`，版本信息里写入 build uuid 和 commit。
 
 两个子命令都要求 `WORKERS_CI=1`（Workers Builds 自动注入）。在本地运行，包括 `npm run deploy`，会直接退出非零。`wrangler deploy` 不会删除已有 secret，所以 secret 继续在控制台维护。
@@ -73,8 +73,8 @@ ALTER TABLE emails ADD COLUMN is_archived INTEGER DEFAULT 0;
 | `POST` | `/` | Svix 签名 | 验签后入队 `mail-ingest` |
 | `POST` | `/mcp` | 只接受 host 为 `backend.internal` 的 Service Binding 调用，并且必须带 `x-abot-owner-email`。公网 host 一律 404 | MCP。每个邮箱每分钟 120 次（只计当前 isolate） |
 | `GET` | `/health` | 无 | `{"ok":true,"last_received_at":"...","count_24h":N}` |
-| `GET` / `POST` | `/signup`、`/provision/request` | 邀请码 | 申请说明；提交时经 `GATEWAY` 转发到 `abot-gateway` |
-| `GET` | `/provision/status?id=` | 无 | 经 `GATEWAY` 转发到 `abot-gateway` 查申请状态 |
+
+邮箱申请在 `abot-gateway`（`https://abot.run/signup`），这个 Worker 不提供。
 
 `/health` 只返回最近一封收件的入库时间和过去 24 小时的归档条数。响应字段只有 `ok`、`last_received_at`、`count_24h`。Svix 时间戳偏离超过 5 分钟或签名对不上回 401，`/mcp` 缺 owner 回 401，都发生在读取业务数据之前。
 
