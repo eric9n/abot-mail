@@ -14,7 +14,6 @@
  * Both are Worker secrets (`wrangler secret put`), never plain vars.
  * The gateway calls this worker with a Service Binding and always sends
  * x-abot-owner-email. MCP_TOKEN and INTERNAL_TOKEN are not read.
- * /signup and /provision/status forward to abot-gateway through env.GATEWAY.
  * Observability uses the METRICS binding. It does not change archive responses.
  */
 
@@ -30,6 +29,19 @@ export const INTERNAL_MCP_HOST = "backend.internal";
 /** POST /mcp fixed window. Counted in this isolate, per presented credential or client IP. */
 export const MCP_RATE_LIMIT = 120;
 export const MCP_RATE_WINDOW_MS = 60_000;
+/** POST /mcp per-mailbox calls per minute, counted in D1 across isolates. */
+export const MCP_D1_RATE_LIMIT = 100;
+export const SEND_MAX_RECIPIENTS = 10;
+/** RFC 5322 line limit; the subject must also be a single line. */
+export const SEND_MAX_SUBJECT_CHARS = 998;
+export const SEND_MAX_BODY_CHARS = 100_000;
+/** Recipients per mailbox per clock hour. Override with env.SEND_HOURLY_LIMIT. */
+export const SEND_HOURLY_LIMIT = 50;
+export const RATE_LIMITS_DDL =
+  "CREATE TABLE IF NOT EXISTS rate_limits (k TEXT PRIMARY KEY, window INTEGER NOT NULL, count INTEGER NOT NULL)";
+const BUMP_COUNTER_SQL =
+  "INSERT INTO rate_limits (k, window, count) VALUES (?, ?, ?) " +
+  "ON CONFLICT(k) DO UPDATE SET count = count + excluded.count RETURNING count";
 /** Resend download_url bodies (raw .eml and attachments) above this are refused. */
 export const MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024;
 /** text_body and html_body written to D1 are cut to this many characters. */
@@ -363,13 +375,48 @@ function assertOptionalBoolean(args, key) {
   if (typeof args[key] !== "boolean") throw new RpcError(-32602, `${key} must be a boolean`);
 }
 
-/** Exact mailbox match. Underscore in an address is a literal, not a LIKE wildcard. */
+function likeEscape(value) {
+  return String(value).replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+/**
+ * Mailbox scope, mirrored by emailBelongsToOwner. A recipient (to or cc) owns
+ * any row. The sender owns only outbound rows: an inbound From header is not
+ * authenticated and can name any mailbox. Addresses match bare or as
+ * "Name <addr>", case-insensitively; _ and % in an address are literals.
+ */
 function ownerPredicate(ownerEmail) {
   if (!ownerEmail) return null;
+  const owner = likeEscape(ownerEmail);
+  const listed = [`%"${owner}"%`, `%<${owner}>%`];
   return {
-    sql: "(msg_from = ? OR msg_to LIKE ? ESCAPE '\\')",
-    params: [ownerEmail, likeContains(`"${ownerEmail}"`)],
+    sql:
+      "((direction = 'out' AND (msg_from LIKE ? ESCAPE '\\' OR msg_from LIKE ? ESCAPE '\\'))" +
+      " OR msg_to LIKE ? ESCAPE '\\' OR msg_to LIKE ? ESCAPE '\\'" +
+      " OR cc LIKE ? ESCAPE '\\' OR cc LIKE ? ESCAPE '\\')",
+    params: [owner, `%<${owner}>`, ...listed, ...listed],
   };
+}
+
+/** "Name <a@b>" or "a@b" to "a@b", lowercased. */
+export function addressOf(value) {
+  if (typeof value !== "string") return "";
+  const angled = /<([^<>]*)>\s*$/.exec(value);
+  return (angled ? angled[1] : value).trim().toLowerCase();
+}
+
+function addressList(value) {
+  const list = Array.isArray(value) ? value : parseJsonField(value, []);
+  return Array.isArray(list) ? list.map(addressOf) : [];
+}
+
+/** Same rule as ownerPredicate, on toMetadata-shaped values. */
+export function emailBelongsToOwner(email, ownerEmail) {
+  if (!ownerEmail) return true;
+  if (!email || typeof email !== "object") return false;
+  const owner = ownerEmail.toLowerCase();
+  if (email.direction === "out" && addressOf(email.from) === owner) return true;
+  return addressList(email.to).includes(owner) || addressList(email.cc).includes(owner);
 }
 
 function assertOnlyKeys(obj, allowed) {
@@ -961,13 +1008,7 @@ export function getEmailCacheUrl(resendId, includeHtml, includeRaw, ai, rev, own
 export function cachedEmailBelongsToOwner(cached, ownerEmail) {
   if (!ownerEmail) return true; // 系统级调用，无隔离
   if (!cached || cached.found === false) return true;
-  if (cached.from === ownerEmail) return true;
-  try {
-    if (JSON.stringify(cached.to || []).includes('"' + ownerEmail + '"')) return true;
-  } catch {
-    // damaged payload -> treat as miss
-  }
-  return false;
+  return emailBelongsToOwner(cached, ownerEmail);
 }
 
 export function statsCacheUrl(rev, ownerEmail) {
@@ -1356,13 +1397,13 @@ export const TOOLS = [
   },
   {
     name: "send_email",
-    description: "Send an email via Resend. Defaults to your bound @abot.run address.",
+    description: "Send an email via Resend from your bound @abot.run address. Recipients count against an hourly quota.",
     inputSchema: {
       type: "object",
       properties: {
-        to: { type: "string", description: "Recipient email address." },
-        subject: { type: "string", description: "Email subject." },
-        body: { type: "string", description: "Email body (plain text)." },
+        to: { type: "string", description: "Recipient address, or up to 10 addresses separated by commas." },
+        subject: { type: "string", description: "Email subject. One line, at most 998 characters." },
+        body: { type: "string", description: "Email body (plain text), at most 100000 characters." },
         from: { type: "string", description: "Sender address. Defaults to your bound email. Must be @abot.run." },
       },
       required: ["to", "subject", "body"],
@@ -1620,13 +1661,7 @@ async function callTool(name, args, deps) {
     const query = loaded.query;
     const rows = loaded.rows;
     if (!rows.length) return { found: false, resend_id: id };
-    // mailbox 隔离：校验归属
-    if (ownerEmail) {
-      const r = rows[0];
-      const isMine = (r.msg_from === ownerEmail) ||
-        (r.msg_to && r.msg_to.includes('"' + ownerEmail + '"'));
-      if (!isMine) return { found: false, resend_id: id };
-    }
+    if (!emailBelongsToOwner(toMetadata(rows[0]), ownerEmail)) return { found: false, resend_id: id };
     let rawEml;
     if (query.includeRaw) rawEml = await cachedObjectText(deps, rawObjectKey(id), fresh);
     const value = {
@@ -1680,6 +1715,13 @@ async function callTool(name, args, deps) {
     if (typeof to !== "string" || !to || typeof subject !== "string" || !subject || typeof body !== "string" || !body) {
       throw new RpcError(-32602, "to, subject, body are required");
     }
+    const recipients = parseRecipients(to);
+    if (subject.length > SEND_MAX_SUBJECT_CHARS || /[\r\n]/.test(subject)) {
+      throw new RpcError(-32602, `subject must be one line of at most ${SEND_MAX_SUBJECT_CHARS} characters`);
+    }
+    if (body.length > SEND_MAX_BODY_CHARS) {
+      throw new RpcError(-32602, `body must be at most ${SEND_MAX_BODY_CHARS} characters`);
+    }
     if (args.from != null && typeof args.from !== "string") {
       throw new RpcError(-32602, "from must be a string");
     }
@@ -1695,20 +1737,50 @@ async function callTool(name, args, deps) {
     if (!apiKey) {
       throw new RpcError(-32603, "RESEND_API_KEY not configured");
     }
-    const doFetch = (deps && deps.fetchImpl) || fetch;
-    const resp = await doFetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        Authorization: "Bearer " + apiKey,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ from, to, subject, text: body }),
-    });
-    const data = await resp.json();
-    if (!resp.ok) {
-      throw new RpcError(-32603, "Resend error: " + JSON.stringify(data));
+    const nowMs = Number.isFinite(deps.nowMs) ? deps.nowMs : Date.now();
+    const hour = Math.floor(nowMs / 3_600_000);
+    const limit = sendHourlyLimit(deps.env);
+    const quotaKey = `send:${ownerEmail}:${hour}`;
+    const nowMinute = Math.floor(nowMs / 60_000);
+    const refund = () => bumpCounter(deps, quotaKey, (hour + 1) * 60, -recipients.length, nowMinute).catch(() => {});
+    let sentThisHour;
+    try {
+      sentThisHour = await bumpCounter(deps, quotaKey, (hour + 1) * 60, recipients.length, nowMinute);
+    } catch {
+      throw new RpcError(-32603, "send quota unavailable");
     }
-    return { id: data.id, from, to, subject };
+    if (sentThisHour > limit) {
+      await refund();
+      throw new RpcError(-32003, `send limit reached: at most ${limit} recipients per hour`);
+    }
+    const toField = recipients.length === 1 ? recipients[0] : recipients;
+    const doFetch = (deps && deps.fetchImpl) || fetch;
+    let resp;
+    try {
+      resp = await doFetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + apiKey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ from, to: toField, subject, text: body }),
+      });
+    } catch {
+      await refund();
+      throw new RpcError(-32603, "Resend unreachable");
+    }
+    let data = {};
+    try {
+      data = await resp.json();
+    } catch {
+      data = {};
+    }
+    if (!resp.ok) {
+      await refund();
+      const reason = data && typeof data.message === "string" ? `: ${data.message.slice(0, 200)}` : "";
+      throw new RpcError(-32603, `Resend rejected the message (HTTP ${resp.status})${reason}`);
+    }
+    return { id: data.id, from, to: toField, subject };
   }
   if (name === "set_email_read_status") {
     const resendId = args.resend_id;
@@ -2688,6 +2760,62 @@ function mcpLimit(env) {
   return n;
 }
 
+export function sendHourlyLimit(env) {
+  if (!env || env.SEND_HOURLY_LIMIT == null || env.SEND_HOURLY_LIMIT === "") return SEND_HOURLY_LIMIT;
+  const n = Number(env.SEND_HOURLY_LIMIT);
+  if (!Number.isInteger(n) || n < 1 || n > 10_000) return SEND_HOURLY_LIMIT;
+  return n;
+}
+
+const RECIPIENT_RE = /^[^\s@<>,;:"()[\]\\]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/i;
+
+/** "a@x.com, b@y.com" -> ["a@x.com", "b@y.com"]; duplicates (case-insensitive) dropped. */
+export function parseRecipients(value) {
+  const parts = String(value).split(",").map((part) => part.trim()).filter(Boolean);
+  if (parts.length === 0 || parts.length > SEND_MAX_RECIPIENTS) {
+    throw new RpcError(-32602, `to must list 1 to ${SEND_MAX_RECIPIENTS} addresses`);
+  }
+  const seen = new Set();
+  const out = [];
+  for (const part of parts) {
+    if (part.length > 254 || !RECIPIENT_RE.test(part)) {
+      throw new RpcError(-32602, "invalid recipient address");
+    }
+    const key = part.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(part);
+  }
+  return out;
+}
+
+/**
+ * Atomically adds `by` to counter `key` and returns the new total.
+ * `expiresMinute` is stored in `window`; rows whose window is before `nowMinute`
+ * are swept whenever a new key is created.
+ */
+export async function bumpCounter(deps, key, expiresMinute, by, nowMinute) {
+  const bump = () => deps.queryFirst(BUMP_COUNTER_SQL, [key, expiresMinute, by]);
+  let row;
+  try {
+    row = await bump();
+  } catch (err) {
+    if (!/no such table: rate_limits/i.test(String(err && err.message))) throw err;
+    await deps.queryRun(RATE_LIMITS_DDL, []);
+    row = await bump();
+  }
+  const count = Number(row && row.count);
+  if (!Number.isFinite(count)) throw new Error("rate counter returned no count");
+  if (count === by) {
+    try {
+      await deps.queryRun("DELETE FROM rate_limits WHERE window < ?", [nowMinute]);
+    } catch {
+      // Sweeping is best effort; stale rows only cost storage.
+    }
+  }
+  return count;
+}
+
 /** Per mailbox when the gateway sent one, otherwise the client IP. Not logged. */
 export function mcpClientKey(request) {
   const owner = request.headers.get("x-abot-owner-email");
@@ -2718,37 +2846,6 @@ export function consumeMcpRate(key, nowMs, limit = MCP_RATE_LIMIT, store = mcpRa
 function pathOf(url) {
   if (url.pathname.length > 1 && url.pathname.endsWith("/")) return url.pathname.slice(0, -1);
   return url.pathname;
-}
-
-async function gatewayProvision(env, trace, target, init) {
-  const gateway = env && env.GATEWAY;
-  if (!gateway || typeof gateway.fetch !== "function") {
-    trace.outcome = "error";
-    return { response: json({ ok: false, error: "gateway_binding_missing" }, 500) };
-  }
-  let upstream;
-  try {
-    upstream = await gateway.fetch(target, init);
-  } catch {
-    trace.outcome = "error";
-    return { response: json({ ok: false, error: "upstream_unavailable" }, 502) };
-  }
-  let payload = {};
-  try {
-    payload = await upstream.json();
-  } catch {
-    payload = {};
-  }
-  if (!payload || typeof payload !== "object") payload = {};
-  if (!upstream.ok || payload.error) {
-    return {
-      response: json(
-        { ok: false, error: payload.error || "upstream_error", message: payload.message },
-        upstream.ok ? 502 : upstream.status,
-      ),
-    };
-  }
-  return { payload };
 }
 
 function jsonContentType(header) {
@@ -2786,92 +2883,6 @@ export async function handleFetch(request, env, deps = {}) {
       }
     }
 
-    if (path === "/signup" && request.method === "GET") {
-      trace.outcome = "ok";
-      const accept = request.headers.get("accept") || "";
-      const info = {
-        service: "aBot 邮箱申请",
-        steps: [
-          "向你的主人要一个邀请码（一小时有效，一次性）",
-          "想一个你想要的邮箱地址，必须是 xxx@abot.run 格式",
-          "POST https://mail.abot.run/signup 提交申请",
-          "提交后等待主人审核，通过后主人会把 secret 发给你",
-          "用邮箱 + secret 调 POST https://abot.run/oauth/token (grant_type=password) 换取 access_token",
-          "以后调 https://abot.run/mcp 时带 Authorization: Bearer <access_token>",
-        ],
-        request_format: {
-          invite_code: "inv_...（必填，主人给的）",
-          agent_name: "你的名字（必填）",
-          reason: "用途说明（必填）",
-          requested_email: "想要的邮箱，如 mybot@abot.run（选填）",
-        },
-        apply_url: "https://mail.abot.run/signup",
-      };
-      if (accept.includes("text/html")) {
-        return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>aBot 邮箱申请</title>
-<style>body{font-family:system-ui;max-width:640px;margin:40px auto;padding:20px;line-height:1.6}
-code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5;padding:12px;border-radius:8px;overflow:auto}</style>
-</head><body><h2>aBot 邮箱申请</h2>
-<ol>${info.steps.map(s => `<li>${s}</li>`).join("")}</ol>
-<h3>申请格式</h3><pre>${JSON.stringify(info.request_format, null, 2)}</pre>
-<p>提交地址：<code>POST ${info.apply_url}</code></p></body></html>`,
-          { headers: { "Content-Type": "text/html;charset=utf-8" } });
-      }
-      return json(info);
-    }
-
-    // 提交邮箱申请（POST /signup 或 POST /provision/request）。邀请码和申请表都在 abot-gateway。
-    if ((path === "/signup" || path === "/provision/request") && request.method === "POST") {
-      trace.outcome = "ok";
-      let body;
-      try {
-        body = await request.json();
-      } catch {
-        body = {};
-      }
-      if (!body || typeof body !== "object") body = {};
-      const inviteCode = (typeof body.invite_code === "string" ? body.invite_code : "").trim();
-      if (!inviteCode) {
-        return json({ ok: false, error: "invite_code_required", message: "需要邀请码" }, 400);
-      }
-      const requestedEmail = (typeof body.requested_email === "string" ? body.requested_email : "").trim().toLowerCase() || null;
-      if (requestedEmail) {
-        if (!requestedEmail.endsWith("@abot.run") || requestedEmail.length < 11) {
-          return json({ ok: false, error: "invalid_email", message: "邮箱必须是 xxx@abot.run 格式" }, 400);
-        }
-        if (!/^[a-z0-9._-]+@abot\.run$/.test(requestedEmail)) {
-          return json({ ok: false, error: "invalid_email", message: "邮箱只能含小写字母、数字、._-" }, 400);
-        }
-      }
-      const forwarded = await gatewayProvision(env, trace, "https://abot-gateway/provision/request", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          invite_code: inviteCode,
-          agent_name: body.agent_name,
-          reason: body.reason,
-          requested_email: requestedEmail,
-        }),
-      });
-      if (forwarded.response) return forwarded.response;
-      const payload = forwarded.payload;
-      return json({ ok: true, id: payload.id, status: payload.status || "pending", message: payload.message || "等待人工审核" });
-    }
-
-    if (path === "/provision/status" && request.method === "GET") {
-      trace.outcome = "ok";
-      const id = url.searchParams.get("id") || "";
-      const forwarded = await gatewayProvision(
-        env,
-        trace,
-        "https://abot-gateway/provision/status?id=" + encodeURIComponent(id),
-        { method: "GET" },
-      );
-      if (forwarded.response) return forwarded.response;
-      const payload = forwarded.payload;
-      return json({ ok: true, id: payload.id, status: payload.status, email: payload.email || null });
-    }
-
     if (path === "/mcp") {
       if (url.hostname !== INTERNAL_MCP_HOST) {
         trace.outcome = "rejected";
@@ -2895,25 +2906,20 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
       }
       // 限流和这次读取共用一个 primary session，避免修订号和结果来自不同副本。
       const db = d1Deps(env);
-      const rateKey = ownerEmail ? "mcp:" + ownerEmail : "mcp:ip:" + (request.headers.get("CF-Connecting-IP") || "unknown");
-      const minute = Math.floor(Date.now() / 60000);
+      const minute = Math.floor((deps.nowMs ?? Date.now()) / 60_000);
+      let callsThisMinute = 0;
       try {
-        await db.queryRun("CREATE TABLE IF NOT EXISTS rate_limits (k TEXT PRIMARY KEY, window INTEGER, count INTEGER)", []);
-        const row = await db.queryFirst("SELECT window, count FROM rate_limits WHERE k=?", [rateKey + ":" + minute]);
-        const count = row && row.window === minute ? row.count : 0;
-        if (count >= 100) {
-          trace.outcome = "rate_limited";
-          return json({ ok: false, error: "rate_limited", message: "每分钟最多100次" }, 429);
-        }
-        if (row && row.window === minute) {
-          await db.queryRun("UPDATE rate_limits SET count=count+1 WHERE k=?", [rateKey + ":" + minute]);
-        } else {
-          await db.queryRun("INSERT OR REPLACE INTO rate_limits (k, window, count) VALUES (?,?,1)", [rateKey + ":" + minute, minute]);
-        }
-        // 清理旧窗口（顺手）
-        await db.queryRun("DELETE FROM rate_limits WHERE window < ?", [minute - 2]);
-      } catch (e) {
-        // 限流失败不挡请求，记日志
+        callsThisMinute = await bumpCounter(db, `mcp:${ownerEmail}:${minute}`, minute + 1, 1, minute);
+      } catch {
+        // Fails open: the in-isolate limiter above still applies.
+      }
+      if (callsThisMinute > MCP_D1_RATE_LIMIT) {
+        trace.outcome = "rate_limited";
+        return json(
+          { ok: false, error: "rate_limited", message: `每分钟最多${MCP_D1_RATE_LIMIT}次` },
+          429,
+          { "retry-after": String(60 - Math.floor(((deps.nowMs ?? Date.now()) % 60_000) / 1000)) },
+        );
       }
       if (!jsonContentType(request.headers.get("content-type"))) {
         trace.outcome = "rejected";

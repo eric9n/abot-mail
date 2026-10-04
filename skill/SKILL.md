@@ -1,7 +1,7 @@
 ---
 name: abot-mail
 description: >-
-  Read the abot-mail archive over its Cloudflare Worker MCP endpoint.
+  Read the abot-mail archive over the abot-gateway MCP endpoint (https://abot.run/mcp).
   Use when searching, listing, fetching, or counting archived Resend mail
   (search_emails, get_email, list_emails, email_stats). Read-only: there is
   no send tool. Prefer skill/mcp_cli.py; GET /health is unauthenticated counts only.
@@ -15,9 +15,11 @@ abot-mail 是已经归档的 Resend 邮件的只读查询入口。Webhook 进 Cl
 
 服务不发送、不删除、不改邮件。工具只有四个：`search_emails`、`get_email`、`list_emails`、`email_stats`。不要发明发送、回复、转发或写库工具。
 
-生产端点（新安装的账号换成自己的 Worker 地址，见 `docs/install.md`）：
+生产端点是 abot-gateway：
 
-`POST https://resend-agent-mail-relay.eric9n-cf.workers.dev/mcp`
+`POST https://abot.run/mcp`
+
+Worker 自己的 `/mcp` 只接受网关的 Service Binding 调用，`mail.abot.run/mcp` 对公网一律 404（边缘 WAF 也拦截）。不要直连 Worker。
 
 传输是 Streamable HTTP，一次一个 JSON-RPC 2.0 请求，响应是普通 JSON（不是必须走 SSE）。`initialize` 的 `protocolVersion` 固定为 `2025-06-18`。`notifications/initialized` 返回 HTTP 202 和空 body。
 
@@ -32,12 +34,12 @@ abot-mail 是已经归档的 Resend 邮件的只读查询入口。Webhook 进 Cl
 | `list` | `tools/call` `list_emails` |
 | `stats` | `tools/call` `email_stats` |
 | `tools` | `tools/list` |
-| `health` | 不走 MCP。`GET /health`，不带 token |
+| `health` | 不走 MCP。`GET https://mail.abot.run/health`（可用 `MAIL_HEALTH_URL` 覆盖），不带 token |
 
 ```bash
-export MCP_TOKEN="<MCP_TOKEN>"
-# 可选。默认是上面的生产 origin。写成带 /mcp 或 /health 的 URL 也会被去掉后缀。
-export MCP_URL="https://resend-agent-mail-relay.eric9n-cf.workers.dev"
+export MCP_TOKEN="<网关 access token>"
+# 可选。默认 https://abot.run。写成带 /mcp 的 URL 也会被去掉后缀。
+export MCP_URL="https://abot.run"
 
 python3 skill/mcp_cli.py health
 python3 skill/mcp_cli.py tools
@@ -61,7 +63,7 @@ python3 skill/mcp_cli.py stats --fresh
 
 ## Auth
 
-`POST /mcp` 需要 `Authorization: Bearer <MCP_TOKEN>`。token 不对返回 401，并且发生在读邮件之前。同一路径另接受 Worker secret `INTERNAL_TOKEN` 对应的 `X-Internal-Token`；agent 继续用 Bearer，不要把 `INTERNAL_TOKEN` 写进仓库或回复。每个凭证在单个 isolate 里每分钟最多 120 次，超出返回 429。
+`POST https://abot.run/mcp` 需要 `Authorization: Bearer <MCP_TOKEN>`，这里的 `MCP_TOKEN` 是 abot-gateway 发给邮箱的 access token。网关用它认出邮箱，删掉 `Authorization` 后经 Service Binding 调 Worker，并带上 `x-abot-owner-email`；Worker 只返回这个邮箱收到（To/Cc）或从这个邮箱发出的邮件。每个邮箱每分钟最多 100 次，超出返回 429。
 
 `mcp_cli.py` 的 token 顺序：
 
@@ -77,7 +79,7 @@ Cursor / Claude Code 的 MCP 配置：
 {
   "mcpServers": {
     "abot-mail": {
-      "url": "https://resend-agent-mail-relay.eric9n-cf.workers.dev/mcp",
+      "url": "https://abot.run/mcp",
       "headers": { "Authorization": "Bearer <MCP_TOKEN>" }
     }
   }
@@ -96,5 +98,5 @@ Cursor / Claude Code 的 MCP 配置：
 - `list_emails` 按 `date` 倒序。可选 `limit`、`direction`（`in` 或 `out`）、`since`、`include_summary`、`fresh`。没有 cursor。
 - `email_stats` 的形状是 `{total, by_direction:{in,out}, by_day:[{day,count}], top_senders:[{from,count}]}`。`by_day` 是近 30 天有邮件的日期，`top_senders` 最多 10 条。可选 `fresh`。
 - `limit` 默认 20，最大 100。`fresh: true` 跳过读缓存，重新读归档。
-- 不要把 `MCP_TOKEN`、`INTERNAL_TOKEN`、`WEBHOOK_SECRET`、`RESEND_API_KEY` 写进仓库、日志或最终回复。
+- 不要把 `MCP_TOKEN`、`WEBHOOK_SECRET`、`RESEND_API_KEY` 写进仓库、日志或最终回复。
 - 归档是异步的：webhook 只入队。刚发出的信要过一会儿再用 `search --fresh` 查。查不到先看 `health` 的 `count_24h`，不要改 Worker。

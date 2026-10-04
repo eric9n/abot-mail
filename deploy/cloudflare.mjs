@@ -20,7 +20,6 @@ export const PRODUCTION = {
   bucket: "abot-mail-archive",
   queue: "mail-ingest",
   dlq: "mail-ingest-dlq",
-  gateway: "abot-gateway",
 };
 
 export class DeployError extends Error {}
@@ -103,12 +102,6 @@ export function productionConfigProblems(toml) {
   expect(
     r2.length === 1 && value(r2[0], "binding") === "ARCHIVE_BUCKET" && value(r2[0], "bucket_name") === PRODUCTION.bucket,
     `R2 binding ARCHIVE_BUCKET must be ${PRODUCTION.bucket}`,
-  );
-
-  const services = tables(top, "services");
-  expect(
-    services.some((s) => value(s, "binding") === "GATEWAY" && value(s, "service") === PRODUCTION.gateway),
-    `service binding GATEWAY -> ${PRODUCTION.gateway} is required by /signup`,
   );
 
   const producers = tables(top, "queues.producers");

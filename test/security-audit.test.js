@@ -10,6 +10,7 @@ import {
   handleFetch,
   likeContains,
   buildGetQuery,
+  bumpCounter,
 } from "../worker/worker.js";
 
 const OWNER_A = "a@abot.run";
@@ -184,6 +185,113 @@ test("send_email 发件人恒为绑定邮箱，无绑定时报错", async () => 
   }
 });
 
+async function withResend(fn) {
+  const seen = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    seen.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({ id: `em_${seen.length}` }), { status: 200 });
+  };
+  try {
+    await fn(seen);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+}
+
+test("send_email 校验收件人、主题和正文，非法输入不会发出", async () => {
+  await withResend(async (seen) => {
+    const { deps } = makeDeps(OWNER_A);
+    deps.env = { RESEND_API_KEY: "re_test" };
+    const send = (args) => handleMcpRpc(toolMessage(1, "send_email", { subject: "s", body: "b", ...args }), deps);
+    const many = Array.from({ length: 11 }, (_, i) => `u${i}@example.com`).join(",");
+    for (const to of [
+      "not-an-address",
+      "a@b",
+      "x@example.com\r\nBcc: victim@example.com",
+      "Evil <x@example.com>",
+      "x@example.com;y@example.com",
+      " , ",
+      many,
+      `${"a".repeat(250)}@example.com`,
+    ]) {
+      assert.equal(toolError(await send({ to })).code, -32602, to);
+    }
+    assert.equal(toolError(await send({ to: "x@example.com", subject: "a\r\nBcc: v@example.com" })).code, -32602);
+    assert.equal(toolError(await send({ to: "x@example.com", subject: "s".repeat(999) })).code, -32602);
+    assert.equal(toolError(await send({ to: "x@example.com", body: "b".repeat(100_001) })).code, -32602);
+    assert.equal(seen.length, 0);
+
+    const v = toolOk(await send({ to: "x@example.com, Y@example.com ,x@EXAMPLE.com" }));
+    assert.deepEqual(v.to, ["x@example.com", "Y@example.com"]);
+    assert.deepEqual(seen[0].to, ["x@example.com", "Y@example.com"]);
+  });
+});
+
+test("send_email 按收件人数计每小时配额，超额直接拒绝且不调用 Resend", async () => {
+  await withResend(async (seen) => {
+    const { db, deps } = makeDeps(OWNER_A);
+    deps.env = { RESEND_API_KEY: "re_test", SEND_HOURLY_LIMIT: "3" };
+    deps.nowMs = Date.UTC(2026, 9, 4, 10, 15);
+    const send = (to) => handleMcpRpc(toolMessage(1, "send_email", { to, subject: "s", body: "b" }), deps);
+    toolOk(await send("a@example.com, b@example.com"));
+    const over = toolError(await send("c@example.com, d@example.com"));
+    assert.equal(over.code, -32003);
+    assert.match(over.message, /3 recipients per hour/);
+    toolOk(await send("c@example.com"));
+    assert.equal(toolError(await send("e@example.com")).code, -32003);
+    assert.equal(seen.length, 2);
+
+    const other = { ...deps, ownerEmail: OWNER_B };
+    toolOk(await handleMcpRpc(toolMessage(2, "send_email", { to: "z@example.com", subject: "s", body: "b" }), other));
+
+    deps.nowMs += 3_600_000;
+    toolOk(await send("e@example.com"));
+    const hour = Math.floor(deps.nowMs / 3_600_000);
+    const keys = db.prepare("SELECT k FROM rate_limits ORDER BY k").all().map((row) => row.k);
+    assert.deepEqual(keys, [`send:${OWNER_A}:${hour}`], "过期窗口在新窗口创建时被清理");
+  });
+});
+
+test("Resend 拒收时退回配额", async () => {
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ message: "domain not verified" }), { status: 403 });
+  try {
+    const { db, deps } = makeDeps(OWNER_A);
+    deps.env = { RESEND_API_KEY: "re_test" };
+    const err = toolError(await handleMcpRpc(toolMessage(1, "send_email", { to: "a@example.com, b@example.com", subject: "s", body: "b" }), deps));
+    assert.equal(err.code, -32603);
+    assert.match(err.message, /HTTP 403.*domain not verified/);
+    assert.equal(db.prepare("SELECT count FROM rate_limits").get().count, 0);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("send_email 配额表缺失时自动建表，配额存储不可用时拒绝发送", async () => {
+  await withResend(async (seen) => {
+    const { db, deps } = makeDeps(OWNER_A);
+    deps.env = { RESEND_API_KEY: "re_test" };
+    db.exec("DROP TABLE rate_limits");
+    toolOk(await handleMcpRpc(toolMessage(1, "send_email", { to: "x@example.com", subject: "s", body: "b" }), deps));
+    assert.equal(db.prepare("SELECT count FROM rate_limits").get().count, 1);
+
+    deps.queryFirst = async () => {
+      throw new Error("D1_ERROR: database unavailable");
+    };
+    const rpc = await handleMcpRpc(toolMessage(2, "send_email", { to: "x@example.com", subject: "s", body: "b" }), deps);
+    assert.equal(toolError(rpc).code, -32603);
+    assert.equal(seen.length, 1);
+  });
+});
+
+test("bumpCounter 原子累加，同一 key 并发也不丢计数", async () => {
+  const { db, deps } = makeDeps(OWNER_A);
+  const counts = await Promise.all(Array.from({ length: 20 }, () => bumpCounter(deps, "k", 10, 1, 5)));
+  assert.deepEqual([...counts].sort((a, b) => a - b), Array.from({ length: 20 }, (_, i) => i + 1));
+  assert.equal(db.prepare("SELECT count FROM rate_limits WHERE k='k'").get().count, 20);
+});
+
 // ---------- 4. ownerEmail LIKE 通配符转义 ----------
 
 test("ownerEmail 中的 LIKE 通配符被转义", () => {
@@ -271,78 +379,64 @@ test("/mcp 只接受 Service Binding 的内部 host，公网 host 带 owner 也�
   assert.equal(internal.status, 200);
 });
 
-function gatewayEnv(handler) {
-  const calls = [];
-  return {
-    calls,
-    env: {
-      GATEWAY: {
-        async fetch(url, init) {
-          calls.push({ url, init });
-          return handler(url, init);
-        },
-      },
-    },
-  };
+test("/mcp 每邮箱每分钟最多 100 次（D1 计数），其他邮箱不受影响", async () => {
+  const env = { ...mcpEnv(), MCP_RATE_LIMIT: "1000" };
+  const nowMs = Date.UTC(2026, 9, 4, 10, 15, 30);
+  const statuses = [];
+  for (let i = 0; i < 101; i++) {
+    statuses.push((await handleFetch(mcpPost({ "x-abot-owner-email": "rl-a@abot.run" }), env, { nowMs })).status);
+  }
+  assert.ok(statuses.slice(0, 100).every((s) => s === 200));
+  assert.equal(statuses[100], 429);
+  const other = await handleFetch(mcpPost({ "x-abot-owner-email": "rl-b@abot.run" }), env, { nowMs });
+  assert.equal(other.status, 200);
+  const nextMinute = await handleFetch(mcpPost({ "x-abot-owner-email": "rl-a@abot.run" }), env, { nowMs: nowMs + 60_000 });
+  assert.equal(nextMinute.status, 200);
+});
+
+function seedRow(db, { resendId, direction, from, to = [], cc = [] }) {
+  db.prepare(
+    `INSERT INTO emails (resend_id, direction, msg_from, msg_to, cc, subject, date, text_body, attachments)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+  ).run(resendId, direction, from, JSON.stringify(to), JSON.stringify(cc), "owned", "2026-10-02T10:00:00Z", "body", "[]");
 }
 
-test("/signup 转发到 abot-gateway，不在本 Worker 建表或核对邀请码", async () => {
-  const { env, calls } = gatewayEnv(() => Response.json({ id: "prov_1", status: "pending" }));
-  const r = await handleFetch(
-    new Request("https://mail.abot.run/signup", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ invite_code: " inv_x ", agent_name: "bot", reason: "r", requested_email: "Bot@abot.run" }),
-    }),
-    env,
-  );
-  assert.equal(r.status, 200);
-  assert.deepEqual(await r.json(), { ok: true, id: "prov_1", status: "pending", message: "等待人工审核" });
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, "https://abot-gateway/provision/request");
-  assert.deepEqual(JSON.parse(calls[0].init.body), {
-    invite_code: "inv_x",
-    agent_name: "bot",
-    reason: "r",
-    requested_email: "bot@abot.run",
-  });
+async function visibleIds(deps) {
+  const rows = toolOk(await handleMcpRpc(toolMessage(1, "search_emails", { query: "owned", fresh: true }), deps));
+  return rows.map((row) => row.resend_id).sort();
+}
+
+test("收件的 From 头不能把邮件归到被冒充的邮箱", async () => {
+  const { db, deps } = makeDeps(OWNER_A);
+  seedRow(db, { resendId: "spoof", direction: "in", from: OWNER_A, to: ["victim@example.com"] });
+  seedRow(db, { resendId: "spoof-named", direction: "in", from: `Boss <${OWNER_A}>`, to: [OWNER_B] });
+  seedRow(db, { resendId: "sent", direction: "out", from: OWNER_A, to: ["x@example.com"] });
+  assert.deepEqual(await visibleIds(deps), ["sent"]);
+  for (const id of ["spoof", "spoof-named"]) {
+    const got = toolOk(await handleMcpRpc(toolMessage(2, "get_email", { resend_id: id, fresh: true }), deps));
+    assert.equal(got.found, false, id);
+    const del = await handleMcpRpc(toolMessage(3, "delete_email", { resend_id: id }), deps);
+    assert.equal(toolError(del).code, -32602, id);
+  }
+  const stats = toolOk(await handleMcpRpc(toolMessage(4, "email_stats", { fresh: true }), deps));
+  assert.equal(stats.total, 1);
+  const { deps: depsB } = makeDeps(OWNER_B);
+  depsB.queryAll = deps.queryAll;
+  depsB.queryFirst = deps.queryFirst;
+  assert.deepEqual(await visibleIds(depsB), ["spoof-named"]);
 });
 
-test("/signup 本地拒绝缺邀请码和非法邮箱，网关错误原样带回状态码", async () => {
-  const { env, calls } = gatewayEnv(() => Response.json({ error: "invite_code_used" }, { status: 403 }));
-  const post = (body) =>
-    handleFetch(
-      new Request("https://mail.abot.run/signup", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      }),
-      env,
-    );
-  assert.equal((await post({})).status, 400);
-  assert.equal((await post({ invite_code: "inv", requested_email: "x@evil.com" })).status, 400);
-  assert.equal(calls.length, 0);
-  const used = await post({ invite_code: "inv" });
-  assert.equal(used.status, 403);
-  assert.equal((await used.json()).error, "invite_code_used");
-  const missing = await handleFetch(
-    new Request("https://mail.abot.run/signup", { method: "POST", body: JSON.stringify({ invite_code: "inv" }) }),
-    {},
-  );
-  assert.equal(missing.status, 500);
-  assert.equal((await missing.json()).error, "gateway_binding_missing");
-});
-
-test("/provision/status 转发到 abot-gateway 并返回状态", async () => {
-  const { env, calls } = gatewayEnv((url) =>
-    url.endsWith("id=prov_1")
-      ? Response.json({ id: "prov_1", status: "approved", email: "bot@abot.run" })
-      : Response.json({ error: "not_found" }, { status: 404 }),
-  );
-  const ok = await handleFetch(new Request("https://mail.abot.run/provision/status?id=prov_1"), env);
-  assert.equal(ok.status, 200);
-  assert.deepEqual(await ok.json(), { ok: true, id: "prov_1", status: "approved", email: "bot@abot.run" });
-  const missing = await handleFetch(new Request("https://mail.abot.run/provision/status?id=a%26b"), env);
-  assert.equal(missing.status, 404);
-  assert.equal(calls[1].url, "https://abot-gateway/provision/status?id=a%26b");
+test("带显示名、抄送、大小写不同的地址都算本人，下划线按字面量匹配", async () => {
+  const owner = "my_bot@abot.run";
+  const { db, deps } = makeDeps(owner);
+  seedRow(db, { resendId: "named-to", direction: "in", from: "x@example.com", to: ["My Bot <My_Bot@abot.run>"] });
+  seedRow(db, { resendId: "cc", direction: "in", from: "x@example.com", to: ["y@example.com"], cc: [owner] });
+  seedRow(db, { resendId: "named-from", direction: "out", from: `My Bot <${owner}>`, to: ["z@example.com"] });
+  seedRow(db, { resendId: "wildcard", direction: "in", from: "x@example.com", to: ["myxbot@abot.run"] });
+  seedRow(db, { resendId: "suffix", direction: "in", from: "x@example.com", to: ["amy_bot@abot.run"] });
+  assert.deepEqual(await visibleIds(deps), ["cc", "named-from", "named-to"]);
+  for (const id of ["cc", "named-from", "named-to"]) {
+    const got = toolOk(await handleMcpRpc(toolMessage(2, "get_email", { resend_id: id, fresh: true }), deps));
+    assert.equal(got.found, true, id);
+  }
 });

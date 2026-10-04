@@ -29,7 +29,7 @@ D1 binding 名是 `DB`。密钥只放在 Worker secrets 里：`WEBHOOK_SECRET`�
 Workers Builds 先 `npm clean-install`（`package-lock.json` 锁住 `wrangler` 版本），然后执行构建命令和部署命令：
 
 - `npm run gate`：语法检查加全部单元测试，任何一项失败都不会部署。
-- `node deploy/cloudflare.mjs build`：核对 `worker/wrangler.toml` 的默认环境仍是生产配置（Worker 名、`mail.abot.run/*` 路由、`workers_dev = false`、生产 D1 id、R2、`GATEWAY` service binding、`mail-ingest` / `mail-ingest-dlq` 队列、没有 `[vars]`），再用 `wrangler deploy --dry-run` 打包。
+- `node deploy/cloudflare.mjs build`：核对 `worker/wrangler.toml` 的默认环境仍是生产配置（Worker 名、`mail.abot.run/*` 路由、`workers_dev = false`、生产 D1 id、R2、`mail-ingest` / `mail-ingest-dlq` 队列、没有 `[vars]`），再用 `wrangler deploy --dry-run` 打包。
 - `node deploy/cloudflare.mjs deploy`：只在 `WORKERS_CI_BRANCH=main` 时执行 `wrangler deploy`，版本信息里写入 build uuid 和 commit。
 
 两个子命令都要求 `WORKERS_CI=1`（Workers Builds 自动注入）。在本地运行，包括 `npm run deploy`，会直接退出非零。`wrangler deploy` 不会删除已有 secret，所以 secret 继续在控制台维护。
@@ -71,10 +71,10 @@ ALTER TABLE emails ADD COLUMN is_archived INTEGER DEFAULT 0;
 | 方法 | 路径 | 鉴权 | 作用 |
 | --- | --- | --- | --- |
 | `POST` | `/` | Svix 签名 | 验签后入队 `mail-ingest` |
-| `POST` | `/mcp` | 只接受 host 为 `backend.internal` 的 Service Binding 调用，并且必须带 `x-abot-owner-email`。公网 host 一律 404 | MCP。每个邮箱每分钟 120 次（只计当前 isolate） |
+| `POST` | `/mcp` | 只接受 host 为 `backend.internal` 的 Service Binding 调用，并且必须带 `x-abot-owner-email`。公网 host 一律 404 | MCP。每个邮箱每分钟 100 次（D1 原子计数，跨 isolate） |
 | `GET` | `/health` | 无 | `{"ok":true,"last_received_at":"...","count_24h":N}` |
-| `GET` / `POST` | `/signup`、`/provision/request` | 邀请码 | 申请说明；提交时经 `GATEWAY` 转发到 `abot-gateway` |
-| `GET` | `/provision/status?id=` | 无 | 经 `GATEWAY` 转发到 `abot-gateway` 查申请状态 |
+
+邮箱申请在 `abot-gateway`（`https://abot.run/signup`），这个 Worker 不提供。
 
 `/health` 只返回最近一封收件的入库时间和过去 24 小时的归档条数。响应字段只有 `ok`、`last_received_at`、`count_24h`。Svix 时间戳偏离超过 5 分钟或签名对不上回 401，`/mcp` 缺 owner 回 401，都发生在读取业务数据之前。
 
@@ -94,6 +94,10 @@ Streamable HTTP，单次 JSON-RPC 2.0，响应是普通 JSON。`initialize` 固�
 | `email_stats` | `{total, by_direction:{in,out}, by_day:[{day,count}], top_senders:[{from,count}]}`。`by_day` 是近 30 天有邮件的日期，`top_senders` 最多 10 条。 |
 
 `YYYY-MM-DD` 会扩成当天的 UTC 起止。`%` 和 `_` 按字面量匹配。
+
+邮箱只看得到收件人（To/Cc）里有自己的邮件，以及自己发出的邮件（`direction = 'out'` 且发件人是自己）。收件的 From 头可以伪造，所以不算归属。
+
+`send_email` 的发件人恒为绑定邮箱。`to` 最多 10 个逗号分隔的地址，主题一行且不超过 998 个字符，正文不超过 100000 个字符。每个邮箱每个整点小时最多发给 50 个收件人（Worker 变量 `SEND_HOURLY_LIMIT` 可改），计数在 D1 的 `rate_limits` 表里；超出返回 JSON-RPC `-32003`，计数存储不可用时拒绝发送，被拒或 Resend 拒收的那次不计入。
 
 ## CLI
 
@@ -119,8 +123,8 @@ python3 skill/mail_archive.py get 435eb30a-d52d-4f7c-a400-ccac381b7cc4 --include
 
 | 路径 | 作用 |
 | --- | --- |
-| `skill/SKILL.md` | 何时使用、MCP 端点、Bearer 鉴权、只读规则 |
-| `skill/mcp_cli.py` | 调 Worker `POST /mcp`。子命令 `search` / `get` / `list` / `stats` 对应四个工具，另有 `tools` 和免鉴权的 `health` |
+| `skill/SKILL.md` | 何时使用、网关 MCP 端点、网关 access token 鉴权、只读规则 |
+| `skill/mcp_cli.py` | 调网关 `POST https://abot.run/mcp`。子命令 `search` / `get` / `list` / `stats` 对应四个工具，另有 `tools` 和免鉴权的 `health` |
 | `skill/references/tools.md` | 四个工具的参数表，与 Worker 的 `TOOLS` 一致 |
 | `skill/mail_archive.py` | 不经过 Worker，直接查 D1。读不到 R2 上的 `.eml` 字节 |
 
@@ -129,7 +133,7 @@ python3 skill/mail_archive.py get 435eb30a-d52d-4f7c-a400-ccac381b7cc4 --include
 `npm test` 用 `node --test` 覆盖三块纯逻辑，并用内存 SQLite 执行 `schema.sql` 和同一套 SQL：
 
 - Svix：合法签名、伪造签名、多签名里有一个合法、改过的 body、超过 5 分钟的时间戳
-- JSON-RPC：`initialize`、`tools/list`、`tools/call`、未知方法、缺参数、未知工具；HTTP 层在解析 JSON 之前拒绝错误的 Bearer
+- JSON-RPC：`initialize`、`tools/list`、`tools/call`、未知方法、缺参数、未知工具；公网 host 的 `/mcp` 和缺 `x-abot-owner-email` 的请求在解析 JSON 之前被拒绝；`send_email` 的收件人校验和每小时配额
 - SQL 构造器：占位符、`LIKE` 转义、limit 上限，以及插入 / 搜索 / 读取 / 统计能在 schema 上跑通
 
 这里没有 Cloudflare token，也没有对 Resend 或线上 D1/R2 发请求。部署完成后在你自己的环境核对：

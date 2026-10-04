@@ -43,7 +43,6 @@ test("the checked-in wrangler.toml is the production config", () => {
 
 test("production config check catches drift that would break the live worker", () => {
   const cases = [
-    [TOML.replace('binding = "GATEWAY"', 'binding = "GW"'), /GATEWAY/],
     [TOML.replace("workers_dev = false", "workers_dev = true"), /workers_dev/],
     [TOML.replace('pattern = "mail.abot.run/*"', 'pattern = "x.abot.run/*"'), /route/],
     [TOML.replace("779058bf-f5c1-44de-b2c8-99350ec7748e", "00000000-0000-4000-8000-000000000000"), /D1/],

@@ -1,7 +1,11 @@
 /**
  * Live gate against a deployed archive worker.
- * Reads WORKER_URL, WEBHOOK_SECRET, MCP_TOKEN, TEST_EMAIL_ID.
+ * Reads WORKER_URL, MCP_URL, WEBHOOK_SECRET, MCP_TOKEN, TEST_EMAIL_ID.
  * Missing variables fail the process; they never count as a pass.
+ *
+ * The worker's own /mcp only answers Service Binding calls, so MCP goes through
+ * the gateway: MCP_URL is the gateway's mail MCP endpoint and MCP_TOKEN is that
+ * gateway's access token for a mailbox that received TEST_EMAIL_ID.
  *
  * The only write is an idempotent archive of TEST_EMAIL_ID. Point WORKER_URL
  * at the staging worker so this does not touch the production D1 database.
@@ -13,7 +17,7 @@ import { createHmac, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-const REQUIRED_ENV = ["WORKER_URL", "WEBHOOK_SECRET", "MCP_TOKEN", "TEST_EMAIL_ID"];
+const REQUIRED_ENV = ["WORKER_URL", "MCP_URL", "WEBHOOK_SECRET", "MCP_TOKEN", "TEST_EMAIL_ID"];
 
 export function signSvix({ secret, svixId, timestamp, body }) {
   if (typeof secret !== "string" || !secret.startsWith("whsec_")) {
@@ -82,7 +86,7 @@ export async function main() {
   const missing = missingEnv();
   if (missing.length) {
     console.error(`e2e: missing required environment variable(s): ${missing.join(", ")}`);
-    console.error("Required: WORKER_URL, WEBHOOK_SECRET (whsec_…), MCP_TOKEN, TEST_EMAIL_ID (an existing Resend received email id).");
+    console.error("Required: WORKER_URL, MCP_URL (gateway mail MCP endpoint), WEBHOOK_SECRET (whsec_…), MCP_TOKEN (gateway access token), TEST_EMAIL_ID (an existing Resend received email id).");
     console.error("Refusing to pass without them.");
     return 1;
   }
@@ -92,16 +96,19 @@ export async function main() {
   const mcpToken = process.env.MCP_TOKEN.trim();
   const emailId = process.env.TEST_EMAIL_ID.trim();
 
-  let parsedUrl;
-  try {
-    parsedUrl = new URL(workerUrl);
-  } catch {
-    console.error(`e2e: WORKER_URL is not a URL: ${workerUrl}`);
-    return 1;
-  }
-  if (parsedUrl.protocol !== "https:" && parsedUrl.protocol !== "http:") {
-    console.error("e2e: WORKER_URL must be http or https");
-    return 1;
+  const mcpUrl = process.env.MCP_URL.trim();
+  for (const [key, value] of [["WORKER_URL", workerUrl], ["MCP_URL", mcpUrl]]) {
+    let parsed;
+    try {
+      parsed = new URL(value);
+    } catch {
+      console.error(`e2e: ${key} is not a URL: ${value}`);
+      return 1;
+    }
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      console.error(`e2e: ${key} must be http or https`);
+      return 1;
+    }
   }
   if (!webhookSecret.startsWith("whsec_")) {
     console.error("e2e: WEBHOOK_SECRET must start with whsec_");
@@ -113,7 +120,7 @@ export async function main() {
   }
 
   const root = endpoint(workerUrl, "/");
-  const mcpUrl = endpoint(workerUrl, "/mcp");
+  const directMcpUrl = endpoint(workerUrl, "/mcp");
   const healthUrl = endpoint(workerUrl, "/health");
   const ctx = { email: null, totalAfterArchive: null, delivery: null };
   const results = [];
@@ -210,7 +217,13 @@ export async function main() {
     headers: signedHeaders(`e2e-${randomUUID()}`, freshTs, eventBody),
   };
 
-  await runCase("d", "MCP without a token and with a wrong token returns 401", async () => {
+  await runCase("d", "worker /mcp is closed to public callers; gateway MCP rejects a missing or wrong token", async () => {
+    const direct = await request(directMcpUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-abot-owner-email": "e2e-probe@abot.run" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: "e2e", method: "tools/list" }),
+    });
+    assertHttp(direct, 404, "worker /mcp with a forged x-abot-owner-email");
     const absent = await mcp(null, "tools/call", { name: "get_email", arguments: { resend_id: emailId } }, { allowError: true });
     assertHttp(absent, 401, "MCP with no Authorization header");
     const wrong = await mcp("incorrect-mcp-token", "tools/call", { name: "get_email", arguments: { resend_id: emailId } }, { allowError: true });
