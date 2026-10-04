@@ -1,79 +1,38 @@
 # 质量门禁
 
-归档 Worker 的变更按下面五段走。任一段失败，修好之后从 Stage 1 全量重跑，不从失败的那一段接着跑。
+归档 Worker 的变更按下面四段走。任一段失败，修好之后从 Stage 1 全量重跑，不从失败的那一段接着跑。
 
-本仓库是纯 JavaScript，没有 TypeScript，也没有 ESLint 配置。`npm run gate` 的静态检查是 `node --check`（`worker/worker.js`、`e2e/run.mjs`）和 `python3 -m py_compile`（`skill/mail_archive.py`），然后跑 `node --test`。`npm run e2e` 不在 gate 里，它要打已部署的 Worker。
+本仓库是纯 JavaScript，没有 TypeScript，也没有 ESLint 配置。`npm run gate` 的静态检查是 `node --check`（`worker/worker.js`、`e2e/run.mjs`、`deploy/cloudflare.mjs`）和 `python3 -m py_compile`（`skill/mail_archive.py`、`skill/mcp_cli.py`），然后跑 `node --test`。
 
 ## Stage 1 — `npm run gate`
 
 在仓库根目录执行：
 
 ```bash
+npm ci
 npm run gate
 ```
 
-通过条件：语法检查和全部单元测试退出码为 0。这里不访问 Resend，也不访问 Cloudflare。E2E 脚本在缺环境变量时会失败；这条由单元测试锁住，避免空环境被当成通过。
+通过条件：语法检查和全部单元测试退出码为 0。这里不访问 Resend，也不访问 Cloudflare。Workers Builds 的构建命令也是从这一步开始，所以本地不过，线上也不会部署。
 
-## Stage 2 — 部署到 staging Worker
+## Stage 2 — 人工复核 diff
 
-Staging 使用独立的 D1，不使用生产库 `779058bf-f5c1-44de-b2c8-99350ec7748e`。R2 也单独建桶，避免 `raw/{resend_id}.eml` 覆盖生产对象。队列用 `mail-ingest-staging`，死信用 `mail-ingest-staging-dlq`，不能消费生产的 `mail-ingest`。
+对照 `main` 看本次 diff。确认行为仍是：验签、按 Resend id 幂等入库、`/mcp` 只接受 `backend.internal` 且必须带 owner、`/health` 只有计数。确认 diff 里没有密钥，`worker/wrangler.toml` 默认环境仍指向生产资源（`deploy/cloudflare.mjs build` 会再核对一次）。
 
-在 `worker/` 目录。队列也要单独建，staging 用 `mail-ingest-staging`，不要把生产的 `mail-ingest` 绑到 staging Worker：
+## Stage 3 — 合入 main，由 Workers Builds 部署
 
-```bash
-npx wrangler d1 create abot-mail-archive-staging
-npx wrangler r2 bucket create abot-mail-archive-staging
-npx wrangler queues create mail-ingest-staging
-npx wrangler queues create mail-ingest-staging-dlq
-```
-
-`worker/wrangler.toml` 里已经有 `[env.staging]`：D1 `abot-mail-archive-staging`、R2 `abot-mail-archive-staging`、队列 `mail-ingest-staging` / `mail-ingest-staging-dlq`，binding 仍是 `DB`、`ARCHIVE_BUCKET`、`INGEST_QUEUE`。把 `wrangler d1 create` 打印的 database id 写进 staging 的 `database_id`（生产的 `779058bf-f5c1-44de-b2c8-99350ec7748e` 保持不动）。文件里的 `00000000-0000-4000-8000-000000000000` 是占位符，部署前必须换掉。
-
-然后只对 staging 建表、写 secrets、部署：
+合入 `main` 就是发布。Cloudflare 控制台里 `resend-agent-mail-relay` 的 Workers Builds 收到推送后执行：
 
 ```bash
-npx wrangler d1 execute abot-mail-archive-staging --remote --env staging --file=schema.sql
-npx wrangler secret put WEBHOOK_SECRET --env staging
-npx wrangler secret put RESEND_API_KEY --env staging
-npx wrangler secret put MCP_TOKEN --env staging
-npx wrangler deploy --env staging
+npm clean-install
+npm run gate && node deploy/cloudflare.mjs build   # 构建命令
+node deploy/cloudflare.mjs deploy                  # 部署命令
 ```
 
-`WEBHOOK_SECRET` 是这个 staging 端点在 Resend 里的 signing secret（`whsec_` 开头）。`TEST_EMAIL_ID` 用一封已经存在的收件 id，门禁脚本不会发信。
+在控制台的 Deployments / Builds 页看这次构建。失败时日志里会写明是测试、配置核对还是 `wrangler deploy` 出的错；修好后重新推送到 `main`，或在控制台点 Retry build。不要在本地补一次 `wrangler deploy`，`deploy/cloudflare.mjs` 在 Workers Builds 以外会拒绝运行。
 
-部署完成后记下 staging 的 workers.dev 地址，作为 Stage 3 的 `WORKER_URL`。
+回滚也在控制台做：Deployments 里选上一版 Rollback，然后在仓库里 revert 对应提交，让下一次构建和线上一致。
 
-## Stage 3 — `npm run e2e`
+## Stage 4 — 部署后核对
 
-回到仓库根目录，对 staging 打真实链路：
-
-```bash
-export WORKER_URL="https://resend-agent-mail-relay-staging.<account>.workers.dev"
-export WEBHOOK_SECRET="whsec_..."
-export MCP_TOKEN="..."
-export TEST_EMAIL_ID="<已存在的 Resend received email id>"
-npm run e2e
-```
-
-四个变量缺任何一个，脚本会在跑用例前退出非零，并写出缺哪些。用例覆盖：
-
-| 用例 | 期望 |
-| --- | --- |
-| a | 签名正确、时间戳新鲜的 `email.received` 很快返回 200 `{"ok":true,"queued":true}`（没有 `duplicate`）。脚本轮询 `get_email` 直到消费者写入；读到结构化字段，并且 `include_raw_eml` 能读到 R2 上的原文 |
-| b | 同一请求原样再投一次，仍返回 `queued: true`，不再要求 `duplicate: true`。轮询期间归档总数不变，正文不变 |
-| c | 伪造签名返回 401；时间戳早于 5 分钟且签名本身正确也返回 401；归档总数不变 |
-| d | `POST /mcp` 不带 token 返回 401；token 错误返回 401 |
-| e | 正确 token 下 `search_emails` 能搜到 (a) 的邮件，`get_email` 能读到正文 |
-| f | `/health` 和未鉴权的 webhook / MCP 响应都不含正文 |
-
-脚本对 `TEST_EMAIL_ID` 做一次幂等写入。`WORKER_URL` 必须指向 Stage 2 的 staging Worker。全部通过则退出码 0；任一失败打印 `FAIL` 和用例说明，退出码非零。
-
-## Stage 4 — 人工复核 diff
-
-对照 `main` 看本次 diff。确认行为仍是：验签、按 Resend id 幂等入库、MCP 鉴权、`/health` 只有计数。确认 diff 里没有密钥、没有把 staging 的 database id 写进生产 binding、没有把 `WORKER_URL` 指到生产 Worker。
-
-## Stage 5 — 合入 main
-
-Stage 1 到 Stage 4 都通过之后，把分支合入 `main`。合入之后的生产部署仍用 `worker/wrangler.toml` 的默认环境：Worker 名 `resend-agent-mail-relay`，D1 `abot-mail-archive`（`779058bf-f5c1-44de-b2c8-99350ec7748e`）。不要把 staging 库或 staging secret 配到生产。
-
-任一环节失败，修复后从 Stage 1 全量重跑。
+按 README「测试与部署后核对」逐条做。`npm run e2e` 直接打 `WORKER_URL/mcp`，而 `/mcp` 已经只接受 Service Binding，所以这个脚本现在只有 webhook 和 `/health` 的用例有意义，MCP 用例要经网关验证。

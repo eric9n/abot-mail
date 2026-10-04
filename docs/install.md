@@ -4,6 +4,8 @@
 
 账号、域名、密钥全部用尖括号占位符。文末「参考值」是**本仓库当前生产部署的例子**，用来对照名字，不是让你把生产 id 填进新账号。
 
+> 这份 runbook 只用于在**另一个** Cloudflare 账号里从零搭一套。生产 Worker `resend-agent-mail-relay` 不按这里部署，它唯一的发布路径是 Cloudflare 控制台的 Workers Builds（见 README「部署」）。另外，`POST /mcp` 现在只接受 Service Binding 的内部 host `backend.internal`，从 workers.dev 或自定义域名直接调 `/mcp` 一律 404。下文用公网 URL 和 `MCP_TOKEN` 验证 MCP 的步骤已经不适用，需要通过一个带 Service Binding 的网关 Worker 来验证。
+
 不要改 Worker 的行为，不要加发送邮件的工具。服务是只读归档：Resend webhook → 验签 → 队列 → D1/R2 → `POST /mcp`。
 
 ## 前置条件

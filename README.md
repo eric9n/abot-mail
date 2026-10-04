@@ -8,58 +8,48 @@ Resend 的 `email.received` / `email.sent` webhook 进入 Cloudflare Worker `res
 
 | 资源 | 名称 | ID |
 | --- | --- | --- |
-| Worker | `resend-agent-mail-relay` | `https://resend-agent-mail-relay.eric9n-cf.workers.dev` |
+| Worker | `resend-agent-mail-relay` | 路由 `mail.abot.run/*`，workers.dev 关闭 |
 | D1 | `abot-mail-archive` | `779058bf-f5c1-44de-b2c8-99350ec7748e` |
 | R2 | `abot-mail-archive` | binding `ARCHIVE_BUCKET` |
 | Queue | `mail-ingest` | binding `INGEST_QUEUE`；死信 `mail-ingest-dlq` |
 
-D1 binding 名是 `DB`。密钥只放在 Worker secrets 里：`WEBHOOK_SECRET`、`RESEND_API_KEY`、`MCP_TOKEN`，以及可选的 `INTERNAL_TOKEN`（`POST /mcp` 的 `X-Internal-Token`）。四个都用 `wrangler secret put`，不要写进 `[vars]` 或仓库。
+D1 binding 名是 `DB`。密钥只放在 Worker secrets 里：`WEBHOOK_SECRET`、`RESEND_API_KEY`。用控制台或 `wrangler secret put` 写入，不要写进 `[vars]` 或仓库。`MCP_TOKEN`、`INTERNAL_TOKEN` 线上还在，但代码已经不读。
 
 ## 部署
 
-在仓库根目录先跑测试，再在 `worker/` 里部署。
+生产 Worker 只有一条发布路径：Cloudflare 控制台 → Workers & Pages → `resend-agent-mail-relay` → Settings → Build（Workers Builds）。它连接 Origin 仓库 `dagow/abot-mail`，`main` 有推送就构建并部署。不要在本地或别的 CI 里跑 `wrangler deploy`，也不要在控制台直接编辑或上传脚本。那样会和仓库漂移，下一次构建会把它覆盖。
 
-```bash
-npm test
-cd worker
-npx wrangler queues create mail-ingest
-npx wrangler queues create mail-ingest-dlq
-npx wrangler d1 execute abot-mail-archive --remote --file=schema.sql
-npx wrangler secret put WEBHOOK_SECRET
-npx wrangler secret put RESEND_API_KEY
-npx wrangler secret put MCP_TOKEN
-npx wrangler secret put INTERNAL_TOKEN
-npx wrangler deploy
+| 控制台设置 | 值 |
+| --- | --- |
+| Root directory | `/` |
+| Build command | `npm run gate && node deploy/cloudflare.mjs build` |
+| Deploy command | `node deploy/cloudflare.mjs deploy` |
+| Production branch | `main`（不开非生产分支构建） |
+
+Workers Builds 先 `npm clean-install`（`package-lock.json` 锁住 `wrangler` 版本），然后执行构建命令和部署命令：
+
+- `npm run gate`：语法检查加全部单元测试，任何一项失败都不会部署。
+- `node deploy/cloudflare.mjs build`：核对 `worker/wrangler.toml` 的默认环境仍是生产配置（Worker 名、`mail.abot.run/*` 路由、`workers_dev = false`、生产 D1 id、R2、`GATEWAY` service binding、`mail-ingest` / `mail-ingest-dlq` 队列、没有 `[vars]`），再用 `wrangler deploy --dry-run` 打包。
+- `node deploy/cloudflare.mjs deploy`：只在 `WORKERS_CI_BRANCH=main` 时执行 `wrangler deploy`，版本信息里写入 build uuid 和 commit。
+
+两个子命令都要求 `WORKERS_CI=1`（Workers Builds 自动注入）。在本地运行，包括 `npm run deploy`，会直接退出非零。`wrangler deploy` 不会删除已有 secret，所以 secret 继续在控制台维护。
+
+D1 表结构不在部署里改。读路径会自己补 `is_read` / `deleted_at` / `is_archived` 三列，补不上就从 SELECT 里拿掉，不会报错。需要手动补列时，在 D1 控制台对 `abot-mail-archive` 逐条执行，列已存在报 `duplicate column name` 就说明补过了：
+
+```sql
+ALTER TABLE emails ADD COLUMN is_read INTEGER DEFAULT 0;
+ALTER TABLE emails ADD COLUMN deleted_at INTEGER;
+ALTER TABLE emails ADD COLUMN is_archived INTEGER DEFAULT 0;
 ```
 
-Staging 使用另一套名字，不能和生产队列混用：`mail-ingest-staging`、`mail-ingest-staging-dlq`、D1 `abot-mail-archive-staging`、R2 `abot-mail-archive-staging`、Worker `resend-agent-mail-relay-staging`。绑定写在 `worker/wrangler.toml` 的 `[env.staging]`。staging 的 `database_id` 要换成 `wrangler d1 create` 打印的 id，占位符不是生产库。部署 staging 用 `npx wrangler deploy --env staging`，secrets 也加 `--env staging`。
+`worker/wrangler.toml` 里的 `[env.staging]` 只保留资源名，目前没有 staging Worker，也没有部署 staging 的路径。
 
-`schema.sql` 使用 `IF NOT EXISTS`，重复执行不会清掉已有邮件，也**不会**给已经存在的 `emails` 表加列。Worker 名称与现有脚本相同，部署后地址保持 `https://resend-agent-mail-relay.eric9n-cf.workers.dev`。
-
-生产库如果是在 `is_read` / `deleted_at` / `is_archived` 写进建表语句之前建的，`search_emails` 和 `email_stats` 都会在 D1 上报 `no such column: deleted_at`（搜索还会再撞上 `is_archived`）。这两条 SELECT 的异常被收成 JSON-RPC `-32603`。`auth` 不在这个失败里：统计查询不选它，而它本来就在最初的建表语句里。
-
-部署下面这个 Worker 之后，读路径会查 `pragma_table_info('emails')`。缺这三列就补 `ALTER`（`duplicate column name` 忽略）；补不上就把该列从当次 SELECT 拿掉，搜索和统计仍返回邮件。`X-Internal-Token` 仍是整段逐字符比较。网关请求没有 `x-abot-owner-email` 仍然 401。带了 owner 的查询仍然只返回该邮箱收发的信。
-
-请在生产 D1 `abot-mail-archive`（`779058bf-f5c1-44de-b2c8-99350ec7748e`）上把下面三条各执行一次。可以先部署再执行，也可以先执行再部署。列已经存在时语句会报 `duplicate column name`，那就是补过了，不要重跑。不要用 batch。
-
-```bash
-cd worker
-npx wrangler d1 execute abot-mail-archive --remote --command "ALTER TABLE emails ADD COLUMN is_read INTEGER DEFAULT 0"
-npx wrangler d1 execute abot-mail-archive --remote --command "ALTER TABLE emails ADD COLUMN deleted_at INTEGER"
-npx wrangler d1 execute abot-mail-archive --remote --command "ALTER TABLE emails ADD COLUMN is_archived INTEGER DEFAULT 0"
-npx wrangler deploy
-```
-
-然后对 `email_stats` 和 `search_emails` 带 `fresh: true` 各调一次，避开最多 120 秒的统计缓存。若 `cache_revision` 表本身不存在，读会按 revision `0` 继续，不会再变成 `-32603`；这时按 `docs/install.md` 第 2 步把 `06.sql`–`09.sql` 补上。
-
-四个 secret（`INTERNAL_TOKEN` 可以不设，不设就只有 Bearer 能进 `/mcp`）：
+两个 secret：
 
 - `WEBHOOK_SECRET`：Resend webhook 的 signing secret，形如 `whsec_` + base64。Worker 去掉前缀再 base64 解码，用原始字节做 HMAC-SHA256。
 - `RESEND_API_KEY`：用来 `GET /emails/receiving/{id}`、`GET /emails/{id}`，以及两边的 attachments 列表。下载原始邮件和附件时走返回里的短时 `download_url`，不把 API key 带到 CDN。
-- `MCP_TOKEN`：自行生成的长随机串，例如 `openssl rand -base64 32`。只用于 `POST /mcp`。
-- `INTERNAL_TOKEN`：同样用 `openssl rand -base64 32` 生成。设了之后，`POST /mcp` 也接受请求头 `X-Internal-Token`，和 `MCP_TOKEN` 一样用逐字符比较，前缀相同不算通过。这是 Worker secret，不是普通变量。
 
-在 Resend 里把 webhook 指到 `https://resend-agent-mail-relay.eric9n-cf.workers.dev/`，订阅 `email.received` 和 `email.sent`。其它事件类型验签通过后直接回 200，不入库。
+在 Resend 里把 webhook 指到 `https://mail.abot.run/`，订阅 `email.received` 和 `email.sent`。其它事件类型验签通过后直接回 200，不入库。
 
 同一封邮件以 Resend 的 id 为主键，`INSERT OR IGNORE`。Webhook 不再返回 `duplicate:true`：去重在消费者里，已有行则跳过 Resend 和 R2。正文和附件都写完之后才插入 D1。Resend 5xx、429、网络超时、D1/R2 瞬时失败会按 60s、120s、240s 再试三次；第四次仍失败，或 Resend 返回 4xx（含 404），写入 `ingest_failures` 后确认消息。死信队列上的消息只落这张表，不再调 Resend。重放时把原来的 webhook 再投一次即可，消费者仍按 `resend_id` 去重。
 
@@ -81,27 +71,18 @@ npx wrangler deploy
 | 方法 | 路径 | 鉴权 | 作用 |
 | --- | --- | --- | --- |
 | `POST` | `/` | Svix 签名 | 验签后入队 `mail-ingest` |
-| `POST` | `/mcp` | `Authorization: Bearer <MCP_TOKEN>`，或 `X-Internal-Token: <INTERNAL_TOKEN>` | MCP。每个凭证每分钟 120 次（只计当前 isolate） |
+| `POST` | `/mcp` | 只接受 host 为 `backend.internal` 的 Service Binding 调用，并且必须带 `x-abot-owner-email`。公网 host 一律 404 | MCP。每个邮箱每分钟 120 次（只计当前 isolate） |
 | `GET` | `/health` | 无 | `{"ok":true,"last_received_at":"...","count_24h":N}` |
+| `GET` / `POST` | `/signup`、`/provision/request` | 邀请码 | 申请说明；提交时经 `GATEWAY` 转发到 `abot-gateway` |
+| `GET` | `/provision/status?id=` | 无 | 经 `GATEWAY` 转发到 `abot-gateway` 查申请状态 |
 
-`/health` 只返回最近一封收件的入库时间和过去 24 小时的归档条数。响应字段只有 `ok`、`last_received_at`、`count_24h`。Svix 时间戳偏离超过 5 分钟、签名对不上、或 MCP token 不对，都回 401，并且发生在读取业务数据之前。
+`/health` 只返回最近一封收件的入库时间和过去 24 小时的归档条数。响应字段只有 `ok`、`last_received_at`、`count_24h`。Svix 时间戳偏离超过 5 分钟或签名对不上回 401，`/mcp` 缺 owner 回 401，都发生在读取业务数据之前。
 
 ## MCP
 
 Streamable HTTP，单次 JSON-RPC 2.0，响应是普通 JSON。`initialize` 固定返回协议版本 `2025-06-18`。`notifications/initialized` 回 HTTP 202 和空 body。
 
-Cursor / Claude Code：
-
-```json
-{
-  "mcpServers": {
-    "abot-mail": {
-      "url": "https://resend-agent-mail-relay.eric9n-cf.workers.dev/mcp",
-      "headers": { "Authorization": "Bearer <MCP_TOKEN>" }
-    }
-  }
-}
-```
+客户端不直接连这个 Worker。agent 连 `https://abot.run/mcp`（`abot-gateway`），网关用 OAuth access token 认出邮箱，再通过 Service Binding `BACKEND_MAIL` 请求 `https://backend.internal/mcp` 并带上 `x-abot-owner-email`。网关会删掉 `Authorization` 和 `X-Internal-Token`。
 
 工具（参数全部进 D1 的 `?` 占位符）：
 
@@ -153,9 +134,9 @@ python3 skill/mail_archive.py get 435eb30a-d52d-4f7c-a400-ccac381b7cc4 --include
 
 这里没有 Cloudflare token，也没有对 Resend 或线上 D1/R2 发请求。部署完成后在你自己的环境核对：
 
-1. `curl -sS https://resend-agent-mail-relay.eric9n-cf.workers.dev/health`  
+1. `curl -sS https://mail.abot.run/health`  
    得到 `ok: true`。响应里只有 `ok`、`last_received_at`、`count_24h`。
-2. 不带 token 的 `POST /mcp` 返回 401。带 `MCP_TOKEN` 调用 `initialize`，`protocolVersion` 为 `2025-06-18`；再调 `tools/list`，能看到四个工具。
+2. 直接 `POST https://mail.abot.run/mcp`（带不带 `x-abot-owner-email` 都一样）返回 404。经网关 `https://abot.run/mcp` 调 `initialize`，`protocolVersion` 为 `2025-06-18`。
 3. 用错误的 `svix-signature` 向 `/` 发 POST，返回 401，D1 行数不变。
 4. 向任意 `xxx@abot.run` 发一封带附件的邮件，并确认 Resend 已把 `email.received` 打到这个 Worker。然后：
    - `/health` 的 `count_24h` 增加，响应里仍然没有邮件内容
