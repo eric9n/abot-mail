@@ -3400,7 +3400,7 @@ test("search and stats omit missing mailbox columns and still isolate owners", (
   const search = buildSearchQuery({ query: "invoice" }, "eric@abot.run", legacy);
   assert.equal(search.sql.includes("deleted_at"), false);
   assert.equal(search.sql.includes("is_archived"), false);
-  assert.match(search.sql, /msg_from = \?/);
+  assert.match(search.sql, /msg_from LIKE \?/);
   const rows = db.prepare(search.sql).all(...search.params).map(toMetadata);
   assert.deepEqual(rows.map((row) => row.resend_id), ["legacy-eric"]);
   assert.equal(rows[0].auth, null);
@@ -3408,7 +3408,7 @@ test("search and stats omit missing mailbox columns and still isolate owners", (
   const stats = buildStatsQueries(NOW_MS, "eric@abot.run", legacy);
   for (const query of [stats.total, stats.byDirection, stats.byDay, stats.topSenders]) {
     assert.equal(query.sql.includes("deleted_at"), false);
-    assert.match(query.sql, /msg_from = \?/);
+    assert.match(query.sql, /msg_from LIKE \?/);
   }
   const total = db.prepare(stats.total.sql).get(...stats.total.params);
   assert.equal(Number(total.total), 1);
@@ -3496,7 +3496,7 @@ test("reads still succeed when mailbox ALTERs are refused", async () => {
   const reads = sqls.sqls.filter((sql) => /FROM emails/i.test(sql));
   assert.equal(reads.length > 0, true);
   assert.equal(reads.some((sql) => sql.includes("deleted_at")), false);
-  assert.equal(reads.some((sql) => sql.includes("msg_from = ?")), true);
+  assert.equal(reads.some((sql) => sql.includes("msg_from LIKE ?")), true);
 });
 
 test("missing auth or cache_revision does not turn reads into internal errors", async () => {

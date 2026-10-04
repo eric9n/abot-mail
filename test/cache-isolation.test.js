@@ -53,9 +53,11 @@ test("cachedEmailBelongsToOwner: 归属校验", () => {
   assert.equal(cachedEmailBelongsToOwner(cachedA, OWNER_B), false, "他人的缓存必须拒绝");
   assert.equal(cachedEmailBelongsToOwner({ found: false }, OWNER_B), true, "found:false 视为 miss");
   assert.equal(cachedEmailBelongsToOwner(cachedA, null), true, "系统级调用无隔离");
-  const cachedFrom = { found: true, from: OWNER_A, to: [] };
-  assert.equal(cachedEmailBelongsToOwner(cachedFrom, OWNER_A), true, "发件人是自己应通过");
+  const cachedFrom = { found: true, direction: "out", from: OWNER_A, to: [] };
+  assert.equal(cachedEmailBelongsToOwner(cachedFrom, OWNER_A), true, "自己发出的信应通过");
   assert.equal(cachedEmailBelongsToOwner(cachedFrom, OWNER_B), false, "发件人不是 B，B 必须拒绝");
+  const spoofed = { found: true, direction: "in", from: OWNER_A, to: ["x@example.com"] };
+  assert.equal(cachedEmailBelongsToOwner(spoofed, OWNER_A), false, "收件的 From 头不能证明归属");
 });
 
 // ---------- 集成测试：模拟完整调用链，复现并验证漏洞已修复 ----------

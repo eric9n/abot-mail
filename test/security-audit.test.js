@@ -270,3 +270,50 @@ test("/mcp 只接受 Service Binding 的内部 host，公网 host 带 owner 也�
   const internal = await handleFetch(mcpPost({ "x-abot-owner-email": OWNER_A }), env);
   assert.equal(internal.status, 200);
 });
+
+function seedRow(db, { resendId, direction, from, to = [], cc = [] }) {
+  db.prepare(
+    `INSERT INTO emails (resend_id, direction, msg_from, msg_to, cc, subject, date, text_body, attachments)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+  ).run(resendId, direction, from, JSON.stringify(to), JSON.stringify(cc), "owned", "2026-10-02T10:00:00Z", "body", "[]");
+}
+
+async function visibleIds(deps) {
+  const rows = toolOk(await handleMcpRpc(toolMessage(1, "search_emails", { query: "owned", fresh: true }), deps));
+  return rows.map((row) => row.resend_id).sort();
+}
+
+test("收件的 From 头不能把邮件归到被冒充的邮箱", async () => {
+  const { db, deps } = makeDeps(OWNER_A);
+  seedRow(db, { resendId: "spoof", direction: "in", from: OWNER_A, to: ["victim@example.com"] });
+  seedRow(db, { resendId: "spoof-named", direction: "in", from: `Boss <${OWNER_A}>`, to: [OWNER_B] });
+  seedRow(db, { resendId: "sent", direction: "out", from: OWNER_A, to: ["x@example.com"] });
+  assert.deepEqual(await visibleIds(deps), ["sent"]);
+  for (const id of ["spoof", "spoof-named"]) {
+    const got = toolOk(await handleMcpRpc(toolMessage(2, "get_email", { resend_id: id, fresh: true }), deps));
+    assert.equal(got.found, false, id);
+    const del = await handleMcpRpc(toolMessage(3, "delete_email", { resend_id: id }), deps);
+    assert.equal(toolError(del).code, -32602, id);
+  }
+  const stats = toolOk(await handleMcpRpc(toolMessage(4, "email_stats", { fresh: true }), deps));
+  assert.equal(stats.total, 1);
+  const { deps: depsB } = makeDeps(OWNER_B);
+  depsB.queryAll = deps.queryAll;
+  depsB.queryFirst = deps.queryFirst;
+  assert.deepEqual(await visibleIds(depsB), ["spoof-named"]);
+});
+
+test("带显示名、抄送、大小写不同的地址都算本人，下划线按字面量匹配", async () => {
+  const owner = "my_bot@abot.run";
+  const { db, deps } = makeDeps(owner);
+  seedRow(db, { resendId: "named-to", direction: "in", from: "x@example.com", to: ["My Bot <My_Bot@abot.run>"] });
+  seedRow(db, { resendId: "cc", direction: "in", from: "x@example.com", to: ["y@example.com"], cc: [owner] });
+  seedRow(db, { resendId: "named-from", direction: "out", from: `My Bot <${owner}>`, to: ["z@example.com"] });
+  seedRow(db, { resendId: "wildcard", direction: "in", from: "x@example.com", to: ["myxbot@abot.run"] });
+  seedRow(db, { resendId: "suffix", direction: "in", from: "x@example.com", to: ["amy_bot@abot.run"] });
+  assert.deepEqual(await visibleIds(deps), ["cc", "named-from", "named-to"]);
+  for (const id of ["cc", "named-from", "named-to"]) {
+    const got = toolOk(await handleMcpRpc(toolMessage(2, "get_email", { resend_id: id, fresh: true }), deps));
+    assert.equal(got.found, true, id);
+  }
+});

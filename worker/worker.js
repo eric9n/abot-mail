@@ -362,13 +362,48 @@ function assertOptionalBoolean(args, key) {
   if (typeof args[key] !== "boolean") throw new RpcError(-32602, `${key} must be a boolean`);
 }
 
-/** Exact mailbox match. Underscore in an address is a literal, not a LIKE wildcard. */
+function likeEscape(value) {
+  return String(value).replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+/**
+ * Mailbox scope, mirrored by emailBelongsToOwner. A recipient (to or cc) owns
+ * any row. The sender owns only outbound rows: an inbound From header is not
+ * authenticated and can name any mailbox. Addresses match bare or as
+ * "Name <addr>", case-insensitively; _ and % in an address are literals.
+ */
 function ownerPredicate(ownerEmail) {
   if (!ownerEmail) return null;
+  const owner = likeEscape(ownerEmail);
+  const listed = [`%"${owner}"%`, `%<${owner}>%`];
   return {
-    sql: "(msg_from = ? OR msg_to LIKE ? ESCAPE '\\')",
-    params: [ownerEmail, likeContains(`"${ownerEmail}"`)],
+    sql:
+      "((direction = 'out' AND (msg_from LIKE ? ESCAPE '\\' OR msg_from LIKE ? ESCAPE '\\'))" +
+      " OR msg_to LIKE ? ESCAPE '\\' OR msg_to LIKE ? ESCAPE '\\'" +
+      " OR cc LIKE ? ESCAPE '\\' OR cc LIKE ? ESCAPE '\\')",
+    params: [owner, `%<${owner}>`, ...listed, ...listed],
   };
+}
+
+/** "Name <a@b>" or "a@b" to "a@b", lowercased. */
+export function addressOf(value) {
+  if (typeof value !== "string") return "";
+  const angled = /<([^<>]*)>\s*$/.exec(value);
+  return (angled ? angled[1] : value).trim().toLowerCase();
+}
+
+function addressList(value) {
+  const list = Array.isArray(value) ? value : parseJsonField(value, []);
+  return Array.isArray(list) ? list.map(addressOf) : [];
+}
+
+/** Same rule as ownerPredicate, on toMetadata-shaped values. */
+export function emailBelongsToOwner(email, ownerEmail) {
+  if (!ownerEmail) return true;
+  if (!email || typeof email !== "object") return false;
+  const owner = ownerEmail.toLowerCase();
+  if (email.direction === "out" && addressOf(email.from) === owner) return true;
+  return addressList(email.to).includes(owner) || addressList(email.cc).includes(owner);
 }
 
 function assertOnlyKeys(obj, allowed) {
@@ -960,13 +995,7 @@ export function getEmailCacheUrl(resendId, includeHtml, includeRaw, ai, rev, own
 export function cachedEmailBelongsToOwner(cached, ownerEmail) {
   if (!ownerEmail) return true; // 系统级调用，无隔离
   if (!cached || cached.found === false) return true;
-  if (cached.from === ownerEmail) return true;
-  try {
-    if (JSON.stringify(cached.to || []).includes('"' + ownerEmail + '"')) return true;
-  } catch {
-    // damaged payload -> treat as miss
-  }
-  return false;
+  return emailBelongsToOwner(cached, ownerEmail);
 }
 
 export function statsCacheUrl(rev, ownerEmail) {
@@ -1619,13 +1648,7 @@ async function callTool(name, args, deps) {
     const query = loaded.query;
     const rows = loaded.rows;
     if (!rows.length) return { found: false, resend_id: id };
-    // mailbox 隔离：校验归属
-    if (ownerEmail) {
-      const r = rows[0];
-      const isMine = (r.msg_from === ownerEmail) ||
-        (r.msg_to && r.msg_to.includes('"' + ownerEmail + '"'));
-      if (!isMine) return { found: false, resend_id: id };
-    }
+    if (!emailBelongsToOwner(toMetadata(rows[0]), ownerEmail)) return { found: false, resend_id: id };
     let rawEml;
     if (query.includeRaw) rawEml = await cachedObjectText(deps, rawObjectKey(id), fresh);
     const value = {
