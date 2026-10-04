@@ -29,6 +29,19 @@ export const INTERNAL_MCP_HOST = "backend.internal";
 /** POST /mcp fixed window. Counted in this isolate, per presented credential or client IP. */
 export const MCP_RATE_LIMIT = 120;
 export const MCP_RATE_WINDOW_MS = 60_000;
+/** POST /mcp per-mailbox calls per minute, counted in D1 across isolates. */
+export const MCP_D1_RATE_LIMIT = 100;
+export const SEND_MAX_RECIPIENTS = 10;
+/** RFC 5322 line limit; the subject must also be a single line. */
+export const SEND_MAX_SUBJECT_CHARS = 998;
+export const SEND_MAX_BODY_CHARS = 100_000;
+/** Recipients per mailbox per clock hour. Override with env.SEND_HOURLY_LIMIT. */
+export const SEND_HOURLY_LIMIT = 50;
+export const RATE_LIMITS_DDL =
+  "CREATE TABLE IF NOT EXISTS rate_limits (k TEXT PRIMARY KEY, window INTEGER NOT NULL, count INTEGER NOT NULL)";
+const BUMP_COUNTER_SQL =
+  "INSERT INTO rate_limits (k, window, count) VALUES (?, ?, ?) " +
+  "ON CONFLICT(k) DO UPDATE SET count = count + excluded.count RETURNING count";
 /** Resend download_url bodies (raw .eml and attachments) above this are refused. */
 export const MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024;
 /** text_body and html_body written to D1 are cut to this many characters. */
@@ -1384,13 +1397,13 @@ export const TOOLS = [
   },
   {
     name: "send_email",
-    description: "Send an email via Resend. Defaults to your bound @abot.run address.",
+    description: "Send an email via Resend from your bound @abot.run address. Recipients count against an hourly quota.",
     inputSchema: {
       type: "object",
       properties: {
-        to: { type: "string", description: "Recipient email address." },
-        subject: { type: "string", description: "Email subject." },
-        body: { type: "string", description: "Email body (plain text)." },
+        to: { type: "string", description: "Recipient address, or up to 10 addresses separated by commas." },
+        subject: { type: "string", description: "Email subject. One line, at most 998 characters." },
+        body: { type: "string", description: "Email body (plain text), at most 100000 characters." },
         from: { type: "string", description: "Sender address. Defaults to your bound email. Must be @abot.run." },
       },
       required: ["to", "subject", "body"],
@@ -1702,6 +1715,13 @@ async function callTool(name, args, deps) {
     if (typeof to !== "string" || !to || typeof subject !== "string" || !subject || typeof body !== "string" || !body) {
       throw new RpcError(-32602, "to, subject, body are required");
     }
+    const recipients = parseRecipients(to);
+    if (subject.length > SEND_MAX_SUBJECT_CHARS || /[\r\n]/.test(subject)) {
+      throw new RpcError(-32602, `subject must be one line of at most ${SEND_MAX_SUBJECT_CHARS} characters`);
+    }
+    if (body.length > SEND_MAX_BODY_CHARS) {
+      throw new RpcError(-32602, `body must be at most ${SEND_MAX_BODY_CHARS} characters`);
+    }
     if (args.from != null && typeof args.from !== "string") {
       throw new RpcError(-32602, "from must be a string");
     }
@@ -1717,20 +1737,50 @@ async function callTool(name, args, deps) {
     if (!apiKey) {
       throw new RpcError(-32603, "RESEND_API_KEY not configured");
     }
-    const doFetch = (deps && deps.fetchImpl) || fetch;
-    const resp = await doFetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        Authorization: "Bearer " + apiKey,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ from, to, subject, text: body }),
-    });
-    const data = await resp.json();
-    if (!resp.ok) {
-      throw new RpcError(-32603, "Resend error: " + JSON.stringify(data));
+    const nowMs = Number.isFinite(deps.nowMs) ? deps.nowMs : Date.now();
+    const hour = Math.floor(nowMs / 3_600_000);
+    const limit = sendHourlyLimit(deps.env);
+    const quotaKey = `send:${ownerEmail}:${hour}`;
+    const nowMinute = Math.floor(nowMs / 60_000);
+    const refund = () => bumpCounter(deps, quotaKey, (hour + 1) * 60, -recipients.length, nowMinute).catch(() => {});
+    let sentThisHour;
+    try {
+      sentThisHour = await bumpCounter(deps, quotaKey, (hour + 1) * 60, recipients.length, nowMinute);
+    } catch {
+      throw new RpcError(-32603, "send quota unavailable");
     }
-    return { id: data.id, from, to, subject };
+    if (sentThisHour > limit) {
+      await refund();
+      throw new RpcError(-32003, `send limit reached: at most ${limit} recipients per hour`);
+    }
+    const toField = recipients.length === 1 ? recipients[0] : recipients;
+    const doFetch = (deps && deps.fetchImpl) || fetch;
+    let resp;
+    try {
+      resp = await doFetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + apiKey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ from, to: toField, subject, text: body }),
+      });
+    } catch {
+      await refund();
+      throw new RpcError(-32603, "Resend unreachable");
+    }
+    let data = {};
+    try {
+      data = await resp.json();
+    } catch {
+      data = {};
+    }
+    if (!resp.ok) {
+      await refund();
+      const reason = data && typeof data.message === "string" ? `: ${data.message.slice(0, 200)}` : "";
+      throw new RpcError(-32603, `Resend rejected the message (HTTP ${resp.status})${reason}`);
+    }
+    return { id: data.id, from, to: toField, subject };
   }
   if (name === "set_email_read_status") {
     const resendId = args.resend_id;
@@ -2710,6 +2760,62 @@ function mcpLimit(env) {
   return n;
 }
 
+export function sendHourlyLimit(env) {
+  if (!env || env.SEND_HOURLY_LIMIT == null || env.SEND_HOURLY_LIMIT === "") return SEND_HOURLY_LIMIT;
+  const n = Number(env.SEND_HOURLY_LIMIT);
+  if (!Number.isInteger(n) || n < 1 || n > 10_000) return SEND_HOURLY_LIMIT;
+  return n;
+}
+
+const RECIPIENT_RE = /^[^\s@<>,;:"()[\]\\]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/i;
+
+/** "a@x.com, b@y.com" -> ["a@x.com", "b@y.com"]; duplicates (case-insensitive) dropped. */
+export function parseRecipients(value) {
+  const parts = String(value).split(",").map((part) => part.trim()).filter(Boolean);
+  if (parts.length === 0 || parts.length > SEND_MAX_RECIPIENTS) {
+    throw new RpcError(-32602, `to must list 1 to ${SEND_MAX_RECIPIENTS} addresses`);
+  }
+  const seen = new Set();
+  const out = [];
+  for (const part of parts) {
+    if (part.length > 254 || !RECIPIENT_RE.test(part)) {
+      throw new RpcError(-32602, "invalid recipient address");
+    }
+    const key = part.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(part);
+  }
+  return out;
+}
+
+/**
+ * Atomically adds `by` to counter `key` and returns the new total.
+ * `expiresMinute` is stored in `window`; rows whose window is before `nowMinute`
+ * are swept whenever a new key is created.
+ */
+export async function bumpCounter(deps, key, expiresMinute, by, nowMinute) {
+  const bump = () => deps.queryFirst(BUMP_COUNTER_SQL, [key, expiresMinute, by]);
+  let row;
+  try {
+    row = await bump();
+  } catch (err) {
+    if (!/no such table: rate_limits/i.test(String(err && err.message))) throw err;
+    await deps.queryRun(RATE_LIMITS_DDL, []);
+    row = await bump();
+  }
+  const count = Number(row && row.count);
+  if (!Number.isFinite(count)) throw new Error("rate counter returned no count");
+  if (count === by) {
+    try {
+      await deps.queryRun("DELETE FROM rate_limits WHERE window < ?", [nowMinute]);
+    } catch {
+      // Sweeping is best effort; stale rows only cost storage.
+    }
+  }
+  return count;
+}
+
 /** Per mailbox when the gateway sent one, otherwise the client IP. Not logged. */
 export function mcpClientKey(request) {
   const owner = request.headers.get("x-abot-owner-email");
@@ -2800,25 +2906,20 @@ export async function handleFetch(request, env, deps = {}) {
       }
       // 限流和这次读取共用一个 primary session，避免修订号和结果来自不同副本。
       const db = d1Deps(env);
-      const rateKey = ownerEmail ? "mcp:" + ownerEmail : "mcp:ip:" + (request.headers.get("CF-Connecting-IP") || "unknown");
-      const minute = Math.floor(Date.now() / 60000);
+      const minute = Math.floor((deps.nowMs ?? Date.now()) / 60_000);
+      let callsThisMinute = 0;
       try {
-        await db.queryRun("CREATE TABLE IF NOT EXISTS rate_limits (k TEXT PRIMARY KEY, window INTEGER, count INTEGER)", []);
-        const row = await db.queryFirst("SELECT window, count FROM rate_limits WHERE k=?", [rateKey + ":" + minute]);
-        const count = row && row.window === minute ? row.count : 0;
-        if (count >= 100) {
-          trace.outcome = "rate_limited";
-          return json({ ok: false, error: "rate_limited", message: "每分钟最多100次" }, 429);
-        }
-        if (row && row.window === minute) {
-          await db.queryRun("UPDATE rate_limits SET count=count+1 WHERE k=?", [rateKey + ":" + minute]);
-        } else {
-          await db.queryRun("INSERT OR REPLACE INTO rate_limits (k, window, count) VALUES (?,?,1)", [rateKey + ":" + minute, minute]);
-        }
-        // 清理旧窗口（顺手）
-        await db.queryRun("DELETE FROM rate_limits WHERE window < ?", [minute - 2]);
-      } catch (e) {
-        // 限流失败不挡请求，记日志
+        callsThisMinute = await bumpCounter(db, `mcp:${ownerEmail}:${minute}`, minute + 1, 1, minute);
+      } catch {
+        // Fails open: the in-isolate limiter above still applies.
+      }
+      if (callsThisMinute > MCP_D1_RATE_LIMIT) {
+        trace.outcome = "rate_limited";
+        return json(
+          { ok: false, error: "rate_limited", message: `每分钟最多${MCP_D1_RATE_LIMIT}次` },
+          429,
+          { "retry-after": String(60 - Math.floor(((deps.nowMs ?? Date.now()) % 60_000) / 1000)) },
+        );
       }
       if (!jsonContentType(request.headers.get("content-type"))) {
         trace.outcome = "rejected";

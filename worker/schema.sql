@@ -53,6 +53,15 @@ BEGIN
   ON CONFLICT(id) DO UPDATE SET rev = rev + 1;
 END;
 
+-- Fixed-window counters: k is "mcp:<mailbox>:<minute>" or "send:<mailbox>:<hour>",
+-- window is the unix minute the counter expires. The worker also creates this
+-- table on "no such table: rate_limits".
+CREATE TABLE IF NOT EXISTS rate_limits (
+  k      TEXT PRIMARY KEY,
+  window INTEGER NOT NULL,
+  count  INTEGER NOT NULL
+);
+
 -- summary is nullable and is not indexed. This file is safe to re-run:
 -- CREATE TABLE IF NOT EXISTS does not add columns to a table that already
 -- exists, and AFTER INSERT is the only revision bump (UPDATE does not fire).
