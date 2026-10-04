@@ -4,7 +4,12 @@
   "type": "module",
   "scripts": {
     "test": "node --disable-warning=ExperimentalWarning --test",
-    "gate": "node --check worker/worker.js && node --check e2e/run.mjs && python3 -m py_compile skill/mail_archive.py skill/mcp_cli.py && node --disable-warning=ExperimentalWarning --test",
+    "gate": "node --check worker/worker.js && node --check e2e/run.mjs && node --check deploy/cloudflare.mjs && python3 -m py_compile skill/mail_archive.py skill/mcp_cli.py && node --disable-warning=ExperimentalWarning --test",
+    "build": "node deploy/cloudflare.mjs build",
+    "deploy": "node deploy/cloudflare.mjs deploy",
     "e2e": "node e2e/run.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.147.0"
   }
 }
