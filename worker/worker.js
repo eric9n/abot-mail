@@ -3,6 +3,7 @@
  * POST /      Resend webhook (Svix): verify, enqueue, return
  * queue       mail-ingest consumer: Resend API → Workers AI summary → D1 + R2
  * POST /mcp   MCP (Streamable HTTP, JSON-RPC) via Service Bindings only
+ *             host must be INTERNAL_MCP_HOST; public hosts get 404
  *             requires x-abot-owner-email; does not check any token
  *             reads may use the Cache API after auth; HTTP responses stay no-store
  *             search/list/stats/get_email keys include a D1 revision bumped on insert
@@ -11,14 +12,21 @@
  *
  * Secrets come from the Worker env: WEBHOOK_SECRET, RESEND_API_KEY.
  * Both are Worker secrets (`wrangler secret put`), never plain vars.
- * Public ingress is off. The gateway calls this worker with a Service Binding
- * and always sends x-abot-owner-email. MCP_TOKEN and INTERNAL_TOKEN are not read.
+ * The gateway calls this worker with a Service Binding and always sends
+ * x-abot-owner-email. MCP_TOKEN and INTERNAL_TOKEN are not read.
+ * /signup and /provision/status forward to abot-gateway through env.GATEWAY.
  * Observability uses the METRICS binding. It does not change archive responses.
  */
 
 const TIMESTAMP_TOLERANCE_SEC = 5 * 60;
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const MAX_BODY_BYTES = 1_000_000;
+/**
+ * abot-gateway calls POST /mcp through a Service Binding at https://backend.internal/.
+ * Public traffic arrives as mail.abot.run, so it can never present this host and
+ * therefore cannot vouch for itself with x-abot-owner-email.
+ */
+export const INTERNAL_MCP_HOST = "backend.internal";
 /** POST /mcp fixed window. Counted in this isolate, per presented credential or client IP. */
 export const MCP_RATE_LIMIT = 120;
 export const MCP_RATE_WINDOW_MS = 60_000;
@@ -2707,10 +2715,40 @@ export function consumeMcpRate(key, nowMs, limit = MCP_RATE_LIMIT, store = mcpRa
   return { allowed: bucket.count <= cap, retryAfterSec };
 }
 
-function pathOf(request) {
-  const url = new URL(request.url);
+function pathOf(url) {
   if (url.pathname.length > 1 && url.pathname.endsWith("/")) return url.pathname.slice(0, -1);
   return url.pathname;
+}
+
+async function gatewayProvision(env, trace, target, init) {
+  const gateway = env && env.GATEWAY;
+  if (!gateway || typeof gateway.fetch !== "function") {
+    trace.outcome = "error";
+    return { response: json({ ok: false, error: "gateway_binding_missing" }, 500) };
+  }
+  let upstream;
+  try {
+    upstream = await gateway.fetch(target, init);
+  } catch {
+    trace.outcome = "error";
+    return { response: json({ ok: false, error: "upstream_unavailable" }, 502) };
+  }
+  let payload = {};
+  try {
+    payload = await upstream.json();
+  } catch {
+    payload = {};
+  }
+  if (!payload || typeof payload !== "object") payload = {};
+  if (!upstream.ok || payload.error) {
+    return {
+      response: json(
+        { ok: false, error: payload.error || "upstream_error", message: payload.message },
+        upstream.ok ? 502 : upstream.status,
+      ),
+    };
+  }
+  return { payload };
 }
 
 function jsonContentType(header) {
@@ -2723,7 +2761,8 @@ export async function handleFetch(request, env, deps = {}) {
   const started = Date.now();
   const trace = { validator_discards: 0, neurons: 0 };
   deps = { ...deps, trace };
-  const path = pathOf(request);
+  const url = new URL(request.url);
+  const path = pathOf(url);
   trace.stage = path === "/health" ? "health" : path === "/mcp" ? "mcp" : "webhook";
   try {
     if (path === "/health") {
@@ -2781,46 +2820,21 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
       return json(info);
     }
 
-    // 提交邮箱申请（POST /signup 或 POST /provision/request）
+    // 提交邮箱申请（POST /signup 或 POST /provision/request）。邀请码和申请表都在 abot-gateway。
     if ((path === "/signup" || path === "/provision/request") && request.method === "POST") {
       trace.outcome = "ok";
-      const db = d1Deps(env);
-      // 确保表存在
-      await db.queryRun(`CREATE TABLE IF NOT EXISTS provision_requests (
-        id TEXT PRIMARY KEY, agent_name TEXT, reason TEXT, requested_email TEXT,
-        status TEXT DEFAULT 'pending', email TEXT, secret_hash TEXT,
-        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`, []);
-      await db.queryRun(`CREATE TABLE IF NOT EXISTS invite_codes (
-        code_hash TEXT PRIMARY KEY, code TEXT,
-        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-        used_at TEXT, used_by TEXT)`, []);
-      await db.queryRun(`CREATE TABLE IF NOT EXISTS mailboxes (
-        email TEXT PRIMARY KEY, request_id TEXT,
-        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`, []);
-      // 邮件状态列迁移
-      for (const [, ddl] of EMAIL_MAILBOX_COLUMN_DDL) {
-        try { await db.queryRun(ddl, []); } catch {}
-      }
       let body;
-      try { body = await request.json(); } catch { body = {}; }
-      const inviteCode = (body.invite_code || "").trim();
+      try {
+        body = await request.json();
+      } catch {
+        body = {};
+      }
+      if (!body || typeof body !== "object") body = {};
+      const inviteCode = (typeof body.invite_code === "string" ? body.invite_code : "").trim();
       if (!inviteCode) {
         return json({ ok: false, error: "invite_code_required", message: "需要邀请码" }, 400);
       }
-      // 验证邀请码
-      const hashBuf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(inviteCode));
-      const codeHash = [...new Uint8Array(hashBuf)].map(b => b.toString(16).padStart(2, "0")).join("");
-      const codeRow = await db.queryFirst("SELECT code_hash, used_at, created_at FROM invite_codes WHERE code_hash=?", [codeHash]);
-      if (!codeRow) return json({ ok: false, error: "invalid_invite_code" }, 403);
-      if (codeRow.used_at) return json({ ok: false, error: "invite_code_used" }, 403);
-      if (Date.now() - new Date(codeRow.created_at).getTime() > 3600 * 1000) {
-        return json({ ok: false, error: "invite_code_expired", message: "邀请码已过期" }, 403);
-      }
-      // 限流
-      const recent = await db.queryFirst("SELECT COUNT(*) as c FROM provision_requests WHERE created_at > datetime('now','-1 hour')", []);
-      if (recent && recent.c >= 10) return json({ ok: false, error: "rate_limited" }, 429);
-      // 验证邮箱
-      const requestedEmail = (body.requested_email || "").trim().toLowerCase() || null;
+      const requestedEmail = (typeof body.requested_email === "string" ? body.requested_email : "").trim().toLowerCase() || null;
       if (requestedEmail) {
         if (!requestedEmail.endsWith("@abot.run") || requestedEmail.length < 11) {
           return json({ ok: false, error: "invalid_email", message: "邮箱必须是 xxx@abot.run 格式" }, 400);
@@ -2828,37 +2842,41 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
         if (!/^[a-z0-9._-]+@abot\.run$/.test(requestedEmail)) {
           return json({ ok: false, error: "invalid_email", message: "邮箱只能含小写字母、数字、._-" }, 400);
         }
-        // 是否已被占用（已批准的申请或已建 mailbox）
-        const taken1 = await db.queryFirst("SELECT id FROM provision_requests WHERE (email=? OR requested_email=?) AND status='approved'", [requestedEmail, requestedEmail]);
-        const taken2 = await db.queryFirst("SELECT email FROM mailboxes WHERE email=?", [requestedEmail]);
-        // 是否有 pending 的申请在用
-        const pending = await db.queryFirst("SELECT id FROM provision_requests WHERE requested_email=? AND status='pending'", [requestedEmail]);
-        if (taken1 || taken2) {
-          return json({ ok: false, error: "email_taken", message: "该邮箱已被使用，请换一个" }, 409);
-        }
-        if (pending) {
-          return json({ ok: false, error: "email_pending", message: "该邮箱已有待审核申请，请换一个" }, 409);
-        }
       }
-      // 创建申请
-      const id = "prov_" + [...crypto.getRandomValues(new Uint8Array(8))].map(b => b.toString(16).padStart(2, "0")).join("");
-      await db.queryRun("INSERT INTO provision_requests (id, agent_name, reason, requested_email, status) VALUES (?,?,?,?,?)",
-        [id, body.agent_name || null, body.reason || null, requestedEmail, "pending"]);
-      await db.queryRun("UPDATE invite_codes SET used_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), used_by=? WHERE code_hash=?", [id, codeHash]);
-      return json({ ok: true, id, status: "pending", message: "等待人工审核" });
+      const forwarded = await gatewayProvision(env, trace, "https://abot-gateway/provision/request", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          invite_code: inviteCode,
+          agent_name: body.agent_name,
+          reason: body.reason,
+          requested_email: requestedEmail,
+        }),
+      });
+      if (forwarded.response) return forwarded.response;
+      const payload = forwarded.payload;
+      return json({ ok: true, id: payload.id, status: payload.status || "pending", message: payload.message || "等待人工审核" });
     }
 
-    // 查申请状态
     if (path === "/provision/status" && request.method === "GET") {
       trace.outcome = "ok";
-      const db = d1Deps(env);
       const id = url.searchParams.get("id") || "";
-      const row = await db.queryFirst("SELECT id, status, email FROM provision_requests WHERE id=?", [id]);
-      if (!row) return json({ ok: false, error: "not_found" }, 404);
-      return json({ ok: true, id: row.id, status: row.status, email: row.email || null });
+      const forwarded = await gatewayProvision(
+        env,
+        trace,
+        "https://abot-gateway/provision/status?id=" + encodeURIComponent(id),
+        { method: "GET" },
+      );
+      if (forwarded.response) return forwarded.response;
+      const payload = forwarded.payload;
+      return json({ ok: true, id: payload.id, status: payload.status, email: payload.email || null });
     }
 
     if (path === "/mcp") {
+      if (url.hostname !== INTERNAL_MCP_HOST) {
+        trace.outcome = "rejected";
+        return json({ ok: false, error: "not found" }, 404);
+      }
       const rate = consumeMcpRate(mcpClientKey(request), deps.nowMs ?? Date.now(), mcpLimit(env));
       if (!rate.allowed) {
         trace.outcome = "rejected";
@@ -2868,8 +2886,7 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
         trace.outcome = "rejected";
         return json({ ok: false, error: "method not allowed" }, 405);
       }
-      // Public hosts are off. The only caller is the gateway via a Service Binding,
-      // which does not send a token. X-Internal-Token and Authorization are ignored.
+      // The gateway sends no token. X-Internal-Token and Authorization are ignored.
       // x-abot-owner-email is required and is the mailbox scope for the call.
       const ownerEmail = (request.headers.get("x-abot-owner-email") || "").trim().toLowerCase() || null;
       if (!ownerEmail || !/^[a-z0-9._-]+@abot\.run$/.test(ownerEmail)) {
