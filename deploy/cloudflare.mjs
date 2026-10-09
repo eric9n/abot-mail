@@ -17,9 +17,6 @@ export const PRODUCTION = {
   route: "mail.abot.run/*",
   zone: "abot.run",
   d1Id: "779058bf-f5c1-44de-b2c8-99350ec7748e",
-  bucket: "abot-mail-archive",
-  queue: "mail-ingest",
-  dlq: "mail-ingest-dlq",
 };
 
 export class DeployError extends Error {}
@@ -98,22 +95,11 @@ export function productionConfigProblems(toml) {
     `D1 binding DB must point at ${PRODUCTION.d1Id}`,
   );
 
-  const r2 = tables(top, "r2_buckets");
-  expect(
-    r2.length === 1 && value(r2[0], "binding") === "ARCHIVE_BUCKET" && value(r2[0], "bucket_name") === PRODUCTION.bucket,
-    `R2 binding ARCHIVE_BUCKET must be ${PRODUCTION.bucket}`,
-  );
-
-  const producers = tables(top, "queues.producers");
-  expect(
-    producers.length === 1 && value(producers[0], "binding") === "INGEST_QUEUE" && value(producers[0], "queue") === PRODUCTION.queue,
-    `queue producer INGEST_QUEUE must be ${PRODUCTION.queue}`,
-  );
-  const consumers = tables(top, "queues.consumers").map((c) => value(c, "queue")).sort();
-  expect(
-    JSON.stringify(consumers) === JSON.stringify([PRODUCTION.queue, PRODUCTION.dlq].sort()),
-    `queue consumers must be ${PRODUCTION.queue} and ${PRODUCTION.dlq}`,
-  );
+  expect(tables(top, "r2_buckets").length === 0, "no R2 binding: mail is not archived");
+  expect(tables(top, "queues.producers").length === 0, "no queue producer: mail is not ingested");
+  expect(tables(top, "queues.consumers").length === 0, "no queue consumer: mail is not ingested");
+  expect(!/^\[ai\]\s*$/m.test(top), "no Workers AI binding: summaries are not stored");
+  expect(!/^\[triggers\]\s*$/m.test(top), "no cron: archive alerts are removed");
   expect(!/^\s*\[vars\]/m.test(top), "no [vars]: secrets stay in Worker secrets");
   return problems;
 }

@@ -37,7 +37,7 @@ test("e2e signer matches the worker verifier", async () => {
   assert.equal(expired.reason, "timestamp_out_of_range");
 });
 
-test("e2e signer is accepted by the worker webhook and only enqueues", async () => {
+test("e2e signer is accepted by the worker webhook and nothing is queued", async () => {
   const secret = `whsec_${Buffer.from("unit-test-webhook-secret").toString("base64")}`;
   const body = JSON.stringify({
     type: "email.received",
@@ -68,15 +68,8 @@ test("e2e signer is accepted by the worker webhook and only enqueues", async () 
     { nowMs },
   );
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { ok: true, queued: true });
-  assert.deepEqual(sent, [
-    {
-      resend_id: "abc-1",
-      event_type: "email.received",
-      received_at: "2026-09-28T12:00:00.000Z",
-      svix_id: "msg_e2e",
-    },
-  ]);
+  assert.deepEqual(await res.json(), { ok: true, ignored: true });
+  assert.deepEqual(sent, []);
 });
 
 test("e2e exits non-zero when credentials are missing", () => {
@@ -90,7 +83,6 @@ test("e2e exits non-zero when credentials are missing", () => {
   assert.match(res.stderr, /WEBHOOK_SECRET/);
   assert.match(res.stderr, /MCP_URL/);
   assert.match(res.stderr, /MCP_TOKEN/);
-  assert.match(res.stderr, /TEST_EMAIL_ID/);
 
   const partial = spawnSync(process.execPath, ["e2e/run.mjs"], {
     cwd: repoRoot,
