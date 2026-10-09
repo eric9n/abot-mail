@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Call the abot-mail MCP server through abot-gateway (read-only).
+"""Call the abot-mail MCP server through abot-gateway.
 
-Subcommands match the Worker tools: search, get, list, stats, account.
-`tools` calls tools/list. `health` is an unauthenticated GET of the Worker's
-/health on mail.abot.run.
+Subcommands: account, send, tools. `health` is an unauthenticated GET of
+/health on mail.abot.run. Archive read commands are gone.
 
 The Worker's own /mcp only answers abot-gateway's Service Binding, so MCP
 calls go to the gateway (https://abot.run/mcp by default, override with --url
@@ -177,62 +176,18 @@ def unwrap_tool(result):
         return text
 
 
-def flag(value):
-    return True if value else None
-
-
-def cmd_search(args):
-    arguments = {
-        "query": args.query,
-        "from": args.sender,
-        "to": args.to,
-        "since": args.since,
-        "until": args.until,
-        "direction": args.direction,
-        "limit": args.limit,
-        "include_summary": flag(args.include_summary),
-        "fresh": flag(args.fresh),
-    }
-    arguments = {key: value for key, value in arguments.items() if value is not None}
-    result = rpc(args.base, args.token, "tools/call", {"name": "search_emails", "arguments": arguments})
-    emit(unwrap_tool(result))
-
-
-def cmd_get(args):
-    arguments = {
-        "resend_id": args.resend_id,
-        "include_html": flag(args.include_html),
-        "include_raw_eml": flag(args.include_raw_eml),
-        "fresh": flag(args.fresh),
-    }
-    arguments = {key: value for key, value in arguments.items() if value is not None}
-    result = rpc(args.base, args.token, "tools/call", {"name": "get_email", "arguments": arguments})
-    emit(unwrap_tool(result))
-
-
-def cmd_list(args):
-    arguments = {
-        "limit": args.limit,
-        "direction": args.direction,
-        "since": args.since,
-        "include_summary": flag(args.include_summary),
-        "fresh": flag(args.fresh),
-    }
-    arguments = {key: value for key, value in arguments.items() if value is not None}
-    result = rpc(args.base, args.token, "tools/call", {"name": "list_emails", "arguments": arguments})
-    emit(unwrap_tool(result))
-
-
-def cmd_stats(args):
-    arguments = {}
-    if args.fresh:
-        arguments["fresh"] = True
-    result = rpc(args.base, args.token, "tools/call", {"name": "email_stats", "arguments": arguments})
-    emit(unwrap_tool(result))
-
-
 def cmd_account(args):
     result = rpc(args.base, args.token, "tools/call", {"name": "get_account", "arguments": {}})
+    emit(unwrap_tool(result))
+
+
+def cmd_send(args):
+    result = rpc(
+        args.base,
+        args.token,
+        "tools/call",
+        {"name": "send_email", "arguments": {"to": args.to, "subject": args.subject, "body": args.body}},
+    )
     emit(unwrap_tool(result))
 
 
@@ -254,43 +209,18 @@ def build_parser():
 
     parser = argparse.ArgumentParser(
         prog="mcp_cli",
-        description="Read the abot-mail archive through the abot-gateway MCP endpoint. There is no send command.",
+        description="Call get_account or send_email through the abot-gateway MCP endpoint. Mail is not archived.",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    search = sub.add_parser("search", parents=[common], help="Call search_emails.")
-    search.add_argument("--query", required=True, help="Substring matched against subject, from, and text body.")
-    search.add_argument("--from", dest="sender", help="Optional substring of the sender.")
-    search.add_argument("--to", help="Optional substring of the JSON to list.")
-    search.add_argument("--since", help="Inclusive ISO8601 lower bound on date. YYYY-MM-DD is allowed.")
-    search.add_argument("--until", help="Inclusive ISO8601 upper bound on date. YYYY-MM-DD is allowed.")
-    search.add_argument("--direction", choices=("in", "out"))
-    search.add_argument("--limit", type=int, help="Default 20, maximum 100.")
-    search.add_argument("--include-summary", action="store_true", help="Attach the stored summary object. Does not generate one.")
-    search.add_argument("--fresh", action="store_true", help="Skip the cache and read the archive again.")
-    search.set_defaults(func=cmd_search)
-
-    get = sub.add_parser("get", parents=[common], help="Call get_email.")
-    get.add_argument("resend_id")
-    get.add_argument("--include-html", action="store_true")
-    get.add_argument("--include-raw-eml", action="store_true")
-    get.add_argument("--fresh", action="store_true", help="Skip the cache and read the archive again.")
-    get.set_defaults(func=cmd_get)
-
-    listing = sub.add_parser("list", parents=[common], help="Call list_emails.")
-    listing.add_argument("--limit", type=int, help="Default 20, maximum 100.")
-    listing.add_argument("--direction", choices=("in", "out"))
-    listing.add_argument("--since", help="Inclusive ISO8601 lower bound on date.")
-    listing.add_argument("--include-summary", action="store_true", help="Attach the stored summary object. Does not generate one.")
-    listing.add_argument("--fresh", action="store_true", help="Skip the cache and read the archive again.")
-    listing.set_defaults(func=cmd_list)
-
-    stats = sub.add_parser("stats", parents=[common], help="Call email_stats.")
-    stats.add_argument("--fresh", action="store_true", help="Skip the cache and read the archive again.")
-    stats.set_defaults(func=cmd_stats)
-
     account = sub.add_parser("account", parents=[common], help="Call get_account.")
     account.set_defaults(func=cmd_account)
+
+    send = sub.add_parser("send", parents=[common], help="Call send_email. Counts against the hourly recipient quota.")
+    send.add_argument("--to", required=True, help="One address, or up to 10 comma-separated addresses.")
+    send.add_argument("--subject", required=True)
+    send.add_argument("--body", required=True)
+    send.set_defaults(func=cmd_send)
 
     tools = sub.add_parser("tools", parents=[common], help="Call tools/list.")
     tools.set_defaults(func=cmd_tools)

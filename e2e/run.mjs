@@ -1,23 +1,15 @@
 /**
- * Live gate against a deployed archive worker.
- * Reads WORKER_URL, MCP_URL, WEBHOOK_SECRET, MCP_TOKEN, TEST_EMAIL_ID.
+ * Live check against a deployed worker that no longer archives mail.
+ * Reads WORKER_URL, MCP_URL, WEBHOOK_SECRET, MCP_TOKEN.
  * Missing variables fail the process; they never count as a pass.
  *
- * The worker's own /mcp only answers Service Binding calls, so MCP goes through
- * the gateway: MCP_URL is the gateway's mail MCP endpoint and MCP_TOKEN is that
- * gateway's access token for a mailbox that received TEST_EMAIL_ID.
- *
- * The only write is an idempotent archive of TEST_EMAIL_ID. Point WORKER_URL
- * at the staging worker so this does not touch the production D1 database.
- * A valid webhook returns as soon as the event is queued. The script polls
- * get_email until the consumer has written the row, or the timeout fires.
+ * MCP_URL is the gateway mail MCP endpoint. MCP_TOKEN is that gateway's
+ * access token. This script does not send an email and does not read D1.
  */
 
 import { createHmac, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { pathToFileURL } from "node:url";
-
-const REQUIRED_ENV = ["WORKER_URL", "MCP_URL", "WEBHOOK_SECRET", "MCP_TOKEN", "TEST_EMAIL_ID"];
+const REQUIRED_ENV = ["WORKER_URL", "MCP_URL", "WEBHOOK_SECRET", "MCP_TOKEN"];
 
 export function signSvix({ secret, svixId, timestamp, body }) {
   if (typeof secret !== "string" || !secret.startsWith("whsec_")) {
@@ -51,10 +43,6 @@ function expect(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 async function request(url, { method = "GET", headers = {}, body, timeoutMs = 30000 } = {}) {
   const res = await fetch(url, {
     method,
@@ -74,19 +62,20 @@ async function request(url, { method = "GET", headers = {}, body, timeoutMs = 30
 
 function assertHttp(res, status, label) {
   if (res.status !== status) {
-    const hint =
-      res.status === 500
-        ? " Confirm TEST_EMAIL_ID is an existing received email and the worker RESEND_API_KEY can read it."
-        : "";
-    throw new Error(`${label}: expected HTTP ${status}, got ${res.status}: ${snippet(res.text)}.${hint}`);
+    throw new Error(`${label}: expected HTTP ${status}, got ${res.status} ${snippet(res.text)}`);
   }
 }
 
-export async function main() {
+function mcpEndpoint() {
+  const raw = process.env.MCP_URL.trim().replace(/\/+$/, "");
+  return raw.endsWith("/mcp") ? raw : `${raw}/mcp`;
+}
+
+async function main() {
   const missing = missingEnv();
   if (missing.length) {
     console.error(`e2e: missing required environment variable(s): ${missing.join(", ")}`);
-    console.error("Required: WORKER_URL, MCP_URL (gateway mail MCP endpoint), WEBHOOK_SECRET (whsec_…), MCP_TOKEN (gateway access token), TEST_EMAIL_ID (an existing Resend received email id).");
+    console.error("Required: WORKER_URL, MCP_URL (gateway mail MCP endpoint), WEBHOOK_SECRET (whsec_…), MCP_TOKEN (gateway access token).");
     console.error("Refusing to pass without them.");
     return 1;
   }
@@ -94,306 +83,71 @@ export async function main() {
   const workerUrl = process.env.WORKER_URL.trim();
   const webhookSecret = process.env.WEBHOOK_SECRET.trim();
   const mcpToken = process.env.MCP_TOKEN.trim();
-  const emailId = process.env.TEST_EMAIL_ID.trim();
 
-  const mcpUrl = process.env.MCP_URL.trim();
-  for (const [key, value] of [["WORKER_URL", workerUrl], ["MCP_URL", mcpUrl]]) {
-    let parsed;
-    try {
-      parsed = new URL(value);
-    } catch {
-      console.error(`e2e: ${key} is not a URL: ${value}`);
-      return 1;
-    }
-    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-      console.error(`e2e: ${key} must be http or https`);
-      return 1;
-    }
-  }
-  if (!webhookSecret.startsWith("whsec_")) {
-    console.error("e2e: WEBHOOK_SECRET must start with whsec_");
-    return 1;
-  }
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(emailId) || emailId.includes("..")) {
-    console.error("e2e: TEST_EMAIL_ID must be a Resend id (letters, digits, '.', '_', '-')");
-    return 1;
-  }
+  const health = await request(endpoint(workerUrl, "/health"));
+  assertHttp(health, 200, "GET /health");
+  expect(health.json && health.json.ok === true, `health not ok: ${snippet(health.text)}`);
+  expect(Object.keys(health.json).join(",") === "ok", `health must be only ok, got ${snippet(health.text)}`);
 
-  const root = endpoint(workerUrl, "/");
-  const directMcpUrl = endpoint(workerUrl, "/mcp");
-  const healthUrl = endpoint(workerUrl, "/health");
-  const ctx = { email: null, totalAfterArchive: null, delivery: null };
-  const results = [];
-
-  async function runCase(id, title, fn) {
-    try {
-      await fn();
-      results.push({ id, title, ok: true });
-      console.log(`PASS  ${id}  ${title}`);
-    } catch (err) {
-      const message = err && err.name === "TimeoutError" ? `${title}: request timed out` : err.message || String(err);
-      results.push({ id, title, ok: false, message });
-      console.error(`FAIL  ${id}  ${title}`);
-      console.error(`      ${message}`);
-    }
-  }
-
-  function postWebhook(body, headers, timeoutMs = 60000) {
-    return request(root, {
-      method: "POST",
-      headers: { "content-type": "application/json", ...headers },
-      body,
-      timeoutMs,
-    });
-  }
-
-  function signedHeaders(svixId, timestamp, body) {
-    return {
+  const body = JSON.stringify({ type: "email.received", data: { email_id: `probe-${randomUUID()}` } });
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const svixId = `msg_${randomUUID()}`;
+  const signed = await request(endpoint(workerUrl, "/"), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
       "svix-id": svixId,
       "svix-timestamp": timestamp,
       "svix-signature": signSvix({ secret: webhookSecret, svixId, timestamp, body }),
-    };
-  }
-
-  async function mcp(token, method, params, { allowError = false } = {}) {
-    const headers = { "content-type": "application/json" };
-    if (token != null) headers.authorization = `Bearer ${token}`;
-    const res = await request(mcpUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ jsonrpc: "2.0", id: "e2e", method, params }),
-    });
-    if (!allowError) {
-      assertHttp(res, 200, method);
-      if (res.json?.error) {
-        throw new Error(`${method} JSON-RPC ${res.json.error.code}: ${res.json.error.message}`);
-      }
-    }
-    return res;
-  }
-
-  async function tool(name, args) {
-    const res = await mcp(mcpToken, "tools/call", { name, arguments: args });
-    const text = res.json?.result?.content?.[0]?.text;
-    if (typeof text !== "string") throw new Error(`${name}: missing text content: ${snippet(res.text)}`);
-    try {
-      return JSON.parse(text);
-    } catch {
-      throw new Error(`${name}: tool text was not JSON: ${snippet(text)}`);
-    }
-  }
-
-  async function totalCount() {
-    const stats = await tool("email_stats", {});
-    if (typeof stats.total !== "number" || !stats.by_direction) {
-      throw new Error(`email_stats returned an unexpected payload: ${snippet(JSON.stringify(stats))}`);
-    }
-    return stats.total;
-  }
-
-  async function waitForEmail(emailIdToFind, { timeoutMs = 90000 } = {}) {
-    const deadline = Date.now() + timeoutMs;
-    let delay = 250;
-    let last = null;
-    while (Date.now() < deadline) {
-      last = await tool("get_email", { resend_id: emailIdToFind, include_html: true, include_raw_eml: true });
-      if (last && last.found === true) return last;
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) break;
-      await sleep(Math.min(delay, remaining));
-      delay = Math.min(Math.round(delay * 1.5), 4000);
-    }
-    throw new Error(`timed out waiting for consumer to archive ${emailIdToFind}: ${snippet(JSON.stringify(last))}`);
-  }
-
-  const eventBody = JSON.stringify({
-    type: "email.received",
-    created_at: new Date().toISOString(),
-    data: { email_id: emailId },
+    },
+    body,
   });
-  const freshTs = String(Math.floor(Date.now() / 1000));
-  ctx.delivery = {
-    body: eventBody,
-    headers: signedHeaders(`e2e-${randomUUID()}`, freshTs, eventBody),
-  };
+  assertHttp(signed, 200, "signed webhook");
+  expect(signed.json && signed.json.ok === true && signed.json.ignored === true, `webhook was not ignored: ${snippet(signed.text)}`);
+  expect(signed.json.queued !== true, "webhook must not enqueue");
 
-  await runCase("d", "worker /mcp is closed to public callers; gateway MCP rejects a missing or wrong token", async () => {
-    const direct = await request(directMcpUrl, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-abot-owner-email": "e2e-probe@abot.run" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: "e2e", method: "tools/list" }),
-    });
-    assertHttp(direct, 404, "worker /mcp with a forged x-abot-owner-email");
-    const absent = await mcp(null, "tools/call", { name: "get_email", arguments: { resend_id: emailId } }, { allowError: true });
-    assertHttp(absent, 401, "MCP with no Authorization header");
-    const wrong = await mcp("incorrect-mcp-token", "tools/call", { name: "get_email", arguments: { resend_id: emailId } }, { allowError: true });
-    assertHttp(wrong, 401, "MCP with the wrong token");
+  const bad = await request(endpoint(workerUrl, "/"), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "svix-id": svixId,
+      "svix-timestamp": timestamp,
+      "svix-signature": "v1,not-a-signature",
+    },
+    body,
   });
+  assertHttp(bad, 401, "bad signature");
 
-  await runCase("c", "forged signature and an expired timestamp return 401", async () => {
-    const before = await totalCount();
-    const forged = await postWebhook(eventBody, {
-      "svix-id": `e2e-forged-${randomUUID()}`,
-      "svix-timestamp": freshTs,
-      "svix-signature": `v1,${"A".repeat(44)}`,
-    });
-    assertHttp(forged, 401, "forged signature");
-    const expiredTs = String(Math.floor(Date.now() / 1000) - 5 * 60 - 1);
-    const expiredId = `e2e-expired-${randomUUID()}`;
-    const expired = await postWebhook(eventBody, signedHeaders(expiredId, expiredTs, eventBody));
-    assertHttp(expired, 401, "expired timestamp");
-    const after = await totalCount();
-    expect(after === before, `rejected webhooks changed the archive total from ${before} to ${after}`);
+  const direct = await request(endpoint(workerUrl, "/mcp"), {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-abot-owner-email": "probe@abot.run" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
   });
+  assertHttp(direct, 404, "public /mcp");
 
-  await runCase("a", "valid email.received webhook returns queued:true and get_email reads the row after the consumer", async () => {
-    const before = await tool("get_email", { resend_id: emailId });
-    const started = Date.now();
-    const res = await postWebhook(ctx.delivery.body, ctx.delivery.headers, 20000);
-    const elapsed = Date.now() - started;
-    assertHttp(res, 200, "valid webhook");
-    expect(res.json?.ok === true && res.json?.queued === true, `valid webhook body was ${snippet(res.text)}`);
-    expect(res.json?.duplicate !== true, "queued webhook body included duplicate:true");
-    expect(elapsed < 20000, `webhook took ${elapsed}ms`);
-    if (before.found !== true) {
-      const immediate = await tool("get_email", { resend_id: emailId });
-      if (immediate.found === true) {
-        console.log("note: consumer archived the row before the first follow-up read");
-      } else {
-        console.log("note: row was not visible when the webhook returned");
-      }
-    }
-    const email = before.found === true ? await tool("get_email", { resend_id: emailId, include_html: true, include_raw_eml: true }) : await waitForEmail(emailId);
-    expect(email.found === true, `get_email did not find ${emailId}: ${snippet(JSON.stringify(email))}`);
-    expect(email.resend_id === emailId, `get_email resend_id was ${email.resend_id}`);
-    expect(email.direction === "in", `stored direction was ${email.direction}, expected in`);
-    for (const key of ["from", "to", "cc", "subject", "date", "has_text", "has_html", "attachments", "text_body"]) {
-      expect(Object.prototype.hasOwnProperty.call(email, key), `get_email is missing ${key}`);
-    }
-    expect(Array.isArray(email.to), "get_email to is not an array");
-    expect(typeof email.date === "string" && email.date.length > 0, "get_email date is empty");
-    const hasRaw = typeof email.raw_eml === "string" && email.raw_eml.length > 0;
-    if (before.found !== true) {
-      expect(hasRaw, `R2 eml missing for ${emailId}: ${email.raw_eml_note || snippet(JSON.stringify(email))}`);
-    } else if (!hasRaw) {
-      console.log(`note: existing row has no raw eml (${email.raw_eml_note || "missing"}); consumer will not refetch it`);
-    }
-    ctx.email = email;
-    ctx.totalAfterArchive = await totalCount();
+  const listed = await request(mcpEndpoint(), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${mcpToken}`,
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
   });
-
-  await runCase("e", "authenticated search_emails finds the row and get_email returns the body", async () => {
-    expect(ctx.email, "prerequisite failed: case a did not read the archived email");
-    const email = ctx.email;
-    const text = typeof email.text_body === "string" ? email.text_body.trim() : "";
-    const html = typeof email.html_body === "string" ? email.html_body.trim() : "";
-    const subject = typeof email.subject === "string" ? email.subject.trim() : "";
-    expect(text.length > 0 || html.length > 0, "get_email returned no text_body or html_body");
-    const address = typeof email.from === "string" ? email.from.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] : null;
-    const query = (text.length >= 20 ? text.slice(0, 60) : subject || address || text).slice(0, 200);
-    expect(query.length > 0, "archived email has no subject, sender, or text_body to search");
-    const args = { query, limit: 100, direction: "in" };
-    if (address) args.from = address;
-    const rows = await tool("search_emails", args);
-    expect(Array.isArray(rows), "search_emails did not return an array");
-    expect(
-      rows.some((row) => row.resend_id === emailId),
-      `search_emails query ${JSON.stringify(query)} returned ${rows.length} row(s) and none were ${emailId}`,
-    );
-    const again = await tool("get_email", { resend_id: emailId });
-    expect(again.found === true && again.resend_id === emailId, "second get_email did not return the same id");
-    expect(again.text_body === email.text_body, "text_body changed between reads");
-    expect(!Object.prototype.hasOwnProperty.call(again, "html_body"), "get_email included html_body without include_html");
-  });
-
-  await runCase("b", "replaying the same webhook leaves a single row", async () => {
-    expect(ctx.email && ctx.totalAfterArchive != null, "prerequisite failed: case a did not archive the email");
-    const replay = await postWebhook(ctx.delivery.body, ctx.delivery.headers, 20000);
-    assertHttp(replay, 200, "replayed webhook");
-    expect(replay.json?.ok === true && replay.json?.queued === true, `replay body was ${snippet(replay.text)}`);
-    expect(replay.json?.duplicate !== true, "replay body included duplicate:true");
-    const deadline = Date.now() + 45000;
-    let delay = 400;
-    let samples = 0;
-    while (samples < 3 && Date.now() < deadline) {
-      const after = await totalCount();
-      expect(after === ctx.totalAfterArchive, `replay changed the archive total from ${ctx.totalAfterArchive} to ${after}`);
-      const email = await tool("get_email", { resend_id: emailId, include_html: true });
-      expect(email.found === true && email.resend_id === emailId, "get_email after replay did not return the same id");
-      expect(email.text_body === ctx.email.text_body, "text_body changed after replay");
-      expect(email.html_body === ctx.email.html_body, "html_body changed after replay");
-      samples += 1;
-      if (samples < 3) await sleep(delay);
-      delay = Math.min(delay * 2, 4000);
-    }
-    expect(samples === 3, "timed out confirming the replay left a single unchanged row");
-  });
-
-  await runCase("f", "unauthenticated responses do not contain the message body", async () => {
-    expect(ctx.email, "prerequisite failed: case a did not read the archived email");
-    const probes = [
-      ["GET /health", await request(healthUrl)],
-      ["POST /mcp with no token", await mcp(null, "tools/call", { name: "get_email", arguments: { resend_id: emailId } }, { allowError: true })],
-      ["POST /mcp with the wrong token", await mcp("incorrect-mcp-token", "tools/call", { name: "get_email", arguments: { resend_id: emailId } }, { allowError: true })],
-      [
-        "POST / with no Svix headers",
-        await postWebhook(eventBody, {}, 30000),
-      ],
-    ];
-    const staticUnauthorized = '{"ok":false,"error":"unauthorized"}';
-    const bodyNeedles = (min) =>
-      [ctx.email.text_body, ctx.email.html_body]
-        .filter((value) => typeof value === "string")
-        .map((value) => value.trim())
-        .filter((value) => value.length >= min && !staticUnauthorized.includes(value));
-    const againstHealth = bodyNeedles(12);
-    const againstUnauthorized = bodyNeedles(4);
-    for (const [label, res] of probes) {
-      if (label === "GET /health") {
-        expect(res.status === 200, `${label}: expected HTTP 200, got ${res.status}: ${snippet(res.text)}`);
-        const keys = res.json && typeof res.json === "object" ? Object.keys(res.json).sort() : [];
-        expect(
-          keys.length === 3 && keys[0] === "count_24h" && keys[1] === "last_received_at" && keys[2] === "ok",
-          `${label} exposed unexpected fields: ${keys.join(", ") || snippet(res.text)}`,
-        );
-        for (const needle of againstHealth) {
-          expect(!res.text.includes(needle), `${label} contained the archived message body`);
-        }
-      } else {
-        expect(res.status === 401, `${label}: expected HTTP 401, got ${res.status}: ${snippet(res.text)}`);
-        for (const needle of againstUnauthorized) {
-          expect(!res.text.includes(needle), `${label} contained the archived message body`);
-        }
-      }
-      for (const banned of ["text_body", "html_body", "raw_eml"]) {
-        expect(!res.text.includes(`"${banned}"`), `${label} included ${banned}`);
-      }
-    }
-  });
-
-  const failed = results.filter((item) => !item.ok);
-  console.log("");
-  console.log(`${results.length - failed.length} passed, ${failed.length} failed`);
-  return failed.length === 0 ? 0 : 1;
+  assertHttp(listed, 200, "gateway tools/list");
+  const names = (((listed.json || {}).result || {}).tools || []).map((tool) => tool.name).sort();
+  expect(JSON.stringify(names) === JSON.stringify(["get_account", "send_email"]), `unexpected tools: ${snippet(JSON.stringify(names))}`);
+  console.log("e2e: health, ignored webhook, and tools/list passed");
+  return 0;
 }
 
-function invokedDirectly() {
-  const entry = process.argv[1];
-  if (!entry) return false;
-  try {
-    return import.meta.url === pathToFileURL(realpathSync(entry)).href;
-  } catch {
-    return false;
-  }
-}
-
-if (invokedDirectly()) {
+if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(new URL(import.meta.url).pathname)) {
   main()
     .then((code) => {
-      process.exit(code);
+      process.exitCode = code;
     })
     .catch((err) => {
       console.error(`e2e: ${err && err.message ? err.message : err}`);
-      process.exit(1);
+      process.exitCode = 1;
     });
 }
+

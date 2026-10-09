@@ -42,12 +42,17 @@ test("the checked-in wrangler.toml is the production config", () => {
 });
 
 test("production config check catches drift that would break the live worker", () => {
+  const inject = (block) => {
+    const at = TOML.indexOf("\n[env.staging]");
+    return TOML.slice(0, at) + "\n" + block + TOML.slice(at);
+  };
   const cases = [
     [TOML.replace("workers_dev = false", "workers_dev = true"), /workers_dev/],
     [TOML.replace('pattern = "mail.abot.run/*"', 'pattern = "x.abot.run/*"'), /route/],
     [TOML.replace("779058bf-f5c1-44de-b2c8-99350ec7748e", "00000000-0000-4000-8000-000000000000"), /D1/],
-    [TOML.replace('queue = "mail-ingest"\n', 'queue = "mail-ingest-staging"\n'), /queue/],
-    [TOML.replace("[ai]", '[vars]\nX = "1"\n\n[ai]'), /\[vars\]/],
+    [inject('[[r2_buckets]]\nbinding = "ARCHIVE_BUCKET"\nbucket_name = "abot-mail-archive"\n'), /R2/],
+    [inject('[[queues.producers]]\nbinding = "INGEST_QUEUE"\nqueue = "mail-ingest"\n'), /queue/],
+    [TOML.replace("[observability]", '[vars]\nX = "1"\n\n[observability]'), /\[vars\]/],
   ];
   for (const [toml, problem] of cases) {
     assert.notEqual(toml, TOML);
