@@ -6,8 +6,11 @@ import { fileURLToPath } from "node:url";
 import {
   CONFIG_PATH,
   DeployError,
+  INGEST_QUEUES,
   assertProductionBranch,
   assertWorkersBuilds,
+  consumerAlreadyGone,
+  consumerRemoveArgs,
   deployMessage,
   productionConfigProblems,
   run,
@@ -71,4 +74,20 @@ test("deploy message names the build and commit", () => {
     deployMessage({ WORKERS_CI_BUILD_UUID: "b-1", WORKERS_CI_COMMIT_SHA: "0123456789abcdef" }),
     "Workers Builds b-1 main@0123456789ab",
   );
+});
+
+test("deploy detaches the archive queue consumers before uploading a script with no queue handler", () => {
+  assert.deepEqual(INGEST_QUEUES, ["mail-ingest", "mail-ingest-dlq"]);
+  assert.deepEqual(consumerRemoveArgs("mail-ingest"), [
+    "queues",
+    "consumer",
+    "remove",
+    "mail-ingest",
+    "resend-agent-mail-relay",
+  ]);
+  assert.equal(
+    consumerAlreadyGone("No worker consumer 'resend-agent-mail-relay' exists for queue mail-ingest\n"),
+    true,
+  );
+  assert.equal(consumerAlreadyGone("Authentication error [code: 10000]"), false);
 });

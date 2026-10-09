@@ -11,6 +11,10 @@ import { fileURLToPath } from "node:url";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const CONFIG_PATH = join(ROOT, "worker", "wrangler.toml");
 export const PRODUCTION_BRANCH = "main";
+// Live consumers from the archive worker. Wrangler deploy does not delete a
+// consumer that was removed from wrangler.toml, and the versions API rejects
+// a script with no queue() while one is still attached (error 11001).
+export const INGEST_QUEUES = ["mail-ingest", "mail-ingest-dlq"];
 
 export const PRODUCTION = {
   name: "resend-agent-mail-relay",
@@ -105,10 +109,33 @@ export function productionConfigProblems(toml) {
 }
 
 function wrangler(args, env) {
-  const bin = join(ROOT, "node_modules", ".bin", "wrangler");
-  const result = spawnSync(bin, args, { cwd: ROOT, env, stdio: "inherit" });
-  if (result.error) throw result.error;
+  const result = spawnWrangler(args, env, "inherit");
   if (result.status !== 0) throw new DeployError(`wrangler ${args[0]} exited with ${result.status}`);
+}
+
+function spawnWrangler(args, env, stdio) {
+  const bin = join(ROOT, "node_modules", ".bin", "wrangler");
+  const result = spawnSync(bin, args, { cwd: ROOT, env, stdio, encoding: stdio === "inherit" ? undefined : "utf8" });
+  if (result.error) throw result.error;
+  return result;
+}
+
+export function consumerRemoveArgs(queue) {
+  return ["queues", "consumer", "remove", queue, PRODUCTION.name];
+}
+
+export function consumerAlreadyGone(output) {
+  return /No worker consumer /.test(output);
+}
+
+function detachIngestConsumers(env) {
+  for (const queue of INGEST_QUEUES) {
+    const result = spawnWrangler(consumerRemoveArgs(queue), env, "pipe");
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+    if (output) process.stderr.write(output.endsWith("\n") ? output : `${output}\n`);
+    if (result.status === 0 || consumerAlreadyGone(output)) continue;
+    throw new DeployError(`wrangler queues consumer remove ${queue} exited with ${result.status}`);
+  }
 }
 
 function checkConfig() {
@@ -133,6 +160,7 @@ export function run(command, env = process.env) {
   if (command === "deploy") {
     assertProductionBranch(env);
     checkConfig();
+    detachIngestConsumers(env);
     const args = ["deploy", "--config", CONFIG_PATH, "--env=", "--message", deployMessage(env)];
     if (env.WORKERS_CI_COMMIT_SHA) args.push("--tag", env.WORKERS_CI_COMMIT_SHA.slice(0, 12));
     wrangler(args, env);
